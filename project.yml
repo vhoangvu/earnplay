@@ -1,0 +1,65 @@
+name: EarnPlay
+options:
+  bundleIdPrefix: com.vhoangvu
+  deploymentTarget:
+    iOS: "18.0"
+packages:
+  EarnPlayCore:
+    path: EarnPlayCore
+targets:
+  EarnPlay:
+    type: application
+    platform: iOS
+    sources:
+      - EarnPlay
+    dependencies:
+      - package: EarnPlayCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchStoryboardName: ""
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.0"
+  EarnPlayAdmin:
+    type: application
+    platform: iOS
+    sources:
+      - EarnPlayAdmin
+    dependencies:
+      - package: EarnPlayCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.admin
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchStoryboardName: ""
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.0"
+  EarnPlayTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - EarnPlayTests
+    dependencies:
+      - target: EarnPlay
+      - package: EarnPlayCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+schemes:
+  EarnPlay:
+    build:
+      targets:
+        EarnPlay: all
+        EarnPlayTests: [test]
+    test:
+      targets:
+        - EarnPlayTests
