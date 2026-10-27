@@ -58,4 +58,57 @@ final class ModelRuntimeTests: XCTestCase {
         XCTAssertFalse(warm.wasColdStart)
         XCTAssertEqual(warm.loadLatencyMs, 0, accuracy: 0.001)
     }
+
+    /// Regression (Copilot review, PR #33): the cold-start check and the
+    /// load must be atomic, so concurrent first generations report
+    /// exactly one wasColdStart == true.
+    func testConcurrentFirstGenerationsReportSingleColdStart() throws {
+        guard ModelRuntime.isRuntimeLinked else {
+            throw XCTSkip("llama.xcframework not fetched; run Scripts/setup-model-spike.sh")
+        }
+        guard let path = ProcessInfo.processInfo.environment["EARNPLAY_MODEL_PATH"],
+              !path.isEmpty else {
+            throw XCTSkip("EARNPLAY_MODEL_PATH not set; real-inference check skipped")
+        }
+        let runtime = ModelRuntime(modelPath: URL(fileURLWithPath: path))
+        let resultsLock = NSLock()
+        var coldFlags: [Bool] = []
+        var errors: [Error] = []
+        DispatchQueue.concurrentPerform(iterations: 4) { _ in
+            do {
+                let result = try runtime.generate(prompt: SpikePrompts.all[0], maxTokens: 8)
+                resultsLock.lock()
+                coldFlags.append(result.wasColdStart)
+                resultsLock.unlock()
+            } catch {
+                resultsLock.lock()
+                errors.append(error)
+                resultsLock.unlock()
+            }
+        }
+        XCTAssertTrue(errors.isEmpty, "concurrent generations failed: \(errors)")
+        XCTAssertEqual(coldFlags.count, 4)
+        XCTAssertEqual(coldFlags.filter { $0 }.count, 1,
+                       "exactly one concurrent caller may report a cold start")
+    }
+
+    /// Regression (Copilot review, PR #33): a prompt whose prefill
+    /// exceeds the old 512-token decode batch must still generate.
+    func testPrefillLongerThanOldBatchSize() throws {
+        guard ModelRuntime.isRuntimeLinked else {
+            throw XCTSkip("llama.xcframework not fetched; run Scripts/setup-model-spike.sh")
+        }
+        guard let path = ProcessInfo.processInfo.environment["EARNPLAY_MODEL_PATH"],
+              !path.isEmpty else {
+            throw XCTSkip("EARNPLAY_MODEL_PATH not set; real-inference check skipped")
+        }
+        let runtime = ModelRuntime(modelPath: URL(fileURLWithPath: path))
+        // ~800 tokens of prompt: beyond the old n_batch = 512, inside
+        // the 2048-token context.
+        let longPrompt = String(repeating: "The quick brown fox jumps over the lazy dog. ",
+                                count: 80)
+            + "\nIn one short sentence, what animal jumps?"
+        let result = try runtime.generate(prompt: longPrompt, maxTokens: 8)
+        XCTAssertFalse(result.response.isEmpty)
+    }
 }

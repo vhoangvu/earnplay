@@ -88,6 +88,13 @@ if [ "$DO_MODEL" -eq 1 ]; then
   echo "model: $MODEL_PATH"
 fi
 
-echo "setup complete. Next steps:"
+echo "setup complete. Next steps (see Docs/ModelRuntimeSpike.md, Setup):"
 echo "  xcodegen generate"
-echo "  EARNPLAY_MODEL_PATH=\"$MODEL_DIR/$MODEL_FILE\" xcodebuild test -project EarnPlay.xcodeproj -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO ARCHS=arm64"
+echo "  # xcodebuild test does not forward shell env vars into the simulator,"
+echo "  # so stage the GGUF into the app's Documents before testing:"
+echo "  xcrun simctl boot \"iPhone 17\" || true"
+echo "  xcodebuild build -project EarnPlay.xcodeproj -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO ARCHS=arm64"
+echo "  xcrun simctl install booted <DerivedData>/Build/Products/Debug-iphonesimulator/EarnPlay.app"
+echo "  DATA=\$(xcrun simctl get_app_container booted com.vhoangvu.earnplay data)"
+echo "  ln \"$MODEL_DIR/$MODEL_FILE\" \"\$DATA/Documents/EarnPlayModel.gguf\""
+echo "  xcodebuild test -project EarnPlay.xcodeproj -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO ARCHS=arm64"

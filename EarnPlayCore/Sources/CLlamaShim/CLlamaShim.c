@@ -1,6 +1,7 @@
 #include "CLlamaShim.h"
 
 #include <llama/llama.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,7 +11,11 @@ struct ep_llama {
     const struct llama_vocab *vocab;
 };
 
-static int ep_backend_ready = 0;
+static pthread_once_t ep_backend_once = PTHREAD_ONCE_INIT;
+
+static void ep_init_backend(void) {
+    llama_backend_init();
+}
 
 static char *ep_strdup(const char *text) {
     if (text == NULL) {
@@ -39,10 +44,7 @@ ep_llama_t *ep_llama_create(const char *model_path, char **out_error) {
         ep_set_error(out_error, "model path is empty");
         return NULL;
     }
-    if (!ep_backend_ready) {
-        llama_backend_init();
-        ep_backend_ready = 1;
-    }
+    pthread_once(&ep_backend_once, ep_init_backend);
 
     struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0; /* CPU only: identical on sim + device */
@@ -55,7 +57,9 @@ ep_llama_t *ep_llama_create(const char *model_path, char **out_error) {
 
     struct llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 2048;
-    ctx_params.n_batch = 512;
+    /* Prefill submits the whole prompt as one batch (below), so the
+       decode batch must hold any prompt that fits the context. */
+    ctx_params.n_batch = ctx_params.n_ctx;
     ctx_params.n_ubatch = 512;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;

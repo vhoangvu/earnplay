@@ -155,6 +155,13 @@ public final class ModelRuntime: @unchecked Sendable {
     public func load() throws -> Double {
         lock.lock()
         defer { lock.unlock() }
+        return try loadLocked()
+    }
+
+    /// Caller must hold `lock`. The didLoad check and the load itself
+    /// happen under that one lock acquisition, so concurrent callers
+    /// cannot both observe the not-yet-loaded state.
+    private func loadLocked() throws -> Double {
         if didLoad {
             return 0
         }
@@ -187,11 +194,11 @@ public final class ModelRuntime: @unchecked Sendable {
 
     /// Metadata for the loaded model. Loads the model first if needed.
     public func loadedModelInfo() throws -> LoadedModelInfo {
-        if !didLoad {
-            _ = try load()
-        }
         lock.lock()
         defer { lock.unlock() }
+        if !didLoad {
+            _ = try loadLocked()
+        }
         if let cachedInfo {
             return cachedInfo
         }
@@ -211,15 +218,18 @@ public final class ModelRuntime: @unchecked Sendable {
         guard !trimmed.isEmpty else {
             throw ModelRuntimeError.emptyPrompt
         }
+        // One lock acquisition covers the cold-start check, the load,
+        // and generation, so exactly one concurrent caller can report
+        // wasColdStart == true.
+        lock.lock()
+        defer { lock.unlock() }
         var loadMs: Double = 0
         var wasCold = false
         if !didLoad {
-            loadMs = try load()
+            loadMs = try loadLocked()
             wasCold = true
         }
         #if canImport(CLlamaShim)
-        lock.lock()
-        defer { lock.unlock() }
         guard let handle else {
             throw ModelRuntimeError.modelLoadFailed("model handle missing after load")
         }
