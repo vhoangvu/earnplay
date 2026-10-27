@@ -63,3 +63,7 @@ schemes:
     test:
       targets:
         - EarnPlayTests
+  EarnPlayAdmin:
+    build:
+      targets:
+        EarnPlayAdmin: all

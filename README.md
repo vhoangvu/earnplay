@@ -25,15 +25,30 @@ xcodegen generate
 open EarnPlay.xcodeproj
 ```
 
-Bundle IDs (`com.vhoangvu.earnplay*`) are placeholders until T0.1 records
-the real IDs from the Apple Developer account.
+## Bundle IDs (recorded in T0.1)
+
+These values must match Xcode's Bundle Identifier fields exactly
+(source of truth: `project.yml` → each target's
+`PRODUCT_BUNDLE_IDENTIFIER`):
+
+| Target | Bundle ID |
+| --- | --- |
+| EarnPlay (child app) | `com.vhoangvu.earnplay` |
+| EarnPlayAdmin (admin app) | `com.vhoangvu.earnplay.admin` |
+| EarnPlayTests (unit tests) | `com.vhoangvu.earnplay.tests` |
+
+> **Placeholder — needs Vu's decision before any signing step:**
+> the `com.vhoangvu` prefix is a placeholder reverse-DNS prefix, not yet
+> confirmed against the Apple Developer account. Do not use these IDs for
+> signing, provisioning, or distribution until Vu confirms the real prefix.
 
 ## CI (Route 1)
 
 Every push to `main` and every pull request runs GitHub Actions on a
 macOS runner (`.github/workflows/ci.yml`): installs XcodeGen, generates
 the project, runs `swift test` for EarnPlayCore, then
-`xcodebuild test` for the app scheme on an iPhone 16 simulator
+`xcodebuild test` for the EarnPlay scheme and `xcodebuild build`
+for the EarnPlayAdmin scheme on an iPhone 16 simulator
 (signing disabled). Check the Actions tab for results.
 
 Deployment target: iOS 18. CI uses the macos-15 runner (Xcode 16).
