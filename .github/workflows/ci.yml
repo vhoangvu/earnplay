@@ -26,10 +26,18 @@ jobs:
       - name: Test EarnPlayCore package
         run: swift test --package-path EarnPlayCore
 
-      - name: Build and test app
+      - name: Build child app and run unit tests
         run: |
           xcodebuild test \
             -project EarnPlay.xcodeproj \
             -scheme EarnPlay \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build admin app
+        run: |
+          xcodebuild build \
+            -project EarnPlay.xcodeproj \
+            -scheme EarnPlayAdmin \
             -destination 'platform=iOS Simulator,name=iPhone 16' \
             CODE_SIGNING_ALLOWED=NO
