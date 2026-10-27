@@ -12,13 +12,17 @@ struct EarnPlayApp: App {
 
 struct ContentView: View {
     var body: some View {
-        VStack(spacing: 12) {
-            Text("EarnPlay")
-                .font(.largeTitle.bold())
-            Text("Tutor chat placeholder — core v\(EarnPlayCore.version)")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(spacing: 12) {
+                Text("EarnPlay")
+                    .font(.largeTitle.bold())
+                Text("Tutor chat placeholder — core v\(EarnPlayCore.version)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Divider()
+                SpikeView()
+            }
+            .padding()
         }
-        .padding()
     }
 }

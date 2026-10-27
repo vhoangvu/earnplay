@@ -16,6 +16,7 @@ targets:
       - package: EarnPlayCore
     settings:
       base:
+        PRODUCT_NAME: EarnPlay
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -33,6 +34,7 @@ targets:
       - package: EarnPlayCore
     settings:
       base:
+        PRODUCT_NAME: EarnPlayAdmin
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.admin
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -51,6 +53,7 @@ targets:
       - package: EarnPlayCore
     settings:
       base:
+        PRODUCT_NAME: EarnPlayTests
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.tests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.0"
