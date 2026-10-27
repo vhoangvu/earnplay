@@ -47,6 +47,8 @@ ep_llama_t *ep_llama_create(const char *model_path, char **out_error) {
     pthread_once(&ep_backend_once, ep_init_backend);
 
     struct llama_model_params model_params = llama_model_default_params();
+    static ggml_backend_dev_t cpu_only_devices[] = { NULL };
+    model_params.devices = cpu_only_devices;
     model_params.n_gpu_layers = 0; /* CPU only: identical on sim + device */
 
     struct llama_model *model = llama_model_load_from_file(model_path, model_params);
@@ -159,13 +161,13 @@ char *ep_llama_generate(ep_llama_t *handle, const char *prompt_utf8,
         return NULL;
     }
     n_prompt = n_got;
-    if (n_prompt + max_tokens > 2048) {
+    if (n_prompt >= 2048) {
+        free(prompt_tokens);
+        ep_set_error(out_error, "prompt exceeds context size");
+        return NULL;
+    }
+    if (max_tokens > 2048 - n_prompt) {
         max_tokens = 2048 - n_prompt;
-        if (max_tokens <= 0) {
-            free(prompt_tokens);
-            ep_set_error(out_error, "prompt exceeds context size");
-            return NULL;
-        }
     }
 
     /* Fresh sequence for every call. */

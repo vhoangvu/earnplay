@@ -59,6 +59,12 @@ if [ "$DO_RUNTIME" -eq 1 ]; then
       echo "runtime: cloning llama.cpp $LLAMA_TAG ..."
       git clone --depth 1 --branch "$LLAMA_TAG" "$LLAMA_URL" "$LLAMA_DIR"
     fi
+    if [ "$(git -C "$LLAMA_DIR" rev-parse HEAD)" != \
+        "$(git -C "$LLAMA_DIR" rev-parse --verify "${LLAMA_TAG}^{commit}")" ] || \
+        ! git -C "$LLAMA_DIR" diff --quiet HEAD --; then
+        echo "error: $LLAMA_DIR must be a clean checkout of llama.cpp $LLAMA_TAG" >&2
+        exit 1
+    fi
     echo "runtime: building llama.xcframework (ios-sim ios-device macos) ..."
     (cd "$LLAMA_DIR" && ./build-xcframework.sh ios-sim ios-device macos)
     mkdir -p "$FRAMEWORKS_DIR"

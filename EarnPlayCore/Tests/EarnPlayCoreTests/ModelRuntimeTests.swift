@@ -71,25 +71,46 @@ final class ModelRuntimeTests: XCTestCase {
             throw XCTSkip("EARNPLAY_MODEL_PATH not set; real-inference check skipped")
         }
         let runtime = ModelRuntime(modelPath: URL(fileURLWithPath: path))
-        let resultsLock = NSLock()
-        var coldFlags: [Bool] = []
-        var errors: [Error] = []
+        final class Results: @unchecked Sendable {
+            let lock = NSLock()
+            var coldFlags: [Bool] = []
+            var errors: [Error] = []
+        }
+        let results = Results()
         DispatchQueue.concurrentPerform(iterations: 4) { _ in
             do {
                 let result = try runtime.generate(prompt: SpikePrompts.all[0], maxTokens: 8)
-                resultsLock.lock()
-                coldFlags.append(result.wasColdStart)
-                resultsLock.unlock()
+                results.lock.lock()
+                results.coldFlags.append(result.wasColdStart)
+                results.lock.unlock()
             } catch {
-                resultsLock.lock()
-                errors.append(error)
-                resultsLock.unlock()
+                results.lock.lock()
+                results.errors.append(error)
+                results.lock.unlock()
             }
         }
-        XCTAssertTrue(errors.isEmpty, "concurrent generations failed: \(errors)")
-        XCTAssertEqual(coldFlags.count, 4)
-        XCTAssertEqual(coldFlags.filter { $0 }.count, 1,
-                       "exactly one concurrent caller may report a cold start")
+        XCTAssertTrue(results.errors.isEmpty, "concurrent generations failed: \(results.errors)")
+        XCTAssertEqual(results.coldFlags.count, 4)
+        XCTAssertEqual(results.coldFlags.filter { $0 }.count, 1, "exactly one concurrent caller may report a cold start")
+    }
+
+    /// Regression (Copilot re-review, PR #33): a huge maxTokens must
+    /// clamp to the remaining context instead of overflowing
+    /// `n_prompt + max_tokens` in the C shim (signed-overflow UB).
+    func testHugeMaxTokensClampsWithoutOverflow() throws {
+        guard ModelRuntime.isRuntimeLinked else {
+            throw XCTSkip("llama.xcframework not fetched; run Scripts/setup-model-spike.sh")
+        }
+        guard let path = ProcessInfo.processInfo.environment["EARNPLAY_MODEL_PATH"],
+              !path.isEmpty else {
+            throw XCTSkip("EARNPLAY_MODEL_PATH not set; real-inference check skipped")
+        }
+        let runtime = ModelRuntime(modelPath: URL(fileURLWithPath: path))
+        let result = try runtime.generate(prompt: SpikePrompts.all[0], maxTokens: Int32.max)
+        XCTAssertFalse(result.response.isEmpty)
+        XCTAssertLessThanOrEqual(result.generatedTokenCount, 2048,
+                                 "generation must stay inside the 2048-token context")
+        XCTAssertGreaterThan(result.generatedTokenCount, 0)
     }
 
     /// Regression (Copilot review, PR #33): a prompt whose prefill

@@ -17,7 +17,7 @@ struct SpikeView: View {
     @State private var warmText = "—"
     @State private var isRunning = false
     @State private var runCount = 0
-    private let runtime: ModelRuntime? = {
+    @State private var runtime: ModelRuntime? = {
         guard let url = ModelRuntime.defaultModelURL() else { return nil }
         return ModelRuntime(modelPath: url)
     }()
@@ -90,7 +90,7 @@ struct SpikeView: View {
                     warmText = total
                 }
             } catch {
-                statusText = "Failed: \(error.localizedDescription)"
+                statusText = "Failed: \(String(describing: error))"
             }
             isRunning = false
         }
