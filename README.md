@@ -52,3 +52,21 @@ for the EarnPlayAdmin scheme on an iPhone 16 simulator
 (signing disabled). Check the Actions tab for results.
 
 Deployment target: iOS 18. CI uses the macos-15 runner (Xcode 16).
+
+## Model spike (T0.2)
+
+`ModelRuntime` in EarnPlayCore wraps llama.cpp (pinned `b11935`,
+CPU backend) and loads Meta Llama 3.2 1B Instruct Q4_K_M
+(808 MB GGUF) fully offline. Model weights and the built
+`llama.xcframework` are fetched, never committed:
+
+```sh
+Scripts/setup-model-spike.sh
+xcodegen generate
+```
+
+Simulator staging, measured cold/warm latencies, the go/no-go on
+model size, and the exact CI gap are recorded in
+`Docs/ModelRuntimeSpike.md`. Without setup, the package still builds
+(runtime reports unavailable) and the offline integration test skips
+rather than passing vacuously.

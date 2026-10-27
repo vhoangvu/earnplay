@@ -1,5 +1,8 @@
 *.xcodeproj
 xcuserdata/
+# T0.2 model spike: runtime framework + model weights are fetched, never committed
+EarnPlayCore/Frameworks/
+*.gguf
 *.xcworkspace
 DerivedData/
 .build/
