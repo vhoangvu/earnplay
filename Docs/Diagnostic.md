@@ -13,9 +13,11 @@ fractions, word problems, reading fluency, and comprehension."
   re-verified through `SolverService.verify` at `start()`. Items the
   solver rejects are dropped and never presented. Answers are judged
   only by `SolverService.checkAnswer` against the verified answer,
-  except items declaring `acceptableAnswers`: each extra is
-  re-verified against the passage (`verifyReadingSupport`) at
-  `start()` and grading accepts any verified entry (normalized).
+  except reading-comprehension items with a passage declaring
+  `acceptableAnswers`: each extra is re-verified against the passage
+  (`verifyReadingSupport`) at `start()` and grading accepts any
+  verified entry (normalized). Math and other non-reading (or
+  passage-less) items never use unverified alternates.
   The passageB fluency item asks how many books were on the shelf
   *before* the move, so 48 is unambiguous. The model never grades, and no model inference runs in the
   diagnostic: T1.2 owns model-proposed generation. The diagnostic bank
@@ -33,6 +35,9 @@ fractions, word problems, reading fluency, and comprehension."
   All session operations are serialized on a recursive lock, so a
   timer calling `expireIfNeeded()` cannot interleave with `submit()`
   (that synchronization justifies `@unchecked Sendable`).
+  `submit(answer:responseMs:questionId:)` requires the presented
+  item's `question.questionId`; a stale ID is rejected under the
+  lock before any grading, recording, or advancing.
 - **Scoring.** Per area: accuracy, counts, median response ms
   (even-sized samples average the two middle values).
   Levels: accuracy >= 0.8 `proficient`, >= 0.5 `developing`, else

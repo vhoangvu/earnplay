@@ -185,8 +185,10 @@ public enum DiagnosticSessionState: Equatable, Sendable {
 
 /// Session flow for one ~10-minute diagnostic.
 ///
-/// Usage: `start()` -> repeat `currentItem` / `submit(answer:responseMs:)`
-/// until `state == .completed`, then `profile()`. `abandon()` ends
+/// Usage: `start()` -> repeat `currentItem` /
+/// `submit(answer:responseMs:questionId:)` (passing the presented
+/// item's `question.questionId`) until `state == .completed`, then
+/// `profile()`. `abandon()` ends
 /// early and `profile()` still returns the partial profile.
 /// Time is injected (`now`) so tests drive the budget deterministically.
 ///
@@ -270,14 +272,18 @@ public final class DiagnosticSession: @unchecked Sendable {
     private static func verifiedAcceptableAnswers(
         item: DiagnosticBankItem, verifiedAnswer: String, solver: SolverService
     ) -> [String] {
-        guard !item.acceptableAnswers.isEmpty else { return [] }
+        // Alternate answers are only for reading-comprehension items
+        // with a passage: each extra must be passage-supported. Math
+        // (and any non-reading or passage-less) items grade solely
+        // through the solver's skill-specific comparison.
+        guard item.problem.skill == .readingComprehension,
+              let passage = item.problem.passage,
+              !item.acceptableAnswers.isEmpty else { return [] }
         var accepted = [verifiedAnswer]
         for extra in item.acceptableAnswers {
             let normalized = SolverService.normalizeForSupport(extra)
             guard !accepted.contains(where: { SolverService.normalizeForSupport($0) == normalized }) else { continue }
-            if let passage = item.problem.passage {
-                guard case .supported = solver.verifyReadingSupport(passage: passage, proposedAnswer: extra) else { continue }
-            }
+            guard case .supported = solver.verifyReadingSupport(passage: passage, proposedAnswer: extra) else { continue }
             accepted.append(extra)
         }
         return accepted
@@ -315,12 +321,18 @@ public final class DiagnosticSession: @unchecked Sendable {
 
     /// Judges the answer against the solver-verified answer (never a
     /// model answer), records it, steps the staircase, and advances.
-    /// Submissions after the time budget are rejected before grading
-    /// or any profile update, and complete the session instead.
+    /// `questionId` must be the presented item's
+    /// `question.questionId` the caller read from `currentItem`; a
+    /// stale submission whose ID no longer matches the pending item
+    /// is rejected under the lock before any grading, recording, or
+    /// advancing. Submissions after the time budget are likewise
+    /// rejected before grading or any profile update, and complete
+    /// the session instead.
     @discardableResult
-    public func submit(answer: String, responseMs: Int) -> Bool {
+    public func submit(answer: String, responseMs: Int, questionId: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard _state == .inProgress, let item = pending else { return false }
+        guard item.question.questionId == questionId else { return false }
         guard !expireIfNeededLocked() else { return false }
         let correct: Bool
         if !item.acceptableAnswers.isEmpty {

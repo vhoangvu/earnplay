@@ -14,7 +14,7 @@ final class DiagnosticTests: XCTestCase {
     private func answerAllCorrectly(_ s: DiagnosticSession, ms: Int = 2_000) {
         var guardCount = 0
         while let item = s.currentItem, guardCount < 100 {
-            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: ms))
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: ms, questionId: item.question.questionId))
             guardCount += 1
         }
     }
@@ -41,7 +41,7 @@ final class DiagnosticTests: XCTestCase {
         var guardCount = 0
         while let item = s.currentItem, guardCount < 100 {
             _ = item
-            XCTAssertFalse(s.submit(answer: "definitely-wrong", responseMs: 3_000))
+            XCTAssertFalse(s.submit(answer: "definitely-wrong", responseMs: 3_000, questionId: item.question.questionId))
             guardCount += 1
         }
         XCTAssertEqual(s.state, .completed)
@@ -79,7 +79,7 @@ final class DiagnosticTests: XCTestCase {
         s.start()
         // Answer only the first item, then abandon.
         let first = try! XCTUnwrap(s.currentItem)
-        _ = s.submit(answer: first.question.verifiedAnswer, responseMs: 1_500)
+        _ = s.submit(answer: first.question.verifiedAnswer, responseMs: 1_500, questionId: first.question.questionId)
         s.abandon()
         XCTAssertEqual(s.state, .abandoned)
         let profile = s.profile()
@@ -93,11 +93,11 @@ final class DiagnosticTests: XCTestCase {
         let s = makeSession(budget: 60)
         s.start()
         let first = try! XCTUnwrap(s.currentItem)
-        _ = s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000)
+        _ = s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000, questionId: first.question.questionId)
         clock = clock.addingTimeInterval(61)
         // Next advance happens on submit; force by answering current item.
         if let item = s.currentItem {
-            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId)
         }
         XCTAssertEqual(s.state, .completed)
         XCTAssertFalse(s.profile().isComplete)
@@ -112,7 +112,7 @@ final class DiagnosticTests: XCTestCase {
         var seen = 0
         while let item = s.currentItem, seen < 100 {
             XCTAssertNotEqual(item.question.promptText, "13 × 3 = ?")
-            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId)
             seen += 1
         }
         XCTAssertGreaterThan(seen, 0)
@@ -183,12 +183,12 @@ final class DiagnosticTests: XCTestCase {
         let s = makeSession(budget: 60)
         s.start()
         let first = try! XCTUnwrap(s.currentItem)
-        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000, questionId: first.question.questionId))
         let responsesBefore = s.responses.count
         let attemptedBefore = s.profile().estimates.map(\.itemsAttempted)
         clock = clock.addingTimeInterval(61)
         let pending = try! XCTUnwrap(s.currentItem)
-        XCTAssertFalse(s.submit(answer: pending.question.verifiedAnswer, responseMs: 1_000))
+        XCTAssertFalse(s.submit(answer: pending.question.verifiedAnswer, responseMs: 1_000, questionId: pending.question.questionId))
         XCTAssertEqual(s.responses.count, responsesBefore)
         XCTAssertEqual(s.profile().estimates.map(\.itemsAttempted), attemptedBefore)
         XCTAssertEqual(s.state, .completed)
@@ -199,7 +199,7 @@ final class DiagnosticTests: XCTestCase {
         let s = makeSession(budget: 60)
         s.start()
         let first = try! XCTUnwrap(s.currentItem)
-        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000, questionId: first.question.questionId))
         let responsesBefore = s.responses.count
         clock = clock.addingTimeInterval(61)
         XCTAssertTrue(s.expireIfNeeded())
@@ -217,7 +217,7 @@ final class DiagnosticTests: XCTestCase {
         var guardCount = 0
         while let item = s.currentItem, guardCount < 100 {
             areas.append(item.area)
-            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000))
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId))
             guardCount += 1
         }
         XCTAssertEqual(s.state, .completed)
@@ -232,11 +232,11 @@ final class DiagnosticTests: XCTestCase {
         // One full round-robin cycle: one item per area.
         for _ in 0..<DiagnosticArea.allCases.count {
             let item = try! XCTUnwrap(s.currentItem)
-            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000))
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId))
         }
         clock = clock.addingTimeInterval(61)
         if let item = s.currentItem {
-            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId)
         }
         XCTAssertEqual(s.state, .completed)
         let profile = s.profile()
@@ -259,7 +259,7 @@ final class DiagnosticTests: XCTestCase {
         s.start()
         for ms in [2_000, 2_000, 2_000, 10_000, 10_000, 10_000] {
             let item = try! XCTUnwrap(s.currentItem)
-            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: ms))
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: ms, questionId: item.question.questionId))
         }
         XCTAssertEqual(s.state, .completed)
         let estimate = s.profile().estimate(for: .factsFluency)
@@ -326,8 +326,8 @@ final class DiagnosticTests: XCTestCase {
                                   bank: [bankItem], timeBudgetSeconds: 600,
                                   itemsPerArea: quotas, now: { self.clock })
         s.start()
-        XCTAssertNotNil(s.currentItem)
-        return s.submit(answer: answer, responseMs: 1_000)
+        let presented = try! XCTUnwrap(s.currentItem)
+        return s.submit(answer: answer, responseMs: 1_000, questionId: presented.question.questionId)
     }
 
     private func bankItem(promptContaining needle: String) -> DiagnosticBankItem {
@@ -372,7 +372,7 @@ final class DiagnosticTests: XCTestCase {
             s.start()
             DispatchQueue.concurrentPerform(iterations: 100) { _ in
                 if let item = s.currentItem {
-                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId)
                 }
             }
             let ids = s.responses.map(\.questionId)
@@ -387,12 +387,12 @@ final class DiagnosticTests: XCTestCase {
                                   now: { box.now() })
         s.start()
         let first = try! XCTUnwrap(s.currentItem)
-        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000, questionId: first.question.questionId))
         box.advance(61)
         DispatchQueue.concurrentPerform(iterations: 100) { i in
             if i % 2 == 0 {
                 if let item = s.currentItem {
-                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000, questionId: item.question.questionId)
                 }
             } else {
                 _ = s.expireIfNeeded()
@@ -402,7 +402,7 @@ final class DiagnosticTests: XCTestCase {
         let ids = s.responses.map(\.questionId)
         XCTAssertEqual(ids.count, Set(ids).count, "duplicate recorded items: \(ids)")
         // Expiry already completed the session: no late recording.
-        XCTAssertFalse(s.submit(answer: "48", responseMs: 1_000))
+        XCTAssertFalse(s.submit(answer: "48", responseMs: 1_000, questionId: first.question.questionId))
         XCTAssertEqual(s.responses.map(\.questionId), ids)
     }
 
@@ -419,9 +419,9 @@ final class DiagnosticTests: XCTestCase {
         var guardCount = 0
         while let item = fractionsWrong.currentItem, guardCount < 100 {
             if item.area == .fractions {
-                XCTAssertFalse(fractionsWrong.submit(answer: "definitely-wrong", responseMs: 2_000))
+                XCTAssertFalse(fractionsWrong.submit(answer: "definitely-wrong", responseMs: 2_000, questionId: item.question.questionId))
             } else {
-                XCTAssertTrue(fractionsWrong.submit(answer: item.question.verifiedAnswer, responseMs: 2_000))
+                XCTAssertTrue(fractionsWrong.submit(answer: item.question.verifiedAnswer, responseMs: 2_000, questionId: item.question.questionId))
             }
             guardCount += 1
         }
@@ -462,7 +462,7 @@ final class DiagnosticTests: XCTestCase {
         while let item = secondSession.currentItem, guardCount < 100 {
             _ = secondSession.submit(
                 answer: item.area == .fractions ? "definitely-wrong" : item.question.verifiedAnswer,
-                responseMs: 2_000)
+                responseMs: 2_000, questionId: item.question.questionId)
             guardCount += 1
         }
         let secondProfile = secondSession.profile()
@@ -480,6 +480,63 @@ final class DiagnosticTests: XCTestCase {
         XCTAssertEqual(loaded?.estimate(for: .fractions).level, .emerging)
         XCTAssertNotEqual(loaded?.estimate(for: .fractions).level,
                           firstProfile.estimate(for: .fractions).level)
+    }
+
+    // MARK: - Copilot round-3 regression tests
+
+    func testMathItemAlternateAnswerDoesNotBypassSolver() {
+        // 3 x 4 with acceptableAnswers ["99"]: 99 must be marked wrong;
+        // math grading goes through the solver, never unverified alternates.
+        let item = DiagnosticBankItem(
+            area: .factsFluency,
+            problem: ProposedProblem(skill: .multiplicationFacts, operands: [3, 4],
+                                     promptText: "3 × 4 = ?", difficulty: 1),
+            acceptableAnswers: ["99"])
+        var quotas = Dictionary(uniqueKeysWithValues: DiagnosticArea.allCases.map { ($0, 0) })
+        quotas[.factsFluency] = 1
+        func freshSession() -> DiagnosticSession {
+            DiagnosticSession(sessionId: "diag-r3-math", solver: SolverService(),
+                              bank: [item], timeBudgetSeconds: 600,
+                              itemsPerArea: quotas, now: { self.clock })
+        }
+        let wrong = freshSession()
+        wrong.start()
+        XCTAssertNotNil(wrong.currentItem)
+        XCTAssertFalse(wrong.submit(answer: "99", responseMs: 1_000, questionId: wrong.currentItem?.question.questionId ?? ""),
+                       "unverified alternate 99 must not be accepted for 3 x 4")
+        XCTAssertEqual(wrong.responses.first?.correct, false)
+        let correct = freshSession()
+        correct.start()
+        XCTAssertTrue(correct.submit(answer: "12", responseMs: 1_000, questionId: correct.currentItem?.question.questionId ?? ""))
+        XCTAssertEqual(correct.responses.first?.correct, true)
+    }
+
+    func testReadingComprehensionAlternateStillAcceptedRound3() {
+        // Legitimate passage-supported alternate must still be accepted.
+        XCTAssertTrue(submitSingleItem(promptContaining: "When did Mia water", answer: "before school"))
+        XCTAssertTrue(submitSingleItem(promptContaining: "Where did Mr. Lee move", answer: "a reading corner"))
+    }
+
+    func testStaleSubmissionIsRejectedWithoutGradingOrAdvancing() {
+        let s = makeSession()
+        s.start()
+        // Two callers read the same presented item.
+        let presented = try! XCTUnwrap(s.currentItem)
+        let callerAItem = presented
+        let callerBItem = presented
+        XCTAssertEqual(callerAItem.question.questionId, callerBItem.question.questionId)
+        // First caller submits and advances the session.
+        XCTAssertTrue(s.submit(answer: callerAItem.question.verifiedAnswer, responseMs: 1_000, questionId: callerAItem.question.questionId))
+        let nextItem = try! XCTUnwrap(s.currentItem)
+        XCTAssertNotEqual(nextItem.question.questionId, presented.question.questionId)
+        let responsesBefore = s.responses
+        let attemptedBefore = s.profile().estimates.map(\.itemsAttempted)
+        // Second caller submits its stale answer for the first item.
+        XCTAssertFalse(s.submit(answer: callerBItem.question.verifiedAnswer, responseMs: 1_000, questionId: callerBItem.question.questionId))
+        XCTAssertEqual(s.responses, responsesBefore, "stale submission must not be graded/recorded")
+        XCTAssertEqual(s.profile().estimates.map(\.itemsAttempted), attemptedBefore)
+        XCTAssertEqual(s.currentItem?.question.questionId, nextItem.question.questionId,
+                       "stale submission must not advance the session")
     }
 
     func testCorruptProfileFileThrowsOnLoad() throws {
