@@ -1,14 +1,21 @@
 import SwiftUI
 import EarnPlayCore
 
-/// Minimal T0.2 spike/debug screen: runs one fixed prompt on-device and
-/// shows the round-trip latency. This is the screen the card's manual
-/// Airplane Mode test uses (human checkpoint, not an automated step).
+/// Minimal T0.2 spike/debug screen: runs one fixed prompt on-device.
 ///
-/// The model file is never bundled. Install it with
-/// `Scripts/setup-model-spike.sh` (simulator) or copy a GGUF named
-/// `EarnPlayModel.gguf` into the app's Documents (device). Without a
-/// model the screen says so — it never invents a response.
+/// Inference uses the PERSISTED production registry's active bundle
+/// artifacts (T5.3 F2/F6): the model file and prompt texts come from
+/// `VersionRegistry.inferenceArtifacts()`, so after a rollback the
+/// rolled-back model/prompts are the ones actually loaded — never
+/// the current artifacts under an old label. Without a model the
+/// screen says so — it never invents a response.
+///
+/// Round 4 F8: registry resolution (which hashes the model) and
+/// snapshot copies run off the main actor; the view shows a loading
+/// state and disables conflicting actions until they finish. The
+/// `ModelRuntime` is bound to the resolved content digest, so a
+/// model file replaced after resolution is rejected at load (F1)
+/// instead of running under the old version stamp.
 struct SpikeView: View {
     @State private var selectedPrompt = 0
     @State private var responseText = ""
@@ -17,36 +24,87 @@ struct SpikeView: View {
     @State private var warmText = "—"
     @State private var isRunning = false
     @State private var runCount = 0
-    @State private var runtime: ModelRuntime? = {
-        guard let url = ModelRuntime.defaultModelURL() else { return nil }
-        return ModelRuntime(modelPath: url)
-    }()
+
+    @State private var artifacts: InferenceArtifacts?
+    @State private var artifactError: String?
+    @State private var registry: VersionRegistry?
+    @State private var versionStatus = ""
+    @State private var runtime: ModelRuntime?
+    @State private var isResolving = true
+    @State private var isVersionActionRunning = false
+
+    private var prompts: [String] { artifacts?.prompts ?? [] }
+    private var versionActionsDisabled: Bool { isRunning || isResolving || isVersionActionRunning }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Model spike (T0.2)")
                 .font(.headline)
-            Text(ModelRuntime.modelIdentifier)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(ModelRuntime.runtimeIdentifier)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Picker("Prompt", selection: $selectedPrompt) {
-                ForEach(SpikePrompts.all.indices, id: \.self) { index in
-                    Text("Prompt \(index + 1)").tag(index)
-                }
+            if isResolving {
+                Text("Resolving version artifacts…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .pickerStyle(.segmented)
+            if let artifacts {
+                Text("Model version: \(artifacts.modelVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Prompt version: \(artifacts.promptVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let artifactError {
+                Text(artifactError)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            // Round 6 F1 (chosen option): child rollback controls
+            // are debug-only. This section is not compiled in
+            // non-DEBUG builds, so no child-app rollback action is
+            // reachable in production; production rollback runs
+            // through the EarnPlayAdmin operator app (see
+            // Docs/VersioningAndRollback.md).
+            #if DEBUG
+            if RollbackControlPolicy.allowsChildAppRollbackControls {
+                Divider()
+                Text("Version rollback (this app, debug only)")
+                    .font(.subheadline.bold())
+                Button("Register active bundle as previous known-good") {
+                    performVersionAction { try $0.registerActiveAsPreviousKnownGood() }
+                }
+                .disabled(versionActionsDisabled)
+                Button("Roll back to previous known-good") {
+                    performVersionAction { try $0.rollbackToPreviousKnownGood() }
+                }
+                .disabled(versionActionsDisabled)
+                Button("Roll forward to current") {
+                    performVersionAction { try $0.select(bundleID: "current") }
+                }
+                .disabled(versionActionsDisabled)
+            }
+            #endif
+            if !versionStatus.isEmpty {
+                Text(versionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-            Text(SpikePrompts.all[selectedPrompt])
-                .font(.subheadline)
+            if !prompts.isEmpty {
+                Picker("Prompt", selection: $selectedPrompt) {
+                    ForEach(prompts.indices, id: \.self) { index in
+                        Text("Prompt \(index + 1)").tag(index)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(prompts[min(selectedPrompt, prompts.count - 1)])
+                    .font(.subheadline)
+            }
 
             Button(isRunning ? "Running…" : "Run prompt") {
                 run()
             }
-            .disabled(isRunning || runtime == nil)
+            .disabled(isRunning || isResolving || isVersionActionRunning || runtime == nil || prompts.isEmpty)
 
             Text(statusText)
                 .font(.caption)
@@ -61,20 +119,111 @@ struct SpikeView: View {
                     .font(.body)
                     .textSelection(.enabled)
             }
-            if runtime == nil {
+            if runtime == nil && !isResolving {
                 Text("No model file found. Run Scripts/setup-model-spike.sh, or copy a GGUF as EarnPlayModel.gguf into Documents.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .padding()
+        .task { await reloadArtifactsAsync() }
+    }
+
+    /// F9/F10: a successful reload replaces the runtime, so prior
+    /// results are cleared and the run counter resets; a failed
+    /// reload clears artifacts/runtime so Run stays disabled.
+    private func applyResolved(_ resolved: InferenceArtifacts, registry reg: VersionRegistry) {
+        // Round 6 F4: release the superseded session's retained
+        // snapshot only after the new artifacts are resolved.
+        if let old = artifacts {
+            (registry ?? reg).releaseInferenceArtifacts(old)
+        }
+        artifacts = resolved
+        artifactError = nil
+        runtime = resolved.modelURL.map {
+            ModelRuntime(modelPath: $0, expectedContentDigest: resolved.modelContentDigest,
+                         expectedModelVersion: resolved.modelContentDigest == nil ? resolved.modelVersion : nil)
+        }
+        registry = reg
+        selectedPrompt = 0
+        responseText = ""
+        coldText = "—"
+        warmText = "—"
+        runCount = 0
+        statusText = "Model not loaded yet."
+    }
+
+    private func applyResolutionFailure(_ error: Error) {
+        if let old = artifacts, let registry {
+            registry.releaseInferenceArtifacts(old)
+        }
+        artifacts = nil
+        runtime = nil
+        artifactError = "Version artifacts unavailable: \(String(describing: error))"
+        responseText = ""
+        coldText = "—"
+        warmText = "—"
+        runCount = 0
+    }
+
+    private func reloadArtifactsAsync() async {
+        isResolving = true
+        defer { isResolving = false }
+        do {
+            let reg = registry
+            let (loaded, resolved) = try await Task.detached(priority: .userInitiated) {
+                let r = try reg ?? VersionRegistry.production()
+                SpikeView.installLoadValidator(on: r)
+                return (r, try r.inferenceArtifacts())
+            }.value
+            applyResolved(resolved, registry: loaded)
+            versionStatus = "Active bundle is now \(try loaded.activeBundleID)."
+        } catch {
+            applyResolutionFailure(error)
+            versionStatus = "Failed: \(String(describing: error))"
+        }
+    }
+
+    // Round 6 F1: only the debug-only controls call this.
+    #if DEBUG
+    private func performVersionAction(_ action: @escaping @Sendable (VersionRegistry) throws -> Void) {
+        guard !versionActionsDisabled else { return }
+        isVersionActionRunning = true
+        Task {
+            defer { isVersionActionRunning = false }
+            do {
+                let reg = registry
+                let loaded = try await Task.detached(priority: .userInitiated) { () -> VersionRegistry in
+                    let r = try reg ?? VersionRegistry.production()
+                    SpikeView.installLoadValidator(on: r)
+                    try action(r)
+                    return r
+                }.value
+                registry = loaded
+                await reloadArtifactsAsync()
+            } catch {
+                versionStatus = "Failed: \(String(describing: error))"
+            }
+        }
+    }
+    #endif
+
+    /// Round 5 F9: a candidate must load before selection commits.
+    static func installLoadValidator(on registry: VersionRegistry) {
+        registry.candidateLoadValidator = { artifacts in
+            guard let url = artifacts.modelURL else {
+                throw VersioningError.artifactUnavailable(bundleID: "candidate", artifact: "modelFile")
+            }
+            try ModelRuntime(modelPath: url,
+                             expectedContentDigest: artifacts.modelContentDigest).load()
+        }
     }
 
     private func run() {
-        guard let runtime else { return }
+        guard let runtime, !prompts.isEmpty, !isVersionActionRunning else { return }
         isRunning = true
         statusText = "Running on-device…"
-        let prompt = SpikePrompts.all[selectedPrompt]
+        let prompt = prompts[min(selectedPrompt, prompts.count - 1)]
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
