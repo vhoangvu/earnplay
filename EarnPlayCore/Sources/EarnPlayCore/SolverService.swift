@@ -488,8 +488,8 @@ public struct SolverService: Sendable {
     /// decimals and unambiguous abbreviations — are not boundaries, and
     /// commas, quotes, apostrophes, and other internal punctuation are
     /// kept verbatim in the returned sentences. A line break is not by
-    /// itself a boundary: it is whitespace unless the next line starts
-    /// a new sentence (an uppercase letter). An abbreviation period is
+    /// itself a boundary: it is whitespace unless a sentence terminator
+    /// (`.`, `!`, `?`) establishes a boundary. An abbreviation period is
     /// suppressed only in unambiguous context — a lowercase or numeric
     /// continuation, a numeric label (`Fig.`/`No.`/`Vol.`) before a
     /// digit, or a capitalized title before a proper name. Sentence-
@@ -516,15 +516,8 @@ public struct SolverService: Sendable {
         while i < chars.count {
             let c = chars[i]
             if c == "\n" || c == "\r" {
-                var j = i + 1
-                while j < chars.count, chars[j].isWhitespace { j += 1 }
-                if j < chars.count, chars[j].isUppercase {
-                    flush()
-                    i = j
-                } else {
-                    current.append(" ")
-                    i += 1
-                }
+                current.append(" ")
+                i += 1
                 continue
             }
             current.append(c)
@@ -546,7 +539,8 @@ public struct SolverService: Sendable {
                             if let next, next.isLowercase {
                                 isInternalPeriod = true
                             } else if let next, next.isNumber,
-                                      numericLabels.contains(word) {
+                                      numericLabels.contains(word),
+                                      token.first?.isUppercase == true {
                                 isInternalPeriod = true
                             } else if let next, next.isUppercase,
                                       token.first?.isUppercase == true,
@@ -579,33 +573,65 @@ public struct SolverService: Sendable {
     /// Lowercases and tokenizes on non-alphanumeric boundaries, keeping
     /// numeric punctuation inside a number: `2.5` stays one token (never
     /// `2 5` or `25`), `1/2` stays one token, and a thousands comma is
-    /// dropped (`1,000` becomes `1000`). Distinct numbers therefore
-    /// never conflate during support checks or reading grading.
+    /// dropped only when the complete token is a valid thousands-grouped
+    /// number (`1,000` becomes `1000`, `1,000,000` becomes `1000000`).
+    /// Commas that are not valid thousands separators are token
+    /// boundaries (`1,2,3` becomes `1 2 3`, never `123`). Distinct
+    /// numbers therefore never conflate during support checks or
+    /// reading grading.
     static func normalizeForSupport(_ text: String) -> String {
         let chars = Array(text.lowercased())
-        var tokens: [String] = []
+        var rawTokens: [String] = []
         var current = ""
         func flushToken() {
-            if !current.isEmpty { tokens.append(current) }
+            if !current.isEmpty { rawTokens.append(current) }
             current = ""
         }
         for index in chars.indices {
             let c = chars[index]
             if c.isLetter || c.isNumber {
                 current.append(c)
-            } else if (c == "." || c == "/"),
+            } else if (c == "." || c == "/" || c == ","),
                       current.last?.isNumber == true,
                       index + 1 < chars.count, chars[index + 1].isNumber {
                 current.append(c)
-            } else if c == ",",
-                      current.last?.isNumber == true,
-                      index + 1 < chars.count, chars[index + 1].isNumber {
-                continue
             } else {
                 flushToken()
             }
         }
         flushToken()
+        var tokens: [String] = []
+        for token in rawTokens {
+            if token.contains(",") {
+                if Self.isThousandsGroupedNumber(token) {
+                    tokens.append(token.filter { $0 != "," })
+                } else {
+                    tokens.append(contentsOf: token.split(separator: ",")
+                        .map(String.init).filter { !$0.isEmpty })
+                }
+            } else {
+                tokens.append(token)
+            }
+        }
         return tokens.joined(separator: " ")
+    }
+
+    /// True only for a complete thousands-grouped number: a leading
+    /// group of 1-3 digits, then one or more groups of exactly 3
+    /// digits, with an optional decimal fraction (`1,000`, `1,000.5`).
+    static func isThousandsGroupedNumber(_ token: String) -> Bool {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 1 || parts.count == 2 else { return false }
+        if parts.count == 2 {
+            guard !parts[1].isEmpty, parts[1].allSatisfy({ $0.isNumber }) else { return false }
+        }
+        let groups = parts[0].split(separator: ",", omittingEmptySubsequences: false)
+        guard groups.count >= 2 else { return false }
+        guard groups[0].count >= 1, groups[0].count <= 3,
+              groups[0].allSatisfy({ $0.isNumber }) else { return false }
+        for group in groups.dropFirst() {
+            guard group.count == 3, group.allSatisfy({ $0.isNumber }) else { return false }
+        }
+        return true
     }
 }

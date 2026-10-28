@@ -509,6 +509,79 @@ final class SolverServiceTests: XCTestCase {
                        .incorrect(expected: "2.5 miles"))
         XCTAssertEqual(solver.checkAnswer(p, proposedAnswer: "2.5 miles"), .correct)
     }
+
+    // MARK: Fix round 5 Finding 1 — line break before a proper name is whitespace
+
+    func testReadingLineBreakBeforeProperNameSupported() {
+        let verdict = solver.verifyReadingSupport(
+            passage: "Maya gave\nTom three apples.",
+            proposedAnswer: "gave Tom three apples")
+        guard case .supported = verdict else {
+            return XCTFail("wrapped proper name must stay in one sentence, got \(verdict)")
+        }
+    }
+
+    // MARK: Fix round 5 Finding 2 — ordinary word before digit sentence is a boundary
+
+    func testReadingOrdinaryWordBeforeDigitSentenceUnsupported() {
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "Maya ate a fig. 3 birds flew away.",
+                proposedAnswer: "fig 3 birds"),
+            .unsupported)
+    }
+
+    // MARK: Fix round 5 Finding 3 — commas that are not thousands separators
+
+    func testReadingCommaSeparatedDigitsNotConflatedWithWholeNumber() {
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "The winning ticket numbers were 1,2,3.",
+                proposedAnswer: "123"),
+            .unsupported)
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "The winning ticket was 123.",
+                proposedAnswer: "1,2,3"),
+            .unsupported)
+        guard case .supported = solver.verifyReadingSupport(
+            passage: "The winning ticket numbers were 1,2,3.",
+            proposedAnswer: "1,2,3") else {
+            return XCTFail("identical comma-separated list must stay supported")
+        }
+        // Valid thousands grouping is still a single number.
+        guard case .supported = solver.verifyReadingSupport(
+            passage: "Maya had 1,000 marbles.",
+            proposedAnswer: "1000 marbles") else {
+            return XCTFail("1,000 must still normalize to 1000")
+        }
+        guard case .supported = solver.verifyReadingSupport(
+            passage: "Maya had 1,000,000 marbles.",
+            proposedAnswer: "1000000 marbles") else {
+            return XCTFail("1,000,000 must still normalize to 1000000")
+        }
+    }
+
+    func testReadingGradingCommaSeparatedDigitsNotConflated() {
+        let p = problem(.readingComprehension,
+                        passage: "The winning ticket numbers were 1,2,3.",
+                        candidate: "1,2,3")
+        XCTAssertEqual(solver.checkAnswer(p, proposedAnswer: "123"),
+                       .incorrect(expected: "1,2,3"))
+        XCTAssertEqual(solver.checkAnswer(p, proposedAnswer: "1,2,3"), .correct)
+        guard case .success(let q) = solver.verify(p, questionId: "r-comma") else {
+            return XCTFail("comma-separated candidate must verify")
+        }
+        XCTAssertEqual(solver.checkAnswer(q, proposedAnswer: "123"),
+                       .incorrect(expected: "1,2,3"))
+        XCTAssertEqual(solver.checkAnswer(q, proposedAnswer: "1,2,3"), .correct)
+        // Grading keeps valid thousands grouping equivalent.
+        let thousands = problem(.readingComprehension,
+                                passage: "Maya had 1,000 marbles.",
+                                candidate: "1,000 marbles")
+        XCTAssertEqual(solver.checkAnswer(thousands, proposedAnswer: "1000 marbles"), .correct)
+        XCTAssertEqual(solver.checkAnswer(thousands, proposedAnswer: "1,000 marbles"), .correct)
+    }
 }
 
 // MARK: - Finding 6 acceptance coverage (issue #3)
