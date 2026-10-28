@@ -67,6 +67,7 @@ public final class PolicyStore: @unchecked Sendable {
     private let directory: URL
     private let fileManager: FileManager
     private let dataWriter: (Data, URL) throws -> Void
+    private let lockAcquirer: (URL) throws -> Int32
     private let lock = NSLock()
     private var cached: Policy
 
@@ -80,16 +81,24 @@ public final class PolicyStore: @unchecked Sendable {
     /// to a file URL and must throw on failure. Production uses the default
     /// atomic `Data.write`; tests inject a throwing writer to exercise the
     /// persistence-failure path deterministically. It has no other effect.
+    ///
+    /// `lockAcquirer` is the lock-acquisition seam: given the lock-file
+    /// URL it must return a locked file descriptor or throw an
+    /// `NSPOSIXErrorDomain` error. Production uses the default
+    /// `open` + `flock(LOCK_EX)` implementation; tests inject a failing
+    /// or interrupted acquirer to exercise that path deterministically.
     public init(
         directory: URL,
         fileManager: FileManager = .default,
-        dataWriter: ((Data, URL) throws -> Void)? = nil
+        dataWriter: ((Data, URL) throws -> Void)? = nil,
+        lockAcquirer: ((URL) throws -> Int32)? = nil
     ) {
         self.directory = directory
         self.fileManager = fileManager
         self.dataWriter = dataWriter ?? { data, url in
             try data.write(to: url, options: [.atomic])
         }
+        self.lockAcquirer = lockAcquirer ?? Self.acquireLockFile(at:)
         self.cached = Self.load(directory: directory, fileManager: fileManager)
             ?? .defaultPolicy
     }
@@ -135,7 +144,13 @@ public final class PolicyStore: @unchecked Sendable {
         // directory (the instance lock alone cannot), then compare against
         // the persisted truth — not just this instance's cache — so a store
         // created before another store wrote v2 still rejects v1.
-        let lockFD = acquireDirectoryLock()
+        let lockFD: Int32
+        do {
+            lockFD = try acquireDirectoryLock()
+        } catch {
+            // Never proceed unlocked: fail before reading or writing.
+            return .persistenceFailed(currentVersion: cached.version)
+        }
         defer { releaseDirectoryLock(lockFD) }
         if let persisted = Self.load(directory: directory, fileManager: fileManager),
            persisted.version > cached.version {
@@ -153,16 +168,34 @@ public final class PolicyStore: @unchecked Sendable {
         return .applied
     }
 
-    // MARK: - Cross-instance lock (best effort; re-read above is the guard)
+    // MARK: - Cross-instance lock (fail-closed; re-read above is the guard)
 
-    private func acquireDirectoryLock() -> Int32 {
-        try? fileManager.createDirectory(
+    private func acquireDirectoryLock() throws -> Int32 {
+        try fileManager.createDirectory(
             at: directory, withIntermediateDirectories: true
         )
         let lockURL = directory.appendingPathComponent(Self.lockFileName)
+        while true {
+            do {
+                return try lockAcquirer(lockURL)
+            } catch let error as NSError
+                where error.domain == NSPOSIXErrorDomain
+                    && Int32(error.code) == EINTR {
+                continue
+            }
+        }
+    }
+
+    private static func acquireLockFile(at lockURL: URL) throws -> Int32 {
         let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
-        guard fd >= 0 else { return -1 }
-        flock(fd, LOCK_EX)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard flock(fd, LOCK_EX) == 0 else {
+            let code = Int(errno)
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: code)
+        }
         return fd
     }
 

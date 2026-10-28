@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import EarnPlayCore
 
@@ -359,6 +360,74 @@ final class PolicyStoreTests: XCTestCase {
         XCTAssertEqual(storeB.storedVersion, 2)
         XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, v2)
         XCTAssertEqual(PolicyStore(directory: directory).storedVersion, 2)
+    }
+
+    // MARK: - Lock-acquisition failure (Copilot round-3 Finding 1)
+
+    func testApplyFailsClosedWhenDirectoryLockCannotBeAcquired() throws {
+        // A directory at the lock-file path cannot be opened O_RDWR, so
+        // lock acquisition fails deterministically through the real
+        // filesystem path (no mock). Apply must not proceed unlocked.
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("policy.lock"),
+            withIntermediateDirectories: false
+        )
+        let store = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            store.apply(samplePolicy(version: 1)),
+            .persistenceFailed(currentVersion: 0)
+        )
+        XCTAssertEqual(store.storedVersion, 0)
+        XCTAssertEqual(store.currentPolicy, .defaultPolicy)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(PolicyStore.policyFileName).path
+            )
+        )
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, .defaultPolicy)
+    }
+
+    func testInjectedLockFailureReturnsPersistenceFailedBeforeReadingOrWriting() {
+        // Store B is created (cache v0) before store A persists v2. If B's
+        // lock acquisition fails, B must report its own cached version —
+        // proving it did not re-read disk — and must not write.
+        var attempts = 0
+        let storeB = PolicyStore(directory: directory, lockAcquirer: { _ in
+            attempts += 1
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+        })
+        let storeA = PolicyStore(directory: directory)
+        let v2 = samplePolicy(version: 2)
+        XCTAssertEqual(storeA.apply(v2), .applied)
+
+        XCTAssertEqual(
+            storeB.apply(samplePolicy(version: 1)),
+            .persistenceFailed(currentVersion: 0)
+        )
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(storeB.storedVersion, 0)
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, v2)
+    }
+
+    func testLockAcquisitionRetriesWhenInterrupted() {
+        var attempts = 0
+        let store = PolicyStore(directory: directory, lockAcquirer: { lockURL in
+            attempts += 1
+            if attempts <= 2 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINTR))
+            }
+            let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+            guard fd >= 0, flock(fd, LOCK_EX) == 0 else {
+                if fd >= 0 { close(fd) }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            return fd
+        })
+        let policy = samplePolicy(version: 1)
+        XCTAssertEqual(store.apply(policy), .applied)
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(store.storedVersion, 1)
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, policy)
     }
 
     // MARK: - alwaysAllowed precedence (Copilot round-2 Finding 2)
