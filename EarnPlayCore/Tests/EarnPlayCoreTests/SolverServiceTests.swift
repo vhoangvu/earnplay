@@ -415,6 +415,26 @@ final class SolverServiceTests: XCTestCase {
             passage: "Maya planted seeds. Birds ate them.", proposedAnswer: "seeds birds")
         XCTAssertEqual(verdict, .unsupported)
     }
+
+    func testReadingEvidencePreservesInternalPunctuation() {
+        let punctPassage = "Maya said, \"Don't forget the twelve seeds, please.\" She smiled, waved, and left."
+        let verdict = solver.verifyReadingSupport(
+            passage: punctPassage, proposedAnswer: "Don't forget the twelve seeds")
+        guard case .supported(let evidence) = verdict else {
+            return XCTFail("expected supported, got \(verdict)")
+        }
+        XCTAssertEqual(evidence, "Maya said, \"Don't forget the twelve seeds, please.\"")
+    }
+
+    func testReadingEvidencePreservesInternalPeriods() {
+        let punctPassage = "Dr. Maya planted 3.5 rows of seeds, laughing. She smiled."
+        let verdict = solver.verifyReadingSupport(
+            passage: punctPassage, proposedAnswer: "3.5 rows of seeds")
+        guard case .supported(let evidence) = verdict else {
+            return XCTFail("expected supported, got \(verdict)")
+        }
+        XCTAssertEqual(evidence, "Dr. Maya planted 3.5 rows of seeds, laughing.")
+    }
 }
 
 // MARK: - Finding 6 acceptance coverage (issue #3)

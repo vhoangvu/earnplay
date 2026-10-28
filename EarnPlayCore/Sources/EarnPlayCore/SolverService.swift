@@ -213,9 +213,9 @@ public struct VerifiedQuestion: Equatable, Sendable {
     /// trace the verified answer back to its supporting text.
     public let passage: String?
 
-    public init(questionId: String, skill: String, formType: SolverForm,
-                promptText: String, verifiedAnswer: String, difficulty: Int,
-                grade: String, passage: String? = nil) {
+    fileprivate init(questionId: String, skill: String, formType: SolverForm,
+                     promptText: String, verifiedAnswer: String, difficulty: Int,
+                     grade: String, passage: String? = nil) {
         self.questionId = questionId
         self.skill = skill
         self.formType = formType
@@ -473,14 +473,68 @@ public struct SolverService: Sendable {
         let answerSpan = " \(normalizedAnswer) "
         guard " \(normalizedPassage) ".contains(answerSpan) else { return .unsupported }
         // Evidence: the first passage sentence containing the complete answer span.
-        let sentences = cleanPassage.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-        for sentence in sentences {
-            let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty, " \(Self.normalizeForSupport(trimmed)) ".contains(answerSpan) {
-                return .supported(evidence: trimmed)
+        for sentence in Self.passageSentences(cleanPassage) {
+            if " \(Self.normalizeForSupport(sentence)) ".contains(answerSpan) {
+                return .supported(evidence: sentence)
             }
         }
         return .unsupported
+    }
+
+    /// Splits a passage into sentences without dropping punctuation.
+    /// A boundary is a terminator (`.`, `!`, `?`, or newline) followed by
+    /// whitespace or the end of the passage; closing quotes/brackets after
+    /// a terminator stay with their sentence. Periods inside a sentence —
+    /// decimals and abbreviations — are not boundaries, and commas,
+    /// quotes, apostrophes, and other internal punctuation are kept
+    /// verbatim in the returned sentences.
+    static func passageSentences(_ passage: String) -> [String] {
+        let abbreviations: Set<String> = [
+            "dr", "mr", "mrs", "ms", "st", "jr", "sr", "prof", "sgt",
+            "capt", "lt", "gen", "sen", "rep", "gov", "fig", "no", "vol",
+        ]
+        let closers: Set<Character> = ["\"", "'", "\u{201D}", "\u{2019}", ")", "]", "}"]
+        let chars = Array(passage)
+        var sentences: [String] = []
+        var current = ""
+        func flush() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { sentences.append(trimmed) }
+            current = ""
+        }
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\n" {
+                flush()
+                i += 1
+                continue
+            }
+            current.append(c)
+            if c == "." || c == "!" || c == "?" {
+                var j = i + 1
+                while j < chars.count, closers.contains(chars[j]) { j += 1 }
+                let atEnd = j >= chars.count
+                if atEnd || chars[j].isWhitespace {
+                    var isInternalPeriod = false
+                    if c == "." {
+                        let word = current.dropLast()
+                            .split(whereSeparator: { !$0.isLetter })
+                            .last.map(String.init)?.lowercased() ?? ""
+                        isInternalPeriod = abbreviations.contains(word)
+                    }
+                    if !isInternalPeriod {
+                        for k in (i + 1)..<j { current.append(chars[k]) }
+                        flush()
+                        i = j
+                        continue
+                    }
+                }
+            }
+            i += 1
+        }
+        flush()
+        return sentences
     }
 
     /// Full reading check: support first, then the question-level verdict.
