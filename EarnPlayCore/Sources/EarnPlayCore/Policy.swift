@@ -85,14 +85,20 @@ public struct Policy: Codable, Equatable, Sendable {
     /// True when `app` stays locked with no challenge offered: either it is
     /// on the never-unlockable override list, or it is not unblockable at
     /// all. Overrides are checked regardless of `unblockable` membership.
+    /// `alwaysAllowed` takes precedence: an always-allowed app is never
+    /// locked, even if it also appears in the other lists.
     public func isNeverUnlockable(_ app: AppRef) -> Bool {
-        neverUnlockableOverrides.contains(app) || !unblockable.contains(app)
+        !alwaysAllowed.contains(app)
+            && (neverUnlockableOverrides.contains(app) || !unblockable.contains(app))
     }
 
     /// True when a completed challenge may open `app`: unblockable and not
     /// overridden. This is the exact predicate T2.2/T3.x gate offers on.
+    /// `alwaysAllowed` takes precedence: an always-allowed app needs no
+    /// challenge, even if it also appears in `unblockable`.
     public func isChallengeUnlockable(_ app: AppRef) -> Bool {
-        unblockable.contains(app) && !neverUnlockableOverrides.contains(app)
+        !alwaysAllowed.contains(app)
+            && unblockable.contains(app) && !neverUnlockableOverrides.contains(app)
     }
 }
 

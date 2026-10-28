@@ -61,6 +61,8 @@ public final class PolicyStore: @unchecked Sendable {
     public static let policyFileName = "policy.json"
     /// Last-good backup file name inside the store directory.
     public static let backupFileName = "policy-backup.json"
+    /// Cross-instance lock file serializing compare-and-write in `apply`.
+    private static let lockFileName = "policy.lock"
 
     private let directory: URL
     private let fileManager: FileManager
@@ -129,6 +131,16 @@ public final class PolicyStore: @unchecked Sendable {
     public func apply(_ policy: Policy) -> PolicyApplyResult {
         lock.lock()
         defer { lock.unlock() }
+        // Serialize compare-and-write across live instances over the same
+        // directory (the instance lock alone cannot), then compare against
+        // the persisted truth — not just this instance's cache — so a store
+        // created before another store wrote v2 still rejects v1.
+        let lockFD = acquireDirectoryLock()
+        defer { releaseDirectoryLock(lockFD) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager),
+           persisted.version > cached.version {
+            cached = persisted
+        }
         guard policy.version > cached.version else {
             return .rejectedStaleVersion(currentVersion: cached.version)
         }
@@ -139,6 +151,25 @@ public final class PolicyStore: @unchecked Sendable {
         }
         cached = policy
         return .applied
+    }
+
+    // MARK: - Cross-instance lock (best effort; re-read above is the guard)
+
+    private func acquireDirectoryLock() -> Int32 {
+        try? fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let lockURL = directory.appendingPathComponent(Self.lockFileName)
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else { return -1 }
+        flock(fd, LOCK_EX)
+        return fd
+    }
+
+    private func releaseDirectoryLock(_ fd: Int32) {
+        guard fd >= 0 else { return }
+        flock(fd, LOCK_UN)
+        close(fd)
     }
 
     /// Re-reads the cache from disk — the relaunch-equivalent reload.

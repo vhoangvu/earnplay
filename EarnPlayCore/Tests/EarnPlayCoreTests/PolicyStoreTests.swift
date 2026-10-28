@@ -337,4 +337,60 @@ final class PolicyStoreTests: XCTestCase {
         )
         XCTAssertTrue(relaunched.currentPolicy.unblockable.isEmpty)
     }
+
+    // MARK: - Two stores over the same directory (Copilot round-2 Finding 1)
+
+    func testTwoStoresSameDirectoryCannotRollBackPersistedPolicy() {
+        // Both stores start at version 0 over the same directory.
+        let storeA = PolicyStore(directory: directory)
+        let storeB = PolicyStore(directory: directory)
+        XCTAssertEqual(storeA.storedVersion, 0)
+        XCTAssertEqual(storeB.storedVersion, 0)
+
+        let v2 = samplePolicy(version: 2)
+        XCTAssertEqual(storeA.apply(v2), .applied)
+
+        // Sequential (not concurrent) stale apply through the other live
+        // instance must see the persisted v2, not its stale cached v0.
+        XCTAssertEqual(
+            storeB.apply(samplePolicy(version: 1)),
+            .rejectedStaleVersion(currentVersion: 2)
+        )
+        XCTAssertEqual(storeB.storedVersion, 2)
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, v2)
+        XCTAssertEqual(PolicyStore(directory: directory).storedVersion, 2)
+    }
+
+    // MARK: - alwaysAllowed precedence (Copilot round-2 Finding 2)
+
+    func testDefaultPolicyAlwaysAllowedAppsAreNeitherNeverNorChallengeUnlockable() {
+        XCTAssertFalse(Policy.defaultPolicy.isNeverUnlockable(.phone))
+        XCTAssertFalse(Policy.defaultPolicy.isChallengeUnlockable(.phone))
+        XCTAssertFalse(Policy.defaultPolicy.isNeverUnlockable(.messages))
+        XCTAssertFalse(Policy.defaultPolicy.isChallengeUnlockable(.messages))
+        XCTAssertFalse(Policy.defaultPolicy.isNeverUnlockable(.earnPlaySelf))
+        XCTAssertFalse(Policy.defaultPolicy.isChallengeUnlockable(.earnPlaySelf))
+    }
+
+    func testAlwaysAllowedTakesPrecedenceInUnlockabilityPredicates() {
+        let overlappingUnblockable = AppRef(id: "com.example.overlap-unblockable")
+        let overlappingOverride = AppRef(id: "com.example.overlap-override")
+        var policy = samplePolicy(version: 1)
+        policy.alwaysAllowed = [overlappingUnblockable, overlappingOverride]
+        policy.unblockable = [overlappingUnblockable, AppRef(id: "com.example.game")]
+        policy.neverUnlockableOverrides = [overlappingOverride, AppRef(id: "com.example.browser")]
+
+        // In both alwaysAllowed and unblockable: neither predicate fires.
+        XCTAssertFalse(policy.isNeverUnlockable(overlappingUnblockable))
+        XCTAssertFalse(policy.isChallengeUnlockable(overlappingUnblockable))
+        // In both alwaysAllowed and neverUnlockableOverrides: neither fires.
+        XCTAssertFalse(policy.isNeverUnlockable(overlappingOverride))
+        XCTAssertFalse(policy.isChallengeUnlockable(overlappingOverride))
+
+        // Non-alwaysAllowed behaviour is unchanged.
+        XCTAssertFalse(policy.isNeverUnlockable(AppRef(id: "com.example.game")))
+        XCTAssertTrue(policy.isChallengeUnlockable(AppRef(id: "com.example.game")))
+        XCTAssertTrue(policy.isNeverUnlockable(AppRef(id: "com.example.browser")))
+        XCTAssertFalse(policy.isChallengeUnlockable(AppRef(id: "com.example.browser")))
+    }
 }
