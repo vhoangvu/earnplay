@@ -465,7 +465,7 @@ public final class ModelRuntime: @unchecked Sendable {
 
     /// Runs one prompt-to-response round-trip. The first call on a fresh
     /// instance loads the model and reports `wasColdStart == true`.
-    public func generate(prompt: String, maxTokens: Int32 = 64) throws -> ModelInferenceResult {
+    public func generate(prompt: String, maxTokens: Int32 = 64, seed: UInt32 = 42) throws -> ModelInferenceResult {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw ModelRuntimeError.emptyPrompt
@@ -489,7 +489,7 @@ public final class ModelRuntime: @unchecked Sendable {
         var tokenCount: Int32 = 0
         var errorPtr: UnsafeMutablePointer<CChar>?
         let generated: String = try prompt.withCString { cPrompt in
-            let raw = ep_llama_generate(handle, cPrompt, maxTokens, 42, &tokenCount, &errorPtr)
+            let raw = ep_llama_generate(handle, cPrompt, maxTokens, seed, &tokenCount, &errorPtr)
             if let errorPtr {
                 let message = String(cString: errorPtr)
                 ep_llama_free_string(errorPtr)
