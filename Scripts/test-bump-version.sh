@@ -18,6 +18,7 @@ cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
 trap cleanup EXIT
 
 fresh() {
+  [ -n "$WORK" ] && rm -rf "$WORK"
   WORK="$(mktemp -d)"
   cp "$FIXTURE" "$WORK/project.yml"
   # Normalize the scratch copy to version 0.1.0 / build 1 (quoted or
