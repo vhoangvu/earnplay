@@ -45,6 +45,7 @@ NEW_VERSION=""
 BUMP_PART=""
 BUMP_BUILD=0
 SET_BUILD=""
+SET_BUILD_GIVEN=0
 DRY_RUN=0
 
 die_usage() { echo "error: $1" >&2; echo "run with --help for usage" >&2; exit 2; }
@@ -69,7 +70,9 @@ while [ $# -gt 0 ]; do
       BUMP_BUILD=1; shift ;;
     --set-build)
       [ $# -ge 2 ] || die_usage "--set-build needs a value"
-      [ -z "$SET_BUILD" ] || die_usage "--set-build given twice"
+      [ "$SET_BUILD_GIVEN" -eq 0 ] || die_usage "--set-build given twice"
+      [ -n "$2" ] || die_usage "--set-build needs a non-empty value"
+      SET_BUILD_GIVEN=1
       SET_BUILD="$2"; shift 2 ;;
     --check)
       [ -z "$MODE" ] || die_usage "--check cannot be combined with a change"
@@ -86,12 +89,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$MODE" ] || [ "$BUMP_BUILD" -eq 1 ] || [ -n "$SET_BUILD" ] \
+[ -n "$MODE" ] || [ "$BUMP_BUILD" -eq 1 ] || [ "$SET_BUILD_GIVEN" -eq 1 ] \
   || die_usage "nothing to do: pass --version, --bump, --bump-build, --set-build or --check"
-if [ "$MODE" = "check" ] && { [ "$BUMP_BUILD" -eq 1 ] || [ -n "$SET_BUILD" ]; }; then
+if [ "$MODE" = "check" ] && { [ "$BUMP_BUILD" -eq 1 ] || [ "$SET_BUILD_GIVEN" -eq 1 ]; }; then
   die_usage "--check cannot be combined with a change"
 fi
-if [ "$BUMP_BUILD" -eq 1 ] && [ -n "$SET_BUILD" ]; then
+if [ "$BUMP_BUILD" -eq 1 ] && [ "$SET_BUILD_GIVEN" -eq 1 ]; then
   die_usage "--bump-build and --set-build cannot be combined"
 fi
 [ -z "$MODE" ] && MODE="build-only"
@@ -116,7 +119,7 @@ if [ "$MODE" = "set" ]; then
   valid_version "$NEW_VERSION" \
     || die_usage "invalid semantic version: '$NEW_VERSION' (want MAJOR.MINOR.PATCH, e.g. 1.2.3)"
 fi
-if [ -n "$SET_BUILD" ]; then
+if [ "$SET_BUILD_GIVEN" -eq 1 ]; then
   valid_build "$SET_BUILD" \
     || die_usage "invalid build number: '$SET_BUILD' (want a positive integer)"
 fi
@@ -194,7 +197,7 @@ TARGET_BUILD="$CURRENT_BUILD"
 if [ "$BUMP_BUILD" -eq 1 ]; then
   TARGET_BUILD=$((CURRENT_BUILD + 1))
 fi
-if [ -n "$SET_BUILD" ]; then
+if [ "$SET_BUILD_GIVEN" -eq 1 ]; then
   TARGET_BUILD="$SET_BUILD"
 fi
 
@@ -205,22 +208,67 @@ fi
 
 # --- write ----------------------------------------------------------------
 
-# Replaces every `KEY: old` / `KEY: "old"` with `KEY: "new"`; read_values
-# accepts both quoted and unquoted YAML, so the write must handle both.
-# All targets move together: every KEY line must end at the new value.
-write_key() {
-  local key="$1" new_value="$2" tmp total updated
-  tmp="$(mktemp "$PROJECT_FILE.tmp.XXXXXX")"
+# Stages every requested change in one temporary file, validates it,
+# then atomically renames it over project.yml. Every `KEY: old` /
+# `KEY: "old"` becomes `KEY: "new"`; read_values accepts both quoted and
+# unquoted YAML, so the write must handle both. All targets move
+# together: every changed KEY line must end at the new value. A failure
+# anywhere before the rename leaves project.yml untouched, so a combined
+# bump can never leave a partial state. The rename preserves the
+# original file's permissions (mktemp creates 0600).
+write_all() {
+  local tmp perms
+  tmp="$(mktemp "$PROJECT_FILE.tmp.XXXXXX")" \
+    || die_error "failed to create temporary file next to $PROJECT_FILE"
   # shellcheck disable=SC2064
-  trap "rm -f '$tmp'" RETURN
-  sed -E "s#^([[:space:]]*$key:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$new_value\"#" "$PROJECT_FILE" > "$tmp"
-  total="$(grep -cE "^[[:space:]]*$key:" "$tmp" || true)"
-  updated="$(grep -cE "^[[:space:]]*$key:[[:space:]]*\"$new_value\"[[:space:]]*$" "$tmp" || true)"
-  [ "$total" -gt 0 ] && [ "$updated" -eq "$total" ] \
-    || die_error "failed to update $key in $PROJECT_FILE (updated $updated of $total entries)"
-  cat "$tmp" > "$PROJECT_FILE"
-  rm -f "$tmp"
-  trap - RETURN
+  trap "rm -f '$tmp'" EXIT
+  if [ "$TARGET_VERSION" != "$CURRENT_VERSION" ] && [ "$TARGET_BUILD" != "$CURRENT_BUILD" ]; then
+    if ! sed -E \
+      -e "s#^([[:space:]]*MARKETING_VERSION:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$TARGET_VERSION\"#" \
+      -e "s#^([[:space:]]*CURRENT_PROJECT_VERSION:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$TARGET_BUILD\"#" \
+      "$PROJECT_FILE" > "$tmp"; then
+      rm -f "$tmp"; trap - EXIT; die_error "failed to stage $PROJECT_FILE"
+    fi
+  elif [ "$TARGET_VERSION" != "$CURRENT_VERSION" ]; then
+    if ! sed -E \
+      "s#^([[:space:]]*MARKETING_VERSION:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$TARGET_VERSION\"#" \
+      "$PROJECT_FILE" > "$tmp"; then
+      rm -f "$tmp"; trap - EXIT; die_error "failed to stage $PROJECT_FILE"
+    fi
+  elif [ "$TARGET_BUILD" != "$CURRENT_BUILD" ]; then
+    if ! sed -E \
+      "s#^([[:space:]]*CURRENT_PROJECT_VERSION:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$TARGET_BUILD\"#" \
+      "$PROJECT_FILE" > "$tmp"; then
+      rm -f "$tmp"; trap - EXIT; die_error "failed to stage $PROJECT_FILE"
+    fi
+  else
+    cp "$PROJECT_FILE" "$tmp" || { rm -f "$tmp"; trap - EXIT; die_error "failed to stage $PROJECT_FILE"; }
+  fi
+  # Validate every changed key in the staged file before committing.
+  if [ "$TARGET_VERSION" != "$CURRENT_VERSION" ]; then
+    validate_key MARKETING_VERSION "$TARGET_VERSION" "$tmp" \
+      || { rm -f "$tmp"; trap - EXIT; die_error "failed to update MARKETING_VERSION in $PROJECT_FILE"; }
+  fi
+  if [ "$TARGET_BUILD" != "$CURRENT_BUILD" ]; then
+    validate_key CURRENT_PROJECT_VERSION "$TARGET_BUILD" "$tmp" \
+      || { rm -f "$tmp"; trap - EXIT; die_error "failed to update CURRENT_PROJECT_VERSION in $PROJECT_FILE"; }
+  fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    perms="$(stat -f '%Lp' "$PROJECT_FILE")" || { rm -f "$tmp"; trap - EXIT; die_error "failed to read permissions of $PROJECT_FILE"; }
+  else
+    perms="$(stat -c '%a' "$PROJECT_FILE")" || { rm -f "$tmp"; trap - EXIT; die_error "failed to read permissions of $PROJECT_FILE"; }
+  fi
+  chmod "$perms" "$tmp" || { rm -f "$tmp"; trap - EXIT; die_error "failed to preserve permissions on staged $PROJECT_FILE"; }
+  mv "$tmp" "$PROJECT_FILE" || { rm -f "$tmp"; trap - EXIT; die_error "failed to replace $PROJECT_FILE"; }
+  trap - EXIT
+}
+
+# Fails unless every KEY line in $3 now reads exactly "new value" $2.
+validate_key() {
+  local key="$1" new_value="$2" staged="$3" total updated
+  total="$(grep -cE "^[[:space:]]*$key:" "$staged" || true)"
+  updated="$(grep -cE "^[[:space:]]*$key:[[:space:]]*\"$new_value\"[[:space:]]*$" "$staged" || true)"
+  [ "$total" -gt 0 ] && [ "$updated" -eq "$total" ]
 }
 
 describe() {
@@ -235,11 +283,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-# Update version first, then build, so a crash cannot leave a new build
-# number on the old version. Both keys live in the same file and each
-# write is a whole-file rewrite of already-validated content.
-[ "$TARGET_VERSION" != "$CURRENT_VERSION" ] && write_key MARKETING_VERSION "$TARGET_VERSION"
-[ "$TARGET_BUILD" != "$CURRENT_BUILD" ] && write_key CURRENT_PROJECT_VERSION "$TARGET_BUILD"
+# Stage both keys in one temporary file, validate, then atomically
+# rename over project.yml: a combined bump lands both keys or neither.
+write_all
 
 describe
 echo "next: run 'xcodegen generate' so the generated project and Info.plist pick this up"

@@ -149,6 +149,30 @@ expect_reject "invalid: --set-build abc rejected" --set-build abc
 expect_reject "invalid: unknown flag rejected" --frobnicate
 expect_reject "invalid: conflicting --bump-build + --set-build rejected" --bump-build --set-build 5
 
+# --- R2-F1: empty --set-build must be rejected at parse time ----------------
+# An empty value must not be treated as "option absent": it must fail with
+# no write, and must not let --bump-build slip past the mutual-exclusion
+# check in either argument order.
+fresh
+expect_reject "R2-F1 invalid: empty --set-build rejected" --set-build ""
+expect_reject "R2-F1 invalid: --bump-build + empty --set-build rejected" --bump-build --set-build ""
+expect_reject "R2-F1 invalid: empty --set-build + --bump-build rejected" --set-build "" --bump-build
+expect_eq "R2-F1: version untouched after empty --set-build attempts" "0.1.0" "$(versions_in "$WORK/project.yml" | sort -u)"
+expect_eq "R2-F1: build untouched after empty --set-build attempts" "1" "$(builds_in "$WORK/project.yml" | sort -u)"
+# The real mutual-exclusion check must still fire for a non-empty conflict.
+fresh
+before="$(shasum -a 256 "$WORK/project.yml" | awk '{print $1}')"
+if out="$("$BUMP" --root "$WORK" --bump-build --set-build 5 2>&1)"; then
+  bad "R2-F1: --bump-build + --set-build mutual exclusion fires (script exited 0)"
+else
+  case "$out" in
+    *"cannot be combined"*) ok "R2-F1: --bump-build + --set-build mutual exclusion fires" ;;
+    *) bad "R2-F1: --bump-build + --set-build mutual exclusion fires (got: $out)" ;;
+  esac
+fi
+after="$(shasum -a 256 "$WORK/project.yml" | awk '{print $1}')"
+expect_eq "R2-F1: mutual-exclusion rejection writes nothing" "$before" "$after"
+
 # --- drift detection -----------------------------------------------------------
 fresh
 # make the two targets disagree on purpose
@@ -215,6 +239,45 @@ expect_eq "F4 bumped live file: patch bump from normalized baseline" "0.1.1" "$(
 expect_eq "F4 bumped live file: build bump from normalized baseline" "2" "$(builds_in "$WORK/project.yml" | sort -u)"
 FIXTURE="$saved_fixture"
 rm -rf "$bumped_dir"
+
+# --- R2-F2: project.yml writes are atomic -------------------------------------
+# A combined bump updates both keys or neither, the original permissions
+# survive the rename, and a failure while staging the build-number change
+# leaves project.yml byte-identical (no partial bump).
+mode_of() { # file
+  if [ "$(uname -s)" = "Darwin" ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
+
+fresh
+chmod 640 "$WORK/project.yml"
+"$BUMP" --root "$WORK" --bump patch --bump-build > /dev/null
+expect_eq "R2-F2 combined: version bumped" "0.1.1" "$(versions_in "$WORK/project.yml" | sort -u)"
+expect_eq "R2-F2 combined: build bumped" "2" "$(builds_in "$WORK/project.yml" | sort -u)"
+expect_eq "R2-F2 combined: permissions preserved" "640" "$(mode_of "$WORK/project.yml")"
+
+fresh
+chmod 640 "$WORK/project.yml"
+before="$(shasum -a 256 "$WORK/project.yml" | awk '{print $1}')"
+fakebin="$WORK/fakebin"
+mkdir -p "$fakebin"
+cat > "$fakebin/sed" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in *CURRENT_PROJECT_VERSION*) echo "simulated failure staging build change" >&2; exit 1 ;; esac
+done
+exec /usr/bin/sed "$@"
+SHIM
+chmod +x "$fakebin/sed"
+if PATH="$fakebin:$PATH" "$BUMP" --root "$WORK" --bump patch --bump-build > /dev/null 2>&1; then
+  bad "R2-F2 atomic: simulated mid-bump failure is reported (script exited 0)"
+else
+  ok "R2-F2 atomic: simulated mid-bump failure is reported"
+fi
+after="$(shasum -a 256 "$WORK/project.yml" | awk '{print $1}')"
+expect_eq "R2-F2 atomic: failed combined bump leaves file byte-identical" "$before" "$after"
+expect_eq "R2-F2 atomic: version not partially bumped" "0.1.0" "$(versions_in "$WORK/project.yml" | sort -u)"
+expect_eq "R2-F2 atomic: build not partially bumped" "1" "$(builds_in "$WORK/project.yml" | sort -u)"
+expect_eq "R2-F2 atomic: permissions untouched by failed bump" "640" "$(mode_of "$WORK/project.yml")"
 
 # --- missing file ---------------------------------------------------------------
 empty="$(mktemp -d)"

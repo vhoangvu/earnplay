@@ -71,9 +71,21 @@ uploaded build follows the same checklist.
 
 - [ ] Tag or otherwise record the released commit with its version
       and build number.
-- [ ] Rollback, if a regression is traced to this release: release
-      the previous known-good version/build again — model and prompt
-      rollback inside the apps follows
+- [ ] Rollback, if a regression is traced to this release. Never
+      re-upload the previous version/build pair: App Store Connect
+      rejects a build number already uploaded for that version. Choose
+      one of:
+      - Make an existing build available again: if the previous
+        known-good build is still in TestFlight, select / re-enable
+        that existing build for the tester group in App Store Connect.
+        Nothing is uploaded again.
+      - Publish a rebuilt rollback: restore the known-good source, but
+        assign a NEW build number (`Scripts/bump-version.sh
+        --bump-build`, or `--set-build N` with an unused N), and — when
+        required for an App Store release — a newer marketing version
+        than the release being rolled back. Then repeat steps 1–5 for
+        the rebuilt rollback.
+      Model and prompt rollback inside the apps follows
       [VersioningAndRollback.md](VersioningAndRollback.md).
 - [ ] (v1) App Store submission is a separate, later step and is not
       part of this checklist's Demo scope.
