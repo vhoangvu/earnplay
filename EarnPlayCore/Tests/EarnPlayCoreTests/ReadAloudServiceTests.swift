@@ -86,6 +86,36 @@ final class ReadAloudServiceTests: XCTestCase {
         return (service, engine, sink)
     }
 
+    /// Voice prerequisite for tests that drive the real AVSpeechEngine:
+    /// playback is possible only with a verified OS-bundled English
+    /// voice. Checked before any playback starts so a device without
+    /// one skips instead of leaving `lastUtterance` nil for a later
+    /// force unwrap to crash on.
+    private func requireBundledEnglishVoice() throws {
+        guard AVSpeechEngine.bundledVoice(forLanguage: "en-US") != nil else {
+            throw XCTSkip("No bundled English voice available on this device")
+        }
+    }
+
+    /// Deterministic callback-processing synchronization.
+    ///
+    /// `speechSynthesizer(_:didFinish:)` hops to the main actor in a
+    /// separate unstructured task, so yield-based waiting does not
+    /// guarantee that task ran before assertions resume.
+    /// The main actor is serial: a sentinel task enqueued after the
+    /// delegate task cannot run until every earlier main-actor job,
+    /// including the delegate hop, has finished. Awaiting the sentinel
+    /// therefore acknowledges processing of every callback enqueued so
+    /// far, including a stale completion that is correctly ignored and
+    /// so produces no callback of its own to wait on.
+    private func awaitCallbackProcessing() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Task { @MainActor in
+                continuation.resume()
+            }
+        }
+    }
+
     // (a) speak is called with the exact message text for a question, a
     // hint, and an instruction message.
     func testSpeakUsesExactTextForQuestionHintAndInstruction() {
@@ -326,41 +356,54 @@ final class ReadAloudServiceTests: XCTestCase {
     // after message B has started must not clear B's speaking state.
     // Otherwise stop/lifecycle calls return early and B keeps playing
     // after the view disappears or a new item starts.
-    func testStaleUtteranceFinishDoesNotClearNewerSpeakingState() async {
+    func testStaleUtteranceFinishDoesNotClearNewerSpeakingState() async throws {
+        try requireBundledEnglishVoice()
         let engine = AVSpeechEngine()
         var finishCount = 0
-        engine.onPlaybackFinished = { finishCount += 1 }
-        engine.speak(text: "Message A")
-        let utteranceA = engine.lastUtterance
-        engine.speak(text: "Message B")
-        let utteranceB = engine.lastUtterance
-        XCTAssertNotNil(utteranceA)
-        XCTAssertNotNil(utteranceB)
+        // Fulfilled by the first genuine completion callback. Awaiting
+        // it is the deterministic wait for B's callback below; the
+        // sentinel in awaitCallbackProcessing() is the acknowledgment
+        // for A's ignored stale completion, which fires no callback.
+        let finished = expectation(description: "current utterance finish callback")
+        engine.onPlaybackFinished = {
+            finishCount += 1
+            finished.fulfill()
+        }
+        XCTAssertTrue(engine.speak(text: "Message A"))
+        let utteranceA = try XCTUnwrap(engine.lastUtterance)
+        XCTAssertTrue(engine.speak(text: "Message B"))
+        let utteranceB = try XCTUnwrap(engine.lastUtterance)
         XCTAssertFalse(utteranceA === utteranceB)
         // A's stale completion arrives after B started: must be ignored.
-        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA!)
-        await Task.yield()
+        // Wait until the delegate hop has actually been processed
+        // before asserting, otherwise this could pass vacuously.
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA)
+        await awaitCallbackProcessing()
         XCTAssertEqual(finishCount, 0, "stale finish for A must not fire the completion callback")
         // B's own completion still fires exactly once.
-        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceB!)
-        await Task.yield()
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceB)
+        await fulfillment(of: [finished], timeout: 10)
         XCTAssertEqual(finishCount, 1)
         engine.stopSpeaking()
     }
 
     // Same regression through the service: after A's stale completion,
     // B is still marked speaking and lifecycle stop still stops it.
-    func testStaleFinishThroughServiceLeavesNewerMessageStoppable() async {
+    func testStaleFinishThroughServiceLeavesNewerMessageStoppable() async throws {
+        try requireBundledEnglishVoice()
         let engine = AVSpeechEngine()
         let service = ReadAloudService(band: GradeBand(grade: "4"), engine: engine)
         let messageA = TutorMessage(id: "a1", text: "Message A", kind: .question)
         let messageB = TutorMessage(id: "b1", text: "Message B", kind: .question)
         service.speak(messageA)
-        let utteranceA = engine.lastUtterance
+        let utteranceA = try XCTUnwrap(engine.lastUtterance)
         service.speak(messageB)
-        XCTAssertNotNil(utteranceA)
-        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA!)
-        await Task.yield()
+        _ = try XCTUnwrap(engine.lastUtterance)
+        // A's stale completion arrives after B started: must be ignored.
+        // Wait for the delegate hop to be processed before asserting,
+        // otherwise this could pass before a stale clear took effect.
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA)
+        await awaitCallbackProcessing()
         XCTAssertTrue(service.isSpeaking, "stale finish must not clear B's speaking state")
         XCTAssertEqual(service.currentMessageID, messageB.id)
         service.handleViewDisappeared()
