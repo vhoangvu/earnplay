@@ -13,6 +13,11 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      # T7.3: fail fast if the two targets' version/build drift apart.
+      # Check only — a pipeline run never changes the app version (LLD §15).
+      - name: Verify release version consistency
+        run: bash Scripts/bump-version.sh --check
+
       - name: Show Xcode version
         run: xcodebuild -version
 
