@@ -23,8 +23,11 @@ fractions, word problems, reading fluency, and comprehension."
   fractions 5, word problems 4, reading fluency 3, comprehension 4
   (22 items). Default budget 600 s (10 minutes), injected clock for
   tests. `abandon()` or budget exhaustion ends the session with a
-  partial profile.
-- **Scoring.** Per area: accuracy, counts, median response ms.
+  partial profile. Callers can trigger budget completion without
+  answering via `expireIfNeeded()`; submissions after the budget are
+  rejected before grading and complete the session instead.
+- **Scoring.** Per area: accuracy, counts, median response ms
+  (even-sized samples average the two middle values).
   Levels: accuracy >= 0.8 `proficient`, >= 0.5 `developing`, else
   `emerging`; unattempted areas stay `notAssessed` (unknown ≠ weak).
   Fluency areas (facts, reading fluency) also require median
@@ -43,7 +46,7 @@ grade-agnostic per LLD S2 (new grade = new content pack, same schema).
 | `estimates` | One `SkillEstimate` per `DiagnosticArea` (always all five) |
 | `diagnosticSessionId` | Session that produced this profile |
 | `completedAt` | When the profile was built |
-| `isComplete` | False on abandon/budget cut; some areas may be `notAssessed` |
+| `isComplete` | True only when every area met its `itemsPerArea` quota; false on abandon/budget cut or unmet quotas |
 
 `SkillEstimate`: `area`, `level`
 (`notAssessed/emerging/developing/proficient`), `accuracy` 0...1,
@@ -59,7 +62,8 @@ T1.2 (question generation) reads the persisted `SkillProfile`:
 
 - `profile.recommendedDifficulty(for: area)` → starting difficulty
   for generated questions in that area.
-- `profile.nextFocusArea` → weakest assessed area to practise next;
+- `profile.nextFocusArea` → weakest assessed area to practise next
+  (ranked by proficiency level first, accuracy as tiebreak);
   `nil` means no diagnostic data — run the diagnostic, do not guess.
 - `profile.estimate(for:).level == .notAssessed` → area unknown;
   T1.2 should probe it at difficulty 1 rather than assume weakness.

@@ -116,7 +116,22 @@ public struct SkillProfile: Codable, Equatable, Sendable {
     /// start the diagnostic, not guess a focus.
     public var nextFocusArea: DiagnosticArea? {
         let assessed = estimates.filter { $0.level != .notAssessed }
-        return assessed.min(by: { $0.accuracy < $1.accuracy })?.area
+        // Rank by proficiency level first (weakest level wins), then by
+        // accuracy: latency can make an all-correct area `developing`
+        // while another all-correct area is `proficient`.
+        func rank(_ level: DiagnosticLevel) -> Int {
+            switch level {
+            case .emerging: return 0
+            case .developing: return 1
+            case .proficient: return 2
+            case .notAssessed: return 3
+            }
+        }
+        return assessed.min(by: {
+            let lhs = rank($0.level), rhs = rank($1.level)
+            if lhs != rhs { return lhs < rhs }
+            return $0.accuracy < $1.accuracy
+        })?.area
     }
 
     /// Starting difficulty for T1.2 question generation in `area`.
@@ -178,6 +193,9 @@ public final class DiagnosticSession: @unchecked Sendable {
     private var queues: [DiagnosticArea: [DiagnosticItem]] = [:]
     private var staircase: [DiagnosticArea: Int] = [:]
     private var pending: DiagnosticItem?
+    /// Index into `DiagnosticArea.allCases` where the next `advance()`
+    /// starts scanning; rotated after each selection (round-robin).
+    private var nextAreaIndex: Int = 0
     /// Items required per area for the session to count as complete.
     public let itemsPerArea: [DiagnosticArea: Int]
 
@@ -229,11 +247,26 @@ public final class DiagnosticSession: @unchecked Sendable {
         return now().timeIntervalSince(startedAt) >= Double(timeBudgetSeconds)
     }
 
+    /// Deadline-aware completion path: callers (e.g. a UI timer) can
+    /// finish the session when the budget expires without answering
+    /// the pending item. Returns true only when this call completed
+    /// the session; a no-op (false) when not expired or not in progress.
+    @discardableResult
+    public func expireIfNeeded() -> Bool {
+        guard state == .inProgress, isTimeExhausted else { return false }
+        pending = nil
+        state = .completed
+        return true
+    }
+
     /// Judges the answer against the solver-verified answer (never a
     /// model answer), records it, steps the staircase, and advances.
+    /// Submissions after the time budget are rejected before grading
+    /// or any profile update, and complete the session instead.
     @discardableResult
     public func submit(answer: String, responseMs: Int) -> Bool {
         guard state == .inProgress, let item = pending else { return false }
+        guard !expireIfNeeded() else { return false }
         let correct = solver.checkAnswer(item.question, proposedAnswer: answer) == .correct
         responses.append(DiagnosticResponse(questionId: item.question.questionId,
                                             area: item.area, difficulty: item.difficulty,
@@ -258,13 +291,15 @@ public final class DiagnosticSession: @unchecked Sendable {
     }
 
     private func advance() {
-        if isTimeExhausted {
-            state = .completed
-            pending = nil
-            return
-        }
-        // Round-robin across areas so a time cut still samples broadly.
-        for area in DiagnosticArea.allCases where needsMore(area) {
+        if expireIfNeeded() { return }
+        // Round-robin across areas so a time cut still samples broadly:
+        // start scanning at `nextAreaIndex` and rotate it past the area
+        // just selected, so each eligible area gets a turn before repeating.
+        let areas = DiagnosticArea.allCases
+        for offset in 0..<areas.count {
+            let areaIndex = (nextAreaIndex + offset) % areas.count
+            let area = areas[areaIndex]
+            guard needsMore(area) else { continue }
             guard var queue = queues[area], !queue.isEmpty else { continue }
             let target = staircase[area] ?? 2
             let index = queue.indices.min(by: {
@@ -272,6 +307,7 @@ public final class DiagnosticSession: @unchecked Sendable {
             }) ?? 0
             pending = queue.remove(at: index)
             queues[area] = queue
+            nextAreaIndex = (areaIndex + 1) % areas.count
             return
         }
         state = .completed
@@ -291,14 +327,22 @@ public final class DiagnosticSession: @unchecked Sendable {
             let correct = rs.count { $0.correct }
             let accuracy = Double(correct) / Double(rs.count)
             let sortedMs = rs.map(\.responseMs).sorted()
-            let median = sortedMs[sortedMs.count / 2]
+            // Even-sized samples average the two middle values.
+            let median = sortedMs.count % 2 == 1
+                ? sortedMs[sortedMs.count / 2]
+                : (sortedMs[sortedMs.count / 2 - 1] + sortedMs[sortedMs.count / 2]) / 2
             estimates.append(SkillEstimate(
                 area: area, level: Self.level(area: area, accuracy: accuracy, medianMs: median),
                 accuracy: accuracy, itemsAttempted: rs.count, itemsCorrect: correct,
                 medianResponseMs: median,
                 recommendedDifficulty: staircase[area] ?? 1))
         }
-        let complete = state == .completed && estimates.allSatisfy { $0.level != .notAssessed }
+        // Complete only when every area met its quota; merely having
+        // been assessed once (e.g. a timeout or a solver-reduced bank)
+        // is not completion.
+        let complete = state == .completed && estimates.allSatisfy {
+            $0.itemsAttempted >= (itemsPerArea[$0.area] ?? 0)
+        }
         return SkillProfile(grade: grade, estimates: estimates,
                             diagnosticSessionId: sessionId, completedAt: now(),
                             isComplete: complete)

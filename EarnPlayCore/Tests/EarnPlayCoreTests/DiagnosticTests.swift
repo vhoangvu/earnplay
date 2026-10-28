@@ -145,6 +145,162 @@ final class DiagnosticTests: XCTestCase {
         XCTAssertEqual(loaded?.nextFocusArea, profile.nextFocusArea)
     }
 
+    // MARK: - Copilot round-1 regression tests
+
+    func testNextFocusAreaRanksByLevelBeforeAccuracy() {
+        // Copilot F1 scenario: all accuracies 1, facts fast/proficient,
+        // reading fluency slow/developing -> focus must be reading fluency.
+        func est(_ area: DiagnosticArea, _ level: DiagnosticLevel, _ ms: Int) -> SkillEstimate {
+            SkillEstimate(area: area, level: level, accuracy: 1.0,
+                          itemsAttempted: 3, itemsCorrect: 3, medianResponseMs: ms,
+                          recommendedDifficulty: 2)
+        }
+        let profile = SkillProfile(
+            grade: "4",
+            estimates: [
+                est(.factsFluency, .proficient, 2_000),
+                est(.fractions, .proficient, 2_000),
+                est(.wordProblems, .proficient, 2_000),
+                est(.readingFluency, .developing, 20_000),
+                est(.comprehension, .proficient, 2_000),
+            ],
+            diagnosticSessionId: "diag-focus", completedAt: clock, isComplete: true)
+        XCTAssertEqual(profile.nextFocusArea, .readingFluency)
+        // Accuracy still breaks ties within the same level.
+        let tie = SkillProfile(
+            grade: "4",
+            estimates: [
+                SkillEstimate(area: .factsFluency, level: .developing, accuracy: 0.9,
+                              itemsAttempted: 10, itemsCorrect: 9, medianResponseMs: 2_000),
+                SkillEstimate(area: .fractions, level: .developing, accuracy: 0.6,
+                              itemsAttempted: 10, itemsCorrect: 6, medianResponseMs: 2_000),
+            ],
+            diagnosticSessionId: "diag-focus-tie", completedAt: clock, isComplete: false)
+        XCTAssertEqual(tie.nextFocusArea, .fractions)
+    }
+
+    func testExpiredSubmitIsRejectedAndDoesNotTouchProfile() {
+        let s = makeSession(budget: 60)
+        s.start()
+        let first = try! XCTUnwrap(s.currentItem)
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        let responsesBefore = s.responses.count
+        let attemptedBefore = s.profile().estimates.map(\.itemsAttempted)
+        clock = clock.addingTimeInterval(61)
+        let pending = try! XCTUnwrap(s.currentItem)
+        XCTAssertFalse(s.submit(answer: pending.question.verifiedAnswer, responseMs: 1_000))
+        XCTAssertEqual(s.responses.count, responsesBefore)
+        XCTAssertEqual(s.profile().estimates.map(\.itemsAttempted), attemptedBefore)
+        XCTAssertEqual(s.state, .completed)
+        XCTAssertNil(s.currentItem)
+    }
+
+    func testExpireIfNeededCompletesWithoutAnswering() {
+        let s = makeSession(budget: 60)
+        s.start()
+        let first = try! XCTUnwrap(s.currentItem)
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        let responsesBefore = s.responses.count
+        clock = clock.addingTimeInterval(61)
+        XCTAssertTrue(s.expireIfNeeded())
+        XCTAssertEqual(s.state, .completed)
+        XCTAssertNil(s.currentItem)
+        XCTAssertEqual(s.responses.count, responsesBefore)
+        // Not expired / already finished: no-op.
+        XCTAssertFalse(s.expireIfNeeded())
+    }
+
+    func testAdvanceRoundRobinsAcrossAreas() {
+        let s = makeSession()
+        s.start()
+        var areas: [DiagnosticArea] = []
+        var guardCount = 0
+        while let item = s.currentItem, guardCount < 100 {
+            areas.append(item.area)
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000))
+            guardCount += 1
+        }
+        XCTAssertEqual(s.state, .completed)
+        // Each eligible area gets a turn before any area repeats.
+        XCTAssertEqual(Array(areas.prefix(DiagnosticArea.allCases.count)), DiagnosticArea.allCases)
+        XCTAssertEqual(Set(areas.prefix(DiagnosticArea.allCases.count)).count, DiagnosticArea.allCases.count)
+    }
+
+    func testBudgetCutAfterRoundRobinStillAssessesEveryArea() {
+        let s = makeSession(budget: 60)
+        s.start()
+        // One full round-robin cycle: one item per area.
+        for _ in 0..<DiagnosticArea.allCases.count {
+            let item = try! XCTUnwrap(s.currentItem)
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000))
+        }
+        clock = clock.addingTimeInterval(61)
+        if let item = s.currentItem {
+            _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+        }
+        XCTAssertEqual(s.state, .completed)
+        let profile = s.profile()
+        for area in DiagnosticArea.allCases {
+            XCTAssertGreaterThanOrEqual(profile.estimate(for: area).itemsAttempted, 1, "\(area)")
+        }
+    }
+
+    func testEvenSizedMedianAveragesTwoMiddleValues() {
+        // Copilot F4 values: 2,2,2,10,10,10 s -> median 6 s, level stays proficient.
+        let factsBank = DiagnosticBank.grade4.filter { $0.area == .factsFluency }
+        XCTAssertEqual(factsBank.count, 6)
+        let quotas: [DiagnosticArea: Int] = [
+            .factsFluency: 6, .fractions: 0, .wordProblems: 0,
+            .readingFluency: 0, .comprehension: 0,
+        ]
+        let s = DiagnosticSession(sessionId: "diag-median", solver: SolverService(),
+                                  bank: factsBank, timeBudgetSeconds: 600,
+                                  itemsPerArea: quotas, now: { self.clock })
+        s.start()
+        for ms in [2_000, 2_000, 2_000, 10_000, 10_000, 10_000] {
+            let item = try! XCTUnwrap(s.currentItem)
+            XCTAssertTrue(s.submit(answer: item.question.verifiedAnswer, responseMs: ms))
+        }
+        XCTAssertEqual(s.state, .completed)
+        let estimate = s.profile().estimate(for: .factsFluency)
+        XCTAssertEqual(estimate.medianResponseMs, 6_000)
+        XCTAssertEqual(estimate.level, .proficient)
+    }
+
+    func testProfileNotCompleteWhenQuotasUnmetDespiteEveryAreaAssessed() {
+        // One item per area (bank reduced, e.g. by solver rejections):
+        // every area assessed, but default quotas (6/5/4/3/4) unmet.
+        var bank: [DiagnosticBankItem] = []
+        for area in DiagnosticArea.allCases {
+            if let first = DiagnosticBank.grade4.first(where: { $0.area == area }) {
+                bank.append(first)
+            }
+        }
+        XCTAssertEqual(bank.count, DiagnosticArea.allCases.count)
+        let s = makeSession(bank: bank)
+        s.start()
+        answerAllCorrectly(s)
+        XCTAssertEqual(s.state, .completed)
+        let profile = s.profile()
+        for area in DiagnosticArea.allCases {
+            XCTAssertEqual(profile.estimate(for: area).itemsAttempted, 1, "\(area)")
+        }
+        XCTAssertFalse(profile.isComplete)
+    }
+
+    func testProfileCompleteWhenQuotasMet() {
+        let s = makeSession()
+        s.start()
+        answerAllCorrectly(s)
+        XCTAssertEqual(s.state, .completed)
+        let profile = s.profile()
+        for area in DiagnosticArea.allCases {
+            XCTAssertEqual(profile.estimate(for: area).itemsAttempted,
+                           DiagnosticSession.defaultItemsPerArea[area], "\(area)")
+        }
+        XCTAssertTrue(profile.isComplete)
+    }
+
     func testCorruptProfileFileThrowsOnLoad() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("diag-bad-\(UUID().uuidString)/profile.json")
