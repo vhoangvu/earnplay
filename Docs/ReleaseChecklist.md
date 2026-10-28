@@ -82,15 +82,18 @@ uploaded build follows the same checklist.
 
 | Piece | Rule |
 | --- | --- |
-| App version | Semantic version `MAJOR.MINOR.PATCH` (optional `-prerelease`), bumped manually with `Scripts/bump-version.sh`. |
+| App version | `MAJOR.MINOR.PATCH` only (three numeric components), bumped manually with `Scripts/bump-version.sh`. It feeds `CFBundleShortVersionString`, so a prerelease label such as `-beta.1` is rejected by the script and must never be written there; keep prerelease labels in release notes, tags, or TestFlight notes instead. |
 | Build number | Positive integer. `--bump-build` adds 1; `--set-build N` sets it (for a future pipeline run number, T7.2). It never changes unless asked. |
 | Re-running | Safe: setting the version already in place changes nothing and does not touch the build number. |
 | Source of truth | `project.yml` — `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` for both app targets. The generated Info.plist derives from them (`GENERATE_INFOPLIST_FILE`), so project and Info.plist agree after `xcodegen generate`. |
-| Guard | CI runs `Scripts/bump-version.sh --check` on every push; it fails if the two targets' versions or build numbers drift apart. |
+| Guard | CI runs `Scripts/bump-version.sh --check` on every push; it fails if the two targets' versions or build numbers drift apart, or if either target is missing a version/build entry. |
 | Drift | If the targets ever disagree, the script refuses to run. Fix `project.yml` by hand, then re-run. |
 | Not the app version | `EarnPlayCore.version` is the core library's own version and is not changed by the bump script. |
 
 Script tests: `Scripts/test-bump-version.sh` exercises the real script
 on scratch copies of `project.yml` (version parse; major/minor/patch
 bumps; build-number increment; idempotent re-run; invalid-input
-rejection; drift and missing-file failures).
+rejection including prerelease versions; drift, missing-entry, and
+missing-file failures; mixed quoted/unquoted values). The scratch copy
+is normalized to version 0.1.0 / build 1, so the suite does not depend
+on the live file's already-released values.

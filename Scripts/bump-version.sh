@@ -3,9 +3,12 @@
 # and/or the build number everywhere the build reads them.
 #
 # Versioning scheme (SSOT/HLD/LLD SS15):
-#   - App version: semantic version MAJOR.MINOR.PATCH (optionally with a
-#     -prerelease suffix). Bumped MANUALLY with this script. A pipeline
-#     run never changes the app version on its own.
+#   - App version: MAJOR.MINOR.PATCH, three numeric components only.
+#     It feeds CFBundleShortVersionString, which App Store Connect
+#     requires in that form, so a prerelease label (e.g. -beta.1) must
+#     never be written here; keep such labels in release notes, tags,
+#     or TestFlight notes instead. Bumped MANUALLY with this script.
+#     A pipeline run never changes the app version on its own.
 #   - Build number: positive integer (CURRENT_PROJECT_VERSION). It only
 #     changes when asked: --bump-build adds 1, --set-build N sets it
 #     (for a future pipeline run number, T7.2). Re-running this script
@@ -98,11 +101,11 @@ PROJECT_FILE="$ROOT/project.yml"
 
 # --- validation -----------------------------------------------------------
 
-# Semantic version: MAJOR.MINOR.PATCH, no leading zeros, optional
-# -prerelease of dot-separated [0-9A-Za-z-] identifiers.
+# App marketing version: MAJOR.MINOR.PATCH only, no leading zeros and
+# no prerelease/build suffix (see header: CFBundleShortVersionString).
 valid_version() {
   local v="$1"
-  [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+  [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 }
 
 valid_build() {
@@ -125,6 +128,30 @@ read_values() {
   grep -E "^[[:space:]]*$1:" "$PROJECT_FILE" \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/^"//; s/"$//' | sort -u || true
 }
+
+# Prints each value of KEY inside TARGET's block under `targets:`, one per
+# line. Target blocks start at two-space indent; the block ends at the next
+# target or at the next top-level key (e.g. `schemes:`).
+target_values() {
+  local target="$1" key="$2"
+  awk -v target="$target" -v key="$key" '
+    /^targets:/ { in_targets=1; next }
+    /^[^[:space:]]/ { in_targets=0 }
+    in_targets && /^  [^[:space:]]/ {
+      name=$0; sub(/^  /, "", name); sub(/:.*/, "", name); current=name; next
+    }
+    in_targets && current==target && $0 ~ ("^[[:space:]]*" key ":") { print }
+  ' "$PROJECT_FILE" | sed -E 's/^[^:]*:[[:space:]]*//; s/^"//; s/"$//' || true
+}
+
+# Both app targets must resolve both settings before any comparison:
+# a missing entry must not hide behind the other target's value.
+for target in EarnPlay EarnPlayAdmin; do
+  for key in MARKETING_VERSION CURRENT_PROJECT_VERSION; do
+    [ -n "$(target_values "$target" "$key")" ] \
+      || die_error "missing $key for target $target in $PROJECT_FILE (both EarnPlay and EarnPlayAdmin must set MARKETING_VERSION and CURRENT_PROJECT_VERSION)"
+  done
+done
 
 CURRENT_VERSION="$(read_values MARKETING_VERSION)"
 CURRENT_BUILD="$(read_values CURRENT_PROJECT_VERSION)"
@@ -152,7 +179,7 @@ TARGET_VERSION="$CURRENT_VERSION"
 if [ "$MODE" = "set" ]; then
   TARGET_VERSION="$NEW_VERSION"
 elif [ "$MODE" = "bump" ]; then
-  base="${CURRENT_VERSION%%-*}"
+  base="$CURRENT_VERSION"
   major="${base%%.*}"; rest="${base#*.}"
   minor="${rest%%.*}"; patch="${rest#*.}"
   case "$BUMP_PART" in
@@ -178,15 +205,19 @@ fi
 
 # --- write ----------------------------------------------------------------
 
-# Replaces every `KEY: "old"` with `KEY: "new"`; all targets move together.
+# Replaces every `KEY: old` / `KEY: "old"` with `KEY: "new"`; read_values
+# accepts both quoted and unquoted YAML, so the write must handle both.
+# All targets move together: every KEY line must end at the new value.
 write_key() {
-  local key="$1" new_value="$2" tmp
+  local key="$1" new_value="$2" tmp total updated
   tmp="$(mktemp "$PROJECT_FILE.tmp.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" RETURN
-  sed -E "s|^([[:space:]]*$key:[[:space:]]*)\"[^\"]*\"|\1\"$new_value\"|" "$PROJECT_FILE" > "$tmp"
-  grep -qE "^[[:space:]]*$key:[[:space:]]*\"$new_value\"" "$tmp" \
-    || die_error "failed to update $key in $PROJECT_FILE"
+  sed -E "s#^([[:space:]]*$key:[[:space:]]*)(\"[^\"]*\"|[^[:space:]#]+)#\1\"$new_value\"#" "$PROJECT_FILE" > "$tmp"
+  total="$(grep -cE "^[[:space:]]*$key:" "$tmp" || true)"
+  updated="$(grep -cE "^[[:space:]]*$key:[[:space:]]*\"$new_value\"[[:space:]]*$" "$tmp" || true)"
+  [ "$total" -gt 0 ] && [ "$updated" -eq "$total" ] \
+    || die_error "failed to update $key in $PROJECT_FILE (updated $updated of $total entries)"
   cat "$tmp" > "$PROJECT_FILE"
   rm -f "$tmp"
   trap - RETURN

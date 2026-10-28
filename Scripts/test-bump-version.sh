@@ -20,11 +20,28 @@ trap cleanup EXIT
 fresh() {
   WORK="$(mktemp -d)"
   cp "$FIXTURE" "$WORK/project.yml"
+  # Normalize the scratch copy to version 0.1.0 / build 1 (quoted or
+  # unquoted) so assertions below stay independent of the live file's
+  # already-released values.
+  sed -E 's#^([[:space:]]*MARKETING_VERSION:[[:space:]]*)("[^"]*"|[^[:space:]]+)#\1"0.1.0"#; s#^([[:space:]]*CURRENT_PROJECT_VERSION:[[:space:]]*)("[^"]*"|[^[:space:]]+)#\1"1"#' \
+    "$WORK/project.yml" > "$WORK/project.yml.norm" && mv "$WORK/project.yml.norm" "$WORK/project.yml"
 }
 
 # marketing values present in a project.yml, one per line
 versions_in() { grep -E '^[[:space:]]*MARKETING_VERSION:' "$1" | sed -E 's/^[^:]*:[[:space:]]*//; s/"//g'; }
 builds_in()   { grep -E '^[[:space:]]*CURRENT_PROJECT_VERSION:' "$1" | sed -E 's/^[^:]*:[[:space:]]*//; s/"//g'; }
+
+# drop the Nth (1-based) occurrence of KEY line from $WORK/project.yml
+remove_nth_key() { # key n
+  awk -v key="$1" -v n="$2" 'BEGIN{c=0} $0 ~ ("^[[:space:]]*" key ":") {c++; if (c==n) next} {print}' \
+    "$WORK/project.yml" > "$WORK/project.yml.tmp" && mv "$WORK/project.yml.tmp" "$WORK/project.yml"
+}
+
+# strip double quotes from the Nth (1-based) occurrence of KEY in $WORK/project.yml
+unquote_nth_key() { # key n
+  awk -v key="$1" -v n="$2" 'BEGIN{c=0} $0 ~ ("^[[:space:]]*" key ":") {c++; if (c==n) gsub(/"/,"")} {print}' \
+    "$WORK/project.yml" > "$WORK/project.yml.tmp" && mv "$WORK/project.yml.tmp" "$WORK/project.yml"
+}
 
 ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
 bad()  { FAIL=$((FAIL + 1)); echo "FAIL: $1" >&2; }
@@ -66,10 +83,17 @@ fresh
 "$BUMP" --root "$WORK" --bump patch > /dev/null
 expect_eq "bump patch: 0.1.0 -> 0.1.1" "0.1.1" "$(versions_in "$WORK/project.yml" | sort -u)"
 
-# explicit set, including a prerelease suffix
+# explicit set (plain MAJOR.MINOR.PATCH only; prerelease rejected below)
 fresh
-"$BUMP" --root "$WORK" --version 2.0.0-beta.1 > /dev/null
-expect_eq "set: explicit prerelease version" "2.0.0-beta.1" "$(versions_in "$WORK/project.yml" | sort -u)"
+"$BUMP" --root "$WORK" --version 2.0.0 > /dev/null
+expect_eq "set: explicit version" "2.0.0" "$(versions_in "$WORK/project.yml" | sort -u)"
+
+# F1: prerelease must never land in MARKETING_VERSION (CFBundleShortVersionString
+# requires three numeric components); expect_reject also proves file unchanged.
+fresh
+expect_reject "F1 invalid: prerelease '2.0.0-beta.1' rejected" --version 2.0.0-beta.1
+expect_reject "F1 invalid: prerelease '1.2.3-rc.1' rejected" --version 1.2.3-rc.1
+expect_eq "F1: MARKETING_VERSION untouched by prerelease attempt" "0.1.0" "$(versions_in "$WORK/project.yml" | sort -u)"
 
 # --- build-number auto-increment, only when asked --------------------------
 fresh
@@ -135,6 +159,62 @@ if "$BUMP" --root "$WORK" --check > /dev/null 2>&1; then
 else
   ok "drift: --check fails when targets disagree"
 fi
+
+# --- F2: a missing entry in either target must fail --check and block a bump ----
+# occurrence 1 = EarnPlay, 2 = EarnPlayAdmin
+for spec in "MARKETING_VERSION 1" "MARKETING_VERSION 2" "CURRENT_PROJECT_VERSION 1" "CURRENT_PROJECT_VERSION 2"; do
+  # shellcheck disable=SC2086
+  set -- $spec
+  fresh
+  remove_nth_key "$1" "$2"
+  if "$BUMP" --root "$WORK" --check > /dev/null 2>&1; then
+    bad "F2 missing entry: --check fails without $1 in target #$2"
+  else
+    ok "F2 missing entry: --check fails without $1 in target #$2"
+  fi
+  expect_reject "F2 missing entry: bump blocked without $1 in target #$2" --bump-build
+done
+
+# --- F3: mixed quoted/unquoted values must all be updated -----------------------
+fresh
+unquote_nth_key CURRENT_PROJECT_VERSION 2
+if "$BUMP" --root "$WORK" --check > /dev/null 2>&1; then
+  ok "F3 mixed quoting: --check passes with quoted+unquoted build"
+else
+  bad "F3 mixed quoting: --check passes with quoted+unquoted build"
+fi
+"$BUMP" --root "$WORK" --bump-build > /dev/null
+expect_eq "F3 mixed quoting: both builds bumped 1 -> 2" "2" "$(builds_in "$WORK/project.yml" | sort -u)"
+expect_eq "F3 mixed quoting: both targets present after bump" "2" "$(builds_in "$WORK/project.yml" | wc -l | tr -d ' ')"
+if "$BUMP" --root "$WORK" --check > /dev/null 2>&1; then
+  ok "F3 mixed quoting: --check still passes after bump"
+else
+  bad "F3 mixed quoting: --check still passes after bump"
+fi
+
+fresh
+unquote_nth_key MARKETING_VERSION 2
+"$BUMP" --root "$WORK" --version 1.0.0 > /dev/null
+expect_eq "F3 mixed quoting: both versions set to 1.0.0" "1.0.0" "$(versions_in "$WORK/project.yml" | sort -u)"
+expect_eq "F3 mixed quoting: both version targets present after set" "2" "$(versions_in "$WORK/project.yml" | wc -l | tr -d ' ')"
+
+# --- F4: suite baseline is independent of the live file's released values -------
+# Simulate a live project.yml that already carries a bumped version/build by
+# pointing the fixture at a bumped copy; fresh() must normalize it to 0.1.0/1.
+saved_fixture="$FIXTURE"
+bumped_dir="$(mktemp -d)"
+sed -E 's#^([[:space:]]*MARKETING_VERSION:[[:space:]]*)("[^"]*"|[^[:space:]]+)#\1"9.8.7"#; s#^([[:space:]]*CURRENT_PROJECT_VERSION:[[:space:]]*)("[^"]*"|[^[:space:]]+)#\1"42"#' \
+  "$FIXTURE" > "$bumped_dir/project.yml"
+FIXTURE="$bumped_dir/project.yml"
+fresh
+out="$("$BUMP" --root "$WORK" --check)"
+expect_eq "F4 bumped live file: normalized version baseline" "version: 0.1.0" "$(printf '%s\n' "$out" | head -n 1)"
+expect_eq "F4 bumped live file: normalized build baseline" "build:   1" "$(printf '%s\n' "$out" | sed -n 2p)"
+"$BUMP" --root "$WORK" --bump patch --bump-build > /dev/null
+expect_eq "F4 bumped live file: patch bump from normalized baseline" "0.1.1" "$(versions_in "$WORK/project.yml" | sort -u)"
+expect_eq "F4 bumped live file: build bump from normalized baseline" "2" "$(builds_in "$WORK/project.yml" | sort -u)"
+FIXTURE="$saved_fixture"
+rm -rf "$bumped_dir"
 
 # --- missing file ---------------------------------------------------------------
 empty="$(mktemp -d)"
