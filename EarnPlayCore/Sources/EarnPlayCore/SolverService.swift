@@ -10,10 +10,11 @@ import Foundation
 /// How it is used:
 /// 1. The model proposes a problem as structured data (`ProposedProblem`):
 ///    skill, form type, and the values that define the problem, plus a passage
-///    for reading. The model's own stated answer is never taken as input.
+///    and a candidate answer for reading. For the computed skills the model's
+///    own stated answer is never taken as input.
 /// 2. `SolverService` computes the correct answer deterministically from the
 ///    skill, form, and values.
-/// 3. For reading, the proposed answer must be supported by the passage text.
+/// 3. For reading, the candidate answer must be supported by the passage text.
 /// 4. Only on success is a `VerifiedQuestion` created, with `verifiedAnswer`
 ///    set by this solver. Attempt correctness is judged against that answer.
 ///
@@ -51,19 +52,39 @@ public struct SolverFraction: Equatable, Codable, Sendable, CustomStringConverti
     public let numerator: Int
     public let denominator: Int
 
+    private enum CodingKeys: String, CodingKey {
+        case numerator, denominator
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let numerator = try container.decode(Int.self, forKey: .numerator)
+        let denominator = try container.decode(Int.self, forKey: .denominator)
+        guard let fraction = SolverFraction(numerator: numerator, denominator: denominator) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .denominator, in: container,
+                debugDescription: "Invalid fraction")
+        }
+        self = fraction
+    }
+
     public init?(numerator: Int, denominator: Int) {
         guard denominator != 0 else { return nil }
-        var n = numerator
-        var d = denominator
-        if d < 0 { n = -n; d = -d }
-        if n == 0 {
-            self.numerator = 0
-            self.denominator = 1
-            return
+        let negative = (numerator < 0) != (denominator < 0)
+        var n = numerator.magnitude
+        var d = denominator.magnitude
+        var a = n, b = d
+        while b != 0 { (a, b) = (b, a % b) }
+        n /= a
+        d /= a
+        guard let normalizedDenominator = Int(exactly: d) else { return nil }
+        if negative && n == Int.min.magnitude {
+            self.numerator = Int.min
+        } else {
+            guard let normalizedNumerator = Int(exactly: n) else { return nil }
+            self.numerator = negative ? -normalizedNumerator : normalizedNumerator
         }
-        let g = SolverFraction.gcd(abs(n), d)
-        self.numerator = n / g
-        self.denominator = d / g
+        self.denominator = normalizedDenominator
     }
 
     /// Parses "n/d" or a whole number "n". Returns nil when malformed.
@@ -116,8 +137,10 @@ public struct SolverFraction: Equatable, Codable, Sendable, CustomStringConverti
     }
 }
 
-/// Structured problem proposal. The model's stated answer is never a field
-/// here: the solver computes the answer itself (contract step 1-2).
+/// Structured problem proposal. For the computed skills the model's stated
+/// answer is never a field here: the solver computes the answer itself
+/// (contract step 1-2). Reading proposals carry `candidateAnswer`, which the
+/// solver only keeps after the passage-support check (step 3).
 public struct ProposedProblem: Equatable, Sendable {
     public var skill: SolverSkill
     public var form: SolverForm
@@ -133,6 +156,10 @@ public struct ProposedProblem: Equatable, Sendable {
     public var irrelevantValues: [Int]
     /// Passage text for reading questions.
     public var passage: String?
+    /// Candidate answer for reading questions. The model proposes it; the
+    /// solver validates it against `passage` before anything is presented.
+    /// Ignored for every other skill, where the solver computes the answer.
+    public var candidateAnswer: String?
     /// The question as presented to the child.
     public var promptText: String
     public var difficulty: Int
@@ -141,6 +168,7 @@ public struct ProposedProblem: Equatable, Sendable {
     public init(skill: SolverSkill, form: SolverForm = .direct, operands: [Int] = [],
                 fractions: [SolverFraction] = [], operation: WordOperation? = nil,
                 irrelevantValues: [Int] = [], passage: String? = nil,
+                candidateAnswer: String? = nil,
                 promptText: String = "", difficulty: Int = 1, grade: String = "4") {
         self.skill = skill
         self.form = form
@@ -149,6 +177,7 @@ public struct ProposedProblem: Equatable, Sendable {
         self.operation = operation
         self.irrelevantValues = irrelevantValues
         self.passage = passage
+        self.candidateAnswer = candidateAnswer
         self.promptText = promptText
         self.difficulty = difficulty
         self.grade = grade
@@ -180,6 +209,22 @@ public struct VerifiedQuestion: Equatable, Sendable {
     public let verifiedAnswer: String
     public let difficulty: Int
     public let grade: String
+    /// Passage retained for reading questions, so grading and review can
+    /// trace the verified answer back to its supporting text.
+    public let passage: String?
+
+    public init(questionId: String, skill: String, formType: SolverForm,
+                promptText: String, verifiedAnswer: String, difficulty: Int,
+                grade: String, passage: String? = nil) {
+        self.questionId = questionId
+        self.skill = skill
+        self.formType = formType
+        self.promptText = promptText
+        self.verifiedAnswer = verifiedAnswer
+        self.difficulty = difficulty
+        self.grade = grade
+        self.passage = passage
+    }
 }
 
 public enum AnswerVerdict: Equatable, Sendable {
@@ -264,13 +309,23 @@ public struct SolverService: Sendable {
             return solveWordProblem(problem)
 
         case .readingComprehension:
-            // Reading has no computed answer: the answer is verified against
-            // the passage by `verifyReadingSupport`. Solving only validates
-            // that a passage exists to verify against.
+            // Reading has no computed answer: the proposal carries a
+            // candidate answer that must be supported by the passage.
             guard let passage = problem.passage, !passage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return .rejected(.missingPassage)
             }
-            return .rejected(.invalidInput("reading answers are verified with verifyReadingSupport, not solve"))
+            guard let candidate = problem.candidateAnswer,
+                  !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .rejected(.invalidInput("reading proposal needs a candidate answer"))
+            }
+            switch verifyReadingSupport(passage: passage, proposedAnswer: candidate) {
+            case .supported:
+                return .verified(verifiedAnswer: candidate.trimmingCharacters(in: .whitespacesAndNewlines))
+            case .unsupported:
+                return .rejected(.unsupportedReadingAnswer)
+            case .invalid(let reason):
+                return .rejected(reason)
+            }
         }
     }
 
@@ -339,7 +394,8 @@ public struct SolverService: Sendable {
                 promptText: problem.promptText,
                 verifiedAnswer: answer,
                 difficulty: problem.difficulty,
-                grade: problem.grade))
+                grade: problem.grade,
+                passage: problem.passage))
         case .rejected(let reason):
             return .failure(reason)
         }
@@ -348,29 +404,46 @@ public struct SolverService: Sendable {
     // MARK: - Judge an attempt (contract step 7)
 
     /// Correctness is always judged against the solver-computed answer.
+    /// For reading, the solver-computed answer is the candidate that
+    /// `verifyReadingSupport` confirmed against the passage.
     public func checkAnswer(_ problem: ProposedProblem, proposedAnswer: String) -> AnswerVerdict {
         switch solve(problem) {
         case .rejected(let reason):
             return .invalid(reason)
         case .verified(let expected):
-            let given = proposedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !given.isEmpty else { return .incorrect(expected: expected) }
-            switch problem.skill {
-            case .fractionAddition:
-                // Equivalent fractions are the same value: an unreduced
-                // correct answer (2/4 for 1/2) is correct, because both
-                // sides are normalized before comparison.
-                guard let givenFraction = SolverFraction(parsing: given),
-                      let expectedFraction = SolverFraction(parsing: expected) else {
-                    return .incorrect(expected: expected)
-                }
-                return givenFraction == expectedFraction ? .correct : .incorrect(expected: expected)
-            case .fractionComparison:
-                let normalized = given.replacingOccurrences(of: "==", with: "=")
-                return normalized == expected ? .correct : .incorrect(expected: expected)
-            default:
-                return given == expected ? .correct : .incorrect(expected: expected)
+            return grade(given: proposedAnswer, expected: expected, skill: problem.skill)
+        }
+    }
+
+    /// Grades an attempt against a question that already passed `verify`.
+    public func checkAnswer(_ question: VerifiedQuestion, proposedAnswer: String) -> AnswerVerdict {
+        grade(given: proposedAnswer, expected: question.verifiedAnswer,
+              skill: SolverSkill(rawValue: question.skill))
+    }
+
+    private func grade(given rawGiven: String, expected: String, skill: SolverSkill?) -> AnswerVerdict {
+        let given = rawGiven.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !given.isEmpty else { return .incorrect(expected: expected) }
+        switch skill {
+        case .fractionAddition:
+            // Equivalent fractions are the same value: an unreduced
+            // correct answer (2/4 for 1/2) is correct, because both
+            // sides are normalized before comparison.
+            guard let givenFraction = SolverFraction(parsing: given),
+                  let expectedFraction = SolverFraction(parsing: expected) else {
+                return .incorrect(expected: expected)
             }
+            return givenFraction == expectedFraction ? .correct : .incorrect(expected: expected)
+        case .fractionComparison:
+            let normalized = given.replacingOccurrences(of: "==", with: "=")
+            return normalized == expected ? .correct : .incorrect(expected: expected)
+        case .readingComprehension:
+            // Reading answers match on normalized text (case and
+            // punctuation do not change the answer's meaning).
+            return Self.normalizeForSupport(given) == Self.normalizeForSupport(expected)
+                ? .correct : .incorrect(expected: expected)
+        default:
+            return given == expected ? .correct : .incorrect(expected: expected)
         }
     }
 
@@ -380,10 +453,11 @@ public struct SolverService: Sendable {
     ///
     /// Deterministic rule, no heuristics: after normalization (lowercase,
     /// collapsed whitespace, trimmed surrounding punctuation) the answer must
-    /// appear as a contiguous span of the passage. When supported, the verdict
-    /// carries the matching passage span as evidence. An answer that needs
-    /// inference, paraphrase, or outside knowledge is unsupported by
-    /// definition — the solver cannot confirm it from the passage alone.
+    /// appear as a whole-token span of the passage, inside a single passage
+    /// sentence. When supported, the verdict carries that sentence as
+    /// evidence. An answer that needs inference, paraphrase, or outside
+    /// knowledge is unsupported by definition — the solver cannot confirm
+    /// it from the passage alone.
     public func verifyReadingSupport(passage: String, proposedAnswer: String) -> ReadingSupportVerdict {
         let cleanPassage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanAnswer = proposedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -396,17 +470,17 @@ public struct SolverService: Sendable {
         guard !normalizedAnswer.isEmpty else {
             return .invalid(.invalidInput("reading answer has no checkable content"))
         }
-        guard normalizedPassage.contains(normalizedAnswer) else { return .unsupported }
-        // Evidence: the first passage sentence containing the answer span,
-        // falling back to the matched answer text itself.
+        let answerSpan = " \(normalizedAnswer) "
+        guard " \(normalizedPassage) ".contains(answerSpan) else { return .unsupported }
+        // Evidence: the first passage sentence containing the complete answer span.
         let sentences = cleanPassage.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
         for sentence in sentences {
             let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty, Self.normalizeForSupport(trimmed).contains(normalizedAnswer) {
+            if !trimmed.isEmpty, " \(Self.normalizeForSupport(trimmed)) ".contains(answerSpan) {
                 return .supported(evidence: trimmed)
             }
         }
-        return .supported(evidence: cleanAnswer)
+        return .unsupported
     }
 
     /// Full reading check: support first, then the question-level verdict.

@@ -8,8 +8,10 @@ decides. Wrong answers can never be taught.
 
 Input is a structured proposal (`ProposedProblem`): skill, form type
 (story / reverse / estimation / which-is-wrong / irrelevant-numbers / direct),
-and the values that define the problem, plus a passage for reading. The
-model's own stated answer is never an input field.
+and the values that define the problem, plus a passage for reading. For the
+computed skills the model's own stated answer is never an input field; for
+reading the candidate answer is an input field but is never trusted — it
+is kept only after the passage-support check passes (below).
 
 | Skill | Values | Verified answer |
 | --- | --- | --- |
@@ -19,7 +21,7 @@ model's own stated answer is never an input field.
 | Fraction comparison | two fractions | `"<"`, `">"`, or `"="` by exact cross-multiplication |
 | Fraction addition | two fractions | sum reduced to lowest terms; whole results render without a denominator |
 | Word problems | relevant operands + explicit operation; irrelevant prompt numbers carried separately and ignored | exact result of the stated operation; division by zero and negative subtraction results are rejected |
-| Reading | passage + proposed answer | supported / unsupported verdict (below) |
+| Reading | passage + candidate answer (`candidateAnswer`) | candidate kept only when the passage supports it (below) |
 
 Fractions are always normalized on construction: reduced by the gcd, sign
 carried by the numerator, zero stored as 0/1. A proposed fraction answer is
@@ -45,7 +47,27 @@ pre-verified safe question (steps 5-6). Attempt correctness
 - It does not generate questions, and it does not solve free-form problem
   text. It verifies structured proposals and proposed answers.
 
-## How the reading-support check works (contract step 3)
+## How reading verification works (contract steps 3-4, 7)
+
+A reading proposal carries its answer explicitly as
+`ProposedProblem.candidateAnswer`; there is no computed answer to derive
+from operands. Verification reuses the support check below:
+
+1. Missing or empty passage → rejected `.missingPassage`. Missing or empty
+   candidate → rejected `.invalidInput`.
+2. `verifyReadingSupport(passage:proposedAnswer:)` decides support.
+   Unsupported → rejected `.unsupportedReadingAnswer`; an `invalid`
+   support verdict propagates its reason as the rejection.
+3. On `supported`, `verify(_:questionId:)` returns a `VerifiedQuestion`
+   whose `verifiedAnswer` is the validated candidate and whose `passage`
+   retains the passage text, so grading and review can trace the answer
+   back to its evidence. Reading is the only skill whose verified answer
+   comes from a proposal field, and only after this support check passes.
+4. Attempts are graded against that validated answer by either
+   `checkAnswer(_:proposedAnswer:)` (proposal form) or
+   `checkAnswer(_:proposedAnswer:)` on the `VerifiedQuestion`. Reading
+   grading compares normalized text, so case and punctuation differences
+   are still the same answer; any different answer is incorrect.
 
 `verifyReadingSupport(passage:proposedAnswer:)` returns
 `supported(evidence:)` / `unsupported` / `invalid(reason:)`:
@@ -53,10 +75,16 @@ pre-verified safe question (steps 5-6). Attempt correctness
 1. Empty passage → `invalid(.missingPassage)`; empty answer → invalid.
 2. Both texts are normalized deterministically: lowercased, split on
    non-alphanumeric characters, rejoined with single spaces.
-3. The normalized answer must appear as a contiguous span of the normalized
-   passage. If it does, the verdict is `supported` and carries as evidence
-   the first passage sentence containing the span.
-4. Otherwise the verdict is `unsupported`. An answer that needs inference,
+3. The normalized answer must appear in the normalized passage with
+   whole-token boundaries on both sides (the check searches for
+   `" answer "` inside `" passage "`). A partial word or number never
+   matches: `six` is not supported by `sixteen`.
+4. The same boundary rule locates evidence: the verdict is `supported`
+   only when one passage sentence contains the complete bounded span, and
+   that sentence is the evidence. If the span only exists across a
+   sentence boundary, the verdict is `unsupported` — there is no fallback
+   that reports support without a supporting sentence.
+5. Otherwise the verdict is `unsupported`. An answer that needs inference,
    paraphrase, or outside knowledge is unsupported by definition, because
    the solver cannot confirm it from the passage alone.
 
