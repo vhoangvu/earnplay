@@ -144,9 +144,16 @@ public struct SkillProfile: Codable, Equatable, Sendable {
 public struct DiagnosticBankItem: Sendable {
     public var area: DiagnosticArea
     public var problem: ProposedProblem
-    public init(area: DiagnosticArea, problem: ProposedProblem) {
+    /// Extra passage-supported answers accepted for this item, in
+    /// addition to the solver-verified candidate. Each entry is
+    /// re-verified against the passage at session start; unsupported
+    /// entries are dropped, never graded against.
+    public var acceptableAnswers: [String]
+    public init(area: DiagnosticArea, problem: ProposedProblem,
+                acceptableAnswers: [String] = []) {
         self.area = area
         self.problem = problem
+        self.acceptableAnswers = acceptableAnswers
     }
 }
 
@@ -155,6 +162,9 @@ public struct DiagnosticItem: Equatable, Sendable {
     public var question: VerifiedQuestion
     public var area: DiagnosticArea
     public var difficulty: Int
+    /// Pre-verified acceptable answers (includes `verifiedAnswer`);
+    /// empty means grade only against the verified answer.
+    public var acceptableAnswers: [String] = []
 }
 
 /// Recorded response to one presented item.
@@ -179,13 +189,25 @@ public enum DiagnosticSessionState: Equatable, Sendable {
 /// until `state == .completed`, then `profile()`. `abandon()` ends
 /// early and `profile()` still returns the partial profile.
 /// Time is injected (`now`) so tests drive the budget deterministically.
+///
+/// Thread safety: every public operation is serialized on `lock`, so a
+/// timer calling `expireIfNeeded()` cannot interleave with `submit()`,
+/// and concurrent submissions cannot record the same item twice. That
+/// synchronization is what justifies `@unchecked Sendable`.
 public final class DiagnosticSession: @unchecked Sendable {
     public let sessionId: String
     public let grade: String
     public let timeBudgetSeconds: Int
-    public private(set) var state: DiagnosticSessionState = .notStarted
-    public private(set) var responses: [DiagnosticResponse] = []
+    public var state: DiagnosticSessionState {
+        lock.lock(); defer { lock.unlock() }; return _state
+    }
+    public var responses: [DiagnosticResponse] {
+        lock.lock(); defer { lock.unlock() }; return _responses
+    }
 
+    private let lock = NSRecursiveLock()
+    private var _state: DiagnosticSessionState = .notStarted
+    private var _responses: [DiagnosticResponse] = []
     private let solver: SolverService
     private let bank: [DiagnosticBankItem]
     private let now: () -> Date
@@ -222,7 +244,8 @@ public final class DiagnosticSession: @unchecked Sendable {
     /// Verifies the whole bank through the solver and builds per-area
     /// queues ordered easy -> hard. Unverifiable items are dropped.
     public func start() {
-        guard state == .notStarted else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard _state == .notStarted else { return }
         startedAt = now()
         for area in DiagnosticArea.allCases {
             staircase[area] = 2
@@ -230,19 +253,46 @@ public final class DiagnosticSession: @unchecked Sendable {
             for item in bank where item.area == area {
                 let qid = "\(sessionId)-\(area.rawValue)-\(verified.count)"
                 if case .success(let q) = solver.verify(item.problem, questionId: qid) {
-                    verified.append(DiagnosticItem(question: q, area: area, difficulty: item.problem.difficulty))
+                    verified.append(DiagnosticItem(
+                        question: q, area: area, difficulty: item.problem.difficulty,
+                        acceptableAnswers: Self.verifiedAcceptableAnswers(item: item, verifiedAnswer: q.verifiedAnswer, solver: solver)))
                 }
             }
             queues[area] = verified.sorted { $0.difficulty < $1.difficulty }
         }
-        state = .inProgress
-        advance()
+        _state = .inProgress
+        advanceLocked()
+    }
+
+    /// Acceptable set for an item: the verified answer plus each
+    /// bank-declared extra the passage actually supports. Unsupported
+    /// extras are dropped so grading never accepts an unverified answer.
+    private static func verifiedAcceptableAnswers(
+        item: DiagnosticBankItem, verifiedAnswer: String, solver: SolverService
+    ) -> [String] {
+        guard !item.acceptableAnswers.isEmpty else { return [] }
+        var accepted = [verifiedAnswer]
+        for extra in item.acceptableAnswers {
+            let normalized = SolverService.normalizeForSupport(extra)
+            guard !accepted.contains(where: { SolverService.normalizeForSupport($0) == normalized }) else { continue }
+            if let passage = item.problem.passage {
+                guard case .supported = solver.verifyReadingSupport(passage: passage, proposedAnswer: extra) else { continue }
+            }
+            accepted.append(extra)
+        }
+        return accepted
     }
 
     /// The item awaiting an answer; nil when finished.
-    public var currentItem: DiagnosticItem? { pending }
+    public var currentItem: DiagnosticItem? {
+        lock.lock(); defer { lock.unlock() }; return pending
+    }
 
     public var isTimeExhausted: Bool {
+        lock.lock(); defer { lock.unlock() }; return isTimeExhaustedLocked
+    }
+
+    private var isTimeExhaustedLocked: Bool {
         guard let startedAt else { return false }
         return now().timeIntervalSince(startedAt) >= Double(timeBudgetSeconds)
     }
@@ -253,9 +303,13 @@ public final class DiagnosticSession: @unchecked Sendable {
     /// the session; a no-op (false) when not expired or not in progress.
     @discardableResult
     public func expireIfNeeded() -> Bool {
-        guard state == .inProgress, isTimeExhausted else { return false }
+        lock.lock(); defer { lock.unlock() }; return expireIfNeededLocked()
+    }
+
+    private func expireIfNeededLocked() -> Bool {
+        guard _state == .inProgress, isTimeExhaustedLocked else { return false }
         pending = nil
-        state = .completed
+        _state = .completed
         return true
     }
 
@@ -265,33 +319,43 @@ public final class DiagnosticSession: @unchecked Sendable {
     /// or any profile update, and complete the session instead.
     @discardableResult
     public func submit(answer: String, responseMs: Int) -> Bool {
-        guard state == .inProgress, let item = pending else { return false }
-        guard !expireIfNeeded() else { return false }
-        let correct = solver.checkAnswer(item.question, proposedAnswer: answer) == .correct
-        responses.append(DiagnosticResponse(questionId: item.question.questionId,
+        lock.lock(); defer { lock.unlock() }
+        guard _state == .inProgress, let item = pending else { return false }
+        guard !expireIfNeededLocked() else { return false }
+        let correct: Bool
+        if !item.acceptableAnswers.isEmpty {
+            let given = SolverService.normalizeForSupport(answer)
+            correct = item.acceptableAnswers.contains {
+                SolverService.normalizeForSupport($0) == given
+            }
+        } else {
+            correct = solver.checkAnswer(item.question, proposedAnswer: answer) == .correct
+        }
+        _responses.append(DiagnosticResponse(questionId: item.question.questionId,
                                             area: item.area, difficulty: item.difficulty,
                                             correct: correct, responseMs: max(0, responseMs)))
         let step = correct ? 1 : -1
         staircase[item.area] = min(3, max(1, (staircase[item.area] ?? 2) + step))
         pending = nil
-        advance()
+        advanceLocked()
         return correct
     }
 
     /// Ends the session early; `profile()` returns partial results.
     public func abandon() {
-        guard state == .inProgress || state == .notStarted else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard _state == .inProgress || _state == .notStarted else { return }
         pending = nil
-        state = .abandoned
+        _state = .abandoned
     }
 
     private func needsMore(_ area: DiagnosticArea) -> Bool {
-        let done = responses.count { $0.area == area }
+        let done = _responses.count { $0.area == area }
         return done < (itemsPerArea[area] ?? 0) && !(queues[area] ?? []).isEmpty
     }
 
-    private func advance() {
-        if expireIfNeeded() { return }
+    private func advanceLocked() {
+        if expireIfNeededLocked() { return }
         // Round-robin across areas so a time cut still samples broadly:
         // start scanning at `nextAreaIndex` and rotate it past the area
         // just selected, so each eligible area gets a turn before repeating.
@@ -310,16 +374,17 @@ public final class DiagnosticSession: @unchecked Sendable {
             nextAreaIndex = (areaIndex + 1) % areas.count
             return
         }
-        state = .completed
+        _state = .completed
         pending = nil
     }
 
     /// Builds the profile. Callable in any state; before `start()` it
     /// returns an all-`.notAssessed`, incomplete profile (empty session).
     public func profile() -> SkillProfile {
+        lock.lock(); defer { lock.unlock() }
         var estimates: [SkillEstimate] = []
         for area in DiagnosticArea.allCases {
-            let rs = responses.filter { $0.area == area }
+            let rs = _responses.filter { $0.area == area }
             guard !rs.isEmpty else {
                 estimates.append(SkillEstimate(area: area))
                 continue
@@ -340,7 +405,7 @@ public final class DiagnosticSession: @unchecked Sendable {
         // Complete only when every area met its quota; merely having
         // been assessed once (e.g. a timeout or a solver-reduced bank)
         // is not completion.
-        let complete = state == .completed && estimates.allSatisfy {
+        let complete = _state == .completed && estimates.allSatisfy {
             $0.itemsAttempted >= (itemsPerArea[$0.area] ?? 0)
         }
         return SkillProfile(grade: grade, estimates: estimates,
@@ -398,12 +463,13 @@ public enum DiagnosticBank {
     private static func p(_ skill: SolverSkill, _ area: DiagnosticArea,
                           operands: [Int] = [], fractions: [SolverFraction] = [],
                           operation: WordOperation? = nil, passage: String? = nil,
-                          candidate: String? = nil, prompt: String,
+                          candidate: String? = nil, acceptable: [String] = [], prompt: String,
                           difficulty: Int) -> DiagnosticBankItem {
         DiagnosticBankItem(area: area, problem: ProposedProblem(
             skill: skill, operands: operands, fractions: fractions, operation: operation,
             passage: passage, candidateAnswer: candidate,
-            promptText: prompt, difficulty: difficulty, grade: "4"))
+            promptText: prompt, difficulty: difficulty, grade: "4"),
+            acceptableAnswers: acceptable)
     }
 
     private static func f(_ n: Int, _ d: Int) -> SolverFraction {
@@ -435,11 +501,11 @@ public enum DiagnosticBank {
         // Reading fluency (literal recall, latency scored)
         p(.readingComprehension, .readingFluency, passage: passageA, candidate: "12", prompt: "Read: \(passageA)\nHow many tomato seeds did Mia plant?", difficulty: 1),
         p(.readingComprehension, .readingFluency, passage: passageA, candidate: "9", prompt: "Read: \(passageA)\nHow many seeds had sprouted after two weeks?", difficulty: 2),
-        p(.readingComprehension, .readingFluency, passage: passageB, candidate: "48", prompt: "Read: \(passageB)\nHow many books are on the top shelf?", difficulty: 1),
+        p(.readingComprehension, .readingFluency, passage: passageB, candidate: "48", prompt: "Read: \(passageB)\nHow many books were on the top shelf before Mr. Lee moved any of them?", difficulty: 1),
         // Comprehension (passage-supported answers)
-        p(.readingComprehension, .comprehension, passage: passageA, candidate: "every morning", prompt: "Read: \(passageA)\nWhen did Mia water the garden?", difficulty: 1),
+        p(.readingComprehension, .comprehension, passage: passageA, candidate: "every morning", acceptable: ["before school", "every morning before school"], prompt: "Read: \(passageA)\nWhen did Mia water the garden?", difficulty: 1),
         p(.readingComprehension, .comprehension, passage: passageB, candidate: "16", prompt: "Read: \(passageB)\nHow many books did Mr. Lee move?", difficulty: 1),
-        p(.readingComprehension, .comprehension, passage: passageB, candidate: "reading corner", prompt: "Read: \(passageB)\nWhere did Mr. Lee move the books?", difficulty: 2),
+        p(.readingComprehension, .comprehension, passage: passageB, candidate: "reading corner", acceptable: ["a reading corner"], prompt: "Read: \(passageB)\nWhere did Mr. Lee move the books?", difficulty: 2),
         p(.readingComprehension, .comprehension, passage: passageA, candidate: "tomato seeds", prompt: "Read: \(passageA)\nWhat did Mia plant in her garden?", difficulty: 2),
     ]
 }

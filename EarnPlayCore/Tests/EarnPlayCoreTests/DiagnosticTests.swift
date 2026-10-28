@@ -301,6 +301,187 @@ final class DiagnosticTests: XCTestCase {
         XCTAssertTrue(profile.isComplete)
     }
 
+    // MARK: - Copilot round-2 regression tests
+
+    /// Thread-safe clock for concurrency tests.
+    private final class Round2Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var date: Date
+        init(_ date: Date) { self.date = date }
+        func now() -> Date { lock.lock(); defer { lock.unlock() }; return date }
+        func advance(_ seconds: TimeInterval) {
+            lock.lock(); defer { lock.unlock() }; date = date.addingTimeInterval(seconds)
+        }
+    }
+
+    /// Runs a session containing only the bank item whose prompt
+    /// contains `needle`, and submits `answer` to it.
+    private func submitSingleItem(promptContaining needle: String, answer: String) -> Bool {
+        let bankItem = try! XCTUnwrap(
+            DiagnosticBank.grade4.first { $0.problem.promptText.contains(needle) },
+            "no bank item containing \(needle)")
+        var quotas = Dictionary(uniqueKeysWithValues: DiagnosticArea.allCases.map { ($0, 0) })
+        quotas[bankItem.area] = 1
+        let s = DiagnosticSession(sessionId: "diag-r2-single", solver: SolverService(),
+                                  bank: [bankItem], timeBudgetSeconds: 600,
+                                  itemsPerArea: quotas, now: { self.clock })
+        s.start()
+        XCTAssertNotNil(s.currentItem)
+        return s.submit(answer: answer, responseMs: 1_000)
+    }
+
+    private func bankItem(promptContaining needle: String) -> DiagnosticBankItem {
+        try! XCTUnwrap(DiagnosticBank.grade4.first { $0.problem.promptText.contains(needle) })
+    }
+
+    func testPassageBFluencyItemAsksBeforeMoveAndVerifies48() {
+        let item = bankItem(promptContaining: "top shelf")
+        // Unambiguous wording: explicitly asks about BEFORE the move.
+        XCTAssertTrue(item.problem.promptText.lowercased().contains("before"),
+                      "prompt must ask before the move: \(item.problem.promptText)")
+        let solver = SolverService()
+        guard case .success(let q) = solver.verify(item.problem, questionId: "r2-f2") else {
+            return XCTFail("reworded item must verify")
+        }
+        XCTAssertEqual(q.verifiedAnswer, "48")
+        XCTAssertTrue(submitSingleItem(promptContaining: "top shelf", answer: "48"))
+        XCTAssertFalse(submitSingleItem(promptContaining: "top shelf", answer: "32"))
+    }
+
+    func testComprehensionWhenItemAcceptsPassagePhrasings() {
+        for phrasing in ["every morning", "before school", "every morning before school"] {
+            XCTAssertTrue(submitSingleItem(promptContaining: "When did Mia water", answer: phrasing),
+                          "should accept: \(phrasing)")
+        }
+        XCTAssertFalse(submitSingleItem(promptContaining: "When did Mia water", answer: "every evening"))
+        XCTAssertFalse(submitSingleItem(promptContaining: "When did Mia water", answer: "after dinner"))
+    }
+
+    func testComprehensionWhereItemAcceptsAReadingCorner() {
+        for phrasing in ["reading corner", "a reading corner"] {
+            XCTAssertTrue(submitSingleItem(promptContaining: "Where did Mr. Lee move", answer: phrasing),
+                          "should accept: \(phrasing)")
+        }
+        XCTAssertFalse(submitSingleItem(promptContaining: "Where did Mr. Lee move", answer: "the garden"))
+        XCTAssertFalse(submitSingleItem(promptContaining: "Where did Mr. Lee move", answer: "the top shelf"))
+    }
+
+    func testConcurrentSubmitsRecordEachItemAtMostOnce() {
+        for _ in 0..<10 {
+            let s = makeSession()
+            s.start()
+            DispatchQueue.concurrentPerform(iterations: 100) { _ in
+                if let item = s.currentItem {
+                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+                }
+            }
+            let ids = s.responses.map(\.questionId)
+            XCTAssertEqual(ids.count, Set(ids).count, "duplicate recorded items: \(ids)")
+        }
+    }
+
+    func testConcurrentSubmitAndExpireCannotDoubleRecord() {
+        let box = Round2Clock(Date(timeIntervalSince1970: 2_000_000))
+        let s = DiagnosticSession(sessionId: "diag-r2-race", solver: SolverService(),
+                                  bank: DiagnosticBank.grade4, timeBudgetSeconds: 60,
+                                  now: { box.now() })
+        s.start()
+        let first = try! XCTUnwrap(s.currentItem)
+        XCTAssertTrue(s.submit(answer: first.question.verifiedAnswer, responseMs: 1_000))
+        box.advance(61)
+        DispatchQueue.concurrentPerform(iterations: 100) { i in
+            if i % 2 == 0 {
+                if let item = s.currentItem {
+                    _ = s.submit(answer: item.question.verifiedAnswer, responseMs: 1_000)
+                }
+            } else {
+                _ = s.expireIfNeeded()
+            }
+        }
+        XCTAssertEqual(s.state, .completed)
+        let ids = s.responses.map(\.questionId)
+        XCTAssertEqual(ids.count, Set(ids).count, "duplicate recorded items: \(ids)")
+        // Expiry already completed the session: no late recording.
+        XCTAssertFalse(s.submit(answer: "48", responseMs: 1_000))
+        XCTAssertEqual(s.responses.map(\.questionId), ids)
+    }
+
+    func testPairedAllCorrectVsFractionsOnlyWrong() {
+        let allCorrect = makeSession()
+        allCorrect.start()
+        answerAllCorrectly(allCorrect)
+        let correctProfile = allCorrect.profile()
+
+        let fractionsWrong = DiagnosticSession(
+            sessionId: "diag-r2-fractions", solver: SolverService(),
+            bank: DiagnosticBank.grade4, timeBudgetSeconds: 600, now: { self.clock })
+        fractionsWrong.start()
+        var guardCount = 0
+        while let item = fractionsWrong.currentItem, guardCount < 100 {
+            if item.area == .fractions {
+                XCTAssertFalse(fractionsWrong.submit(answer: "definitely-wrong", responseMs: 2_000))
+            } else {
+                XCTAssertTrue(fractionsWrong.submit(answer: item.question.verifiedAnswer, responseMs: 2_000))
+            }
+            guardCount += 1
+        }
+        let wrongProfile = fractionsWrong.profile()
+
+        // Exact per-area levels: all-correct run.
+        for area in DiagnosticArea.allCases {
+            XCTAssertEqual(correctProfile.estimate(for: area).level, .proficient, "all-correct \(area)")
+            XCTAssertEqual(correctProfile.estimate(for: area).accuracy, 1.0, "all-correct \(area)")
+        }
+        // Exact per-area levels: fractions-only-wrong run.
+        XCTAssertEqual(wrongProfile.estimate(for: .fractions).level, .emerging)
+        XCTAssertEqual(wrongProfile.estimate(for: .fractions).accuracy, 0.0)
+        XCTAssertEqual(wrongProfile.estimate(for: .fractions).itemsCorrect, 0)
+        XCTAssertGreaterThan(wrongProfile.estimate(for: .fractions).itemsAttempted, 0)
+        for area in DiagnosticArea.allCases where area != .fractions {
+            XCTAssertEqual(wrongProfile.estimate(for: area).level, .proficient, "fractions-wrong \(area)")
+            XCTAssertEqual(wrongProfile.estimate(for: area).accuracy, 1.0, "fractions-wrong \(area)")
+        }
+        XCTAssertEqual(wrongProfile.nextFocusArea, .fractions)
+    }
+
+    func testPersistenceSecondProfileFullyReplacesFirst() throws {
+        // First profile: all-correct.
+        let firstSession = DiagnosticSession(
+            sessionId: "diag-r2-first", solver: SolverService(),
+            bank: DiagnosticBank.grade4, timeBudgetSeconds: 600, now: { self.clock })
+        firstSession.start()
+        answerAllCorrectly(firstSession)
+        let firstProfile = firstSession.profile()
+
+        // Second profile: fractions-only-wrong, distinct session id.
+        let secondSession = DiagnosticSession(
+            sessionId: "diag-r2-second", solver: SolverService(),
+            bank: DiagnosticBank.grade4, timeBudgetSeconds: 600, now: { self.clock })
+        secondSession.start()
+        var guardCount = 0
+        while let item = secondSession.currentItem, guardCount < 100 {
+            _ = secondSession.submit(
+                answer: item.area == .fractions ? "definitely-wrong" : item.question.verifiedAnswer,
+                responseMs: 2_000)
+            guardCount += 1
+        }
+        let secondProfile = secondSession.profile()
+        XCTAssertNotEqual(firstProfile, secondProfile)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("diag-r2-\(UUID().uuidString)/profile.json")
+        let store = FileSkillProfileStore(fileURL: url)
+        try store.save(firstProfile)
+        XCTAssertEqual(try store.load(), firstProfile)
+        try store.save(secondProfile)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded, secondProfile)
+        XCTAssertEqual(loaded?.diagnosticSessionId, "diag-r2-second")
+        XCTAssertEqual(loaded?.estimate(for: .fractions).level, .emerging)
+        XCTAssertNotEqual(loaded?.estimate(for: .fractions).level,
+                          firstProfile.estimate(for: .fractions).level)
+    }
+
     func testCorruptProfileFileThrowsOnLoad() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("diag-bad-\(UUID().uuidString)/profile.json")
