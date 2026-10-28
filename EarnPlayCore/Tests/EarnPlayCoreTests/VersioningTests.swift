@@ -45,14 +45,14 @@ final class VersioningTests: XCTestCase {
 
     func testProductionBundleDerivesFromRuntimeAndPromptConstants() throws {
         let registry = try VersionRegistry.production(storeURL: tempStoreURL(), modelURL: nil)
-        XCTAssertEqual(registry.activeBundle.modelVersion, ModelRuntime.versionStamp)
+        XCTAssertEqual(try registry.activeBundle.modelVersion, ModelRuntime.versionStamp)
         XCTAssertEqual(
-            registry.activeBundle.modelVersion,
+            try registry.activeBundle.modelVersion,
             "\(ModelRuntime.modelIdentifier) / \(ModelRuntime.runtimeIdentifier)"
         )
-        XCTAssertEqual(registry.activeBundle.promptVersion, SpikePrompts.version)
-        XCTAssertFalse(registry.activeBundle.modelVersion.isEmpty)
-        XCTAssertFalse(registry.activeBundle.promptVersion.isEmpty)
+        XCTAssertEqual(try registry.activeBundle.promptVersion, SpikePrompts.version)
+        XCTAssertFalse(try registry.activeBundle.modelVersion.isEmpty)
+        XCTAssertFalse(try registry.activeBundle.promptVersion.isEmpty)
     }
 
     /// Production ships exactly one bundle today, so production rollback
@@ -76,8 +76,8 @@ final class VersioningTests: XCTestCase {
         XCTAssertEqual(session.startedAt, startedAt)
         XCTAssertFalse(session.modelVersion.isEmpty)
         XCTAssertFalse(session.promptVersion.isEmpty)
-        XCTAssertEqual(session.modelVersion, registry.activeBundle.modelVersion)
-        XCTAssertEqual(session.promptVersion, registry.activeBundle.promptVersion)
+        XCTAssertEqual(session.modelVersion, try registry.activeBundle.modelVersion)
+        XCTAssertEqual(session.promptVersion, try registry.activeBundle.promptVersion)
         XCTAssertEqual(session.modelVersion, ModelRuntime.versionStamp)
         XCTAssertEqual(session.promptVersion, SpikePrompts.version)
     }
@@ -100,13 +100,35 @@ final class VersioningTests: XCTestCase {
     /// a new session stamps the older versions; rolling forward again
     /// restores the current stamp.
     func testRollbackChangesStampedVersionAndRollForwardRestores() throws {
-        let registry = try makeRegistry()
+        // Round 4 F12: roll-forward target must carry a real model
+        // artifact, so this registry binds "current" to a GGUF file.
+        let currentModel = try tempGGUF(named: "CurrentModel.gguf")
+        let previousModel = try tempGGUF()
+        let registry = try VersionRegistry(
+            bundles: [
+                VersionBundle(
+                    bundleID: "current",
+                    modelVersion: ModelRuntime.versionStamp,
+                    promptVersion: SpikePrompts.version,
+                    modelFilePath: currentModel.path,
+                    promptTexts: SpikePrompts.all
+                ),
+                VersionBundle(
+                    bundleID: VersionRegistry.previousKnownGoodBundleID,
+                    modelVersion: "previous-model-fixture",
+                    promptVersion: "previous-prompt-fixture",
+                    modelFilePath: previousModel.path,
+                    promptTexts: ["Previous prompt alpha.", "Previous prompt beta."]
+                ),
+            ],
+            activeBundleID: "current"
+        )
         let startedAt = Date(timeIntervalSince1970: 1_730_000_100)
         let before = try SessionRecord.start(sessionId: "s-before", startedAt: startedAt, registry: registry)
         XCTAssertEqual(before.modelVersion, ModelRuntime.versionStamp)
 
         try registry.rollbackToPreviousKnownGood()
-        XCTAssertEqual(registry.activeBundle.bundleID, VersionRegistry.previousKnownGoodBundleID)
+        XCTAssertEqual(try registry.activeBundle.bundleID, VersionRegistry.previousKnownGoodBundleID)
         let rolledBack = try SessionRecord.start(sessionId: "s-rollback", startedAt: startedAt, registry: registry)
         XCTAssertEqual(rolledBack.modelVersion, "previous-model-fixture")
         XCTAssertEqual(rolledBack.promptVersion, "previous-prompt-fixture")
@@ -124,7 +146,7 @@ final class VersioningTests: XCTestCase {
             XCTAssertEqual(error as? VersioningError, .unknownBundle("does-not-exist"))
         }
         // A failed selection must not change the active bundle.
-        XCTAssertEqual(registry.activeBundle.bundleID, "current")
+        XCTAssertEqual(try registry.activeBundle.bundleID, "current")
     }
 
     func testRegistryRejectsInvalidBundles() {
@@ -168,14 +190,14 @@ final class VersioningTests: XCTestCase {
         }
         XCTAssertTrue(box.errors.isEmpty, "unexpected errors: \(box.errors)")
         XCTAssertEqual(box.stamps, 100)
-        XCTAssertEqual(registry.registeredBundles.count, 102)
-        XCTAssertEqual(registry.activeBundleID, "current")
+        XCTAssertEqual(try registry.registeredBundles.count, 102)
+        XCTAssertEqual(try registry.activeBundleID, "current")
     }
 
     // F2: after rollback, inference artifacts are the rolled-back ones.
     func testRollbackArtifactsAreUsedByInference() throws {
         let registry = try makeRegistry()
-        let previous = registry.registeredBundles.first {
+        let previous = try registry.registeredBundles.first {
             $0.bundleID == VersionRegistry.previousKnownGoodBundleID
         }!
         try registry.rollbackToPreviousKnownGood()
@@ -198,7 +220,7 @@ final class VersioningTests: XCTestCase {
             XCTAssertEqual(error as? VersioningError,
                            .artifactUnavailable(bundleID: "label-only", artifact: "modelFile"))
         }
-        XCTAssertEqual(registry.activeBundleID, "current")
+        XCTAssertEqual(try registry.activeBundleID, "current")
         try registry.register(VersionBundle(
             bundleID: "missing-model", modelVersion: "m", promptVersion: "spike-v1",
             modelFilePath: "/nonexistent/ghost.gguf"))
@@ -206,7 +228,7 @@ final class VersioningTests: XCTestCase {
             XCTAssertEqual(error as? VersioningError,
                            .artifactUnavailable(bundleID: "missing-model", artifact: "modelFile"))
         }
-        XCTAssertEqual(registry.activeBundleID, "current")
+        XCTAssertEqual(try registry.activeBundleID, "current")
     }
 
     // F6+F4: persisted registry survives reconstruction; a second
@@ -224,10 +246,10 @@ final class VersioningTests: XCTestCase {
         try first.rollbackToPreviousKnownGood()
 
         let panelSource = try VersionRegistry.production(storeURL: store, modelURL: nil)
-        XCTAssertEqual(panelSource.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
-        XCTAssertEqual(panelSource.activeBundle.modelVersion, "persisted-previous-model")
-        XCTAssertEqual(panelSource.activeBundle.promptVersion, "persisted-previous-prompt")
-        XCTAssertEqual(panelSource.registeredBundles.count, 2)
+        XCTAssertEqual(try panelSource.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
+        XCTAssertEqual(try panelSource.activeBundle.modelVersion, "persisted-previous-model")
+        XCTAssertEqual(try panelSource.activeBundle.promptVersion, "persisted-previous-prompt")
+        XCTAssertEqual(try panelSource.registeredBundles.count, 2)
         let session = try SessionRecord.start(sessionId: "after-restart", registry: panelSource)
         XCTAssertEqual(session.modelVersion, "persisted-previous-model")
         XCTAssertEqual(session.promptVersion, "persisted-previous-prompt")
@@ -246,9 +268,9 @@ final class VersioningTests: XCTestCase {
         let registry = try VersionRegistry.production(storeURL: tempStoreURL(), modelURL: model)
         let digest = try ModelRuntime.contentSHA256(forFileAt: model)
         XCTAssertEqual(
-            registry.activeBundle.modelVersion,
+            try registry.activeBundle.modelVersion,
             "InstalledModel.gguf (12 bytes, GGUF, sha256:\(digest)) / llama.cpp b11935, CPU backend")
-        XCTAssertFalse(registry.activeBundle.modelVersion.contains("Llama-3.2-1B"))
+        XCTAssertFalse(try registry.activeBundle.modelVersion.contains("Llama-3.2-1B"))
     }
 
     // F7: decoding enforces the non-empty version invariant.
@@ -308,7 +330,7 @@ extension VersioningTests {
         let corrupt = corruptDir.appendingPathComponent("Corrupt.gguf")
         try Data("not a gguf at all".utf8).write(to: corrupt)
         let restored = try VersionRegistry.production(storeURL: store, modelURL: corrupt)
-        XCTAssertEqual(restored.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
+        XCTAssertEqual(try restored.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
         let artifacts = try restored.inferenceArtifacts(defaultModelURL: nil)
         XCTAssertEqual(artifacts.prompts, SpikePrompts.all)
         XCTAssertNotNil(artifacts.modelURL)
@@ -329,7 +351,7 @@ extension VersioningTests {
         try Data("GGUF-original-bytes".utf8).write(to: model)
         let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
         try registry.registerActiveAsPreviousKnownGood()
-        let previous = registry.registeredBundles.first { $0.bundleID == VersionRegistry.previousKnownGoodBundleID }!
+        let previous = try registry.registeredBundles.first { $0.bundleID == VersionRegistry.previousKnownGoodBundleID }!
         XCTAssertEqual(previous.promptTexts, SpikePrompts.all)
         XCTAssertNotNil(previous.modelFilePath)
         XCTAssertNotEqual(previous.modelFilePath, model.path)
@@ -394,7 +416,7 @@ extension VersioningTests {
         let registry = try makeRegistry()
         XCTAssertThrowsError(try registry.register(VersionBundle(
             bundleID: "current", modelVersion: "ghost-model", promptVersion: "ghost-prompt")))
-        XCTAssertEqual(registry.activeBundle.modelVersion, ModelRuntime.versionStamp)
+        XCTAssertEqual(try registry.activeBundle.modelVersion, ModelRuntime.versionStamp)
 
         let store = tempStoreURL()
         let persisted = try VersionRegistry.production(storeURL: store, modelURL: nil)
@@ -407,12 +429,12 @@ extension VersioningTests {
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path) }
         XCTAssertThrowsError(try persisted.register(VersionBundle(
             bundleID: "never-persisted", modelVersion: "m", promptVersion: "p")))
-        XCTAssertFalse(persisted.registeredBundles.contains { $0.bundleID == "never-persisted" })
+        XCTAssertFalse(try persisted.registeredBundles.contains { $0.bundleID == "never-persisted" })
         XCTAssertThrowsError(try persisted.select(bundleID: VersionRegistry.previousKnownGoodBundleID))
-        XCTAssertEqual(persisted.activeBundleID, "current")
+        XCTAssertEqual(try persisted.activeBundleID, "current")
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path)
         try persisted.select(bundleID: VersionRegistry.previousKnownGoodBundleID)
-        XCTAssertEqual(persisted.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
+        XCTAssertEqual(try persisted.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
     }
 
     // F6: two instances on one store do not lose each other's updates.
@@ -425,11 +447,161 @@ extension VersioningTests {
                                      modelVersion: "prev-m", promptVersion: "prev-p",
                                      modelFilePath: prevModel.path, promptTexts: ["Prev."]))
         try b.register(VersionBundle(bundleID: "from-b", modelVersion: "m-b", promptVersion: "p-b"))
-        XCTAssertTrue(b.registeredBundles.contains { $0.bundleID == VersionRegistry.previousKnownGoodBundleID })
+        XCTAssertTrue(try b.registeredBundles.contains { $0.bundleID == VersionRegistry.previousKnownGoodBundleID })
         try a.rollbackToPreviousKnownGood()
         let fresh = try VersionRegistry.production(storeURL: store, modelURL: nil)
-        XCTAssertEqual(fresh.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
-        XCTAssertTrue(fresh.registeredBundles.contains { $0.bundleID == "from-b" })
-        XCTAssertTrue(fresh.registeredBundles.contains { $0.bundleID == VersionRegistry.previousKnownGoodBundleID })
+        XCTAssertEqual(try fresh.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
+        XCTAssertTrue(try fresh.registeredBundles.contains { $0.bundleID == "from-b" })
+        XCTAssertTrue(try fresh.registeredBundles.contains { $0.bundleID == VersionRegistry.previousKnownGoodBundleID })
+    }
+}
+
+extension VersioningTests {
+    // Round 4 F2: same-size replacement with preserved mtime rehashes.
+    func testSameSizeReplacementWithPreservedMtimeRehashes() throws {
+        let url = try tempGGUF(named: "CacheBust.gguf")
+        try Data("GGUF-AAAAAAA".utf8).write(to: url)
+        let first = try ModelRuntime.contentSHA256(forFileAt: url)
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let mtime = attrs[.modificationDate] as! Date
+        try Data("GGUF-BBBBBBB".utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: url.path)
+        let second = try ModelRuntime.contentSHA256(forFileAt: url)
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(try ModelRuntime.verifiedModelVersion(forModelAt: url),
+                          "CacheBust.gguf (12 bytes, GGUF, sha256:\(first)) / llama.cpp b11935, CPU backend")
+    }
+
+    // Round 4 F1: a runtime bound to a verified digest rejects a
+    // file replaced after the runtime was created, at load time.
+    func testBoundRuntimeRejectsReplacedModelAtLoad() throws {
+        let url = try tempGGUF(named: "BoundLoad.gguf")
+        try Data("GGUF-AAAAAAA".utf8).write(to: url)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: url)
+        let runtime = ModelRuntime(modelPath: url, expectedContentDigest: digest)
+        try Data("GGUF-BBBBBBB".utf8).write(to: url)
+        XCTAssertThrowsError(try runtime.load()) { error in
+            XCTAssertEqual(error as? ModelRuntimeError, .modelContentMismatch(path: url.path))
+        }
+        // Re-resolving against the new file binds its new digest.
+        let newDigest = try ModelRuntime.contentSHA256(forFileAt: url)
+        XCTAssertNotEqual(newDigest, digest)
+        let artifactsDigest = try ModelRuntime.verifiedModelVersion(forModelAt: url)
+        XCTAssertTrue(artifactsDigest.contains(newDigest))
+    }
+
+    // Round 4 F12: snapshot and rollback/select reject missing models.
+    func testSnapshotAndSelectionRejectMissingModelArtifacts() throws {
+        let registry = try VersionRegistry.production(storeURL: tempStoreURL(), modelURL: nil)
+        XCTAssertThrowsError(try registry.registerActiveAsPreviousKnownGood(defaultModelURL: nil)) { error in
+            XCTAssertEqual(error as? VersioningError,
+                           .artifactUnavailable(bundleID: "current", artifact: "modelFile"))
+        }
+        XCTAssertThrowsError(try registry.rollbackToPreviousKnownGood()) { error in
+            XCTAssertEqual(error as? VersioningError, .noPreviousBundle)
+        }
+        let labelOnly = try VersionRegistry(
+            bundles: [
+                VersionBundle(bundleID: "current", modelVersion: ModelRuntime.versionStamp,
+                              promptVersion: SpikePrompts.version,
+                              modelFilePath: try tempGGUF().path, promptTexts: SpikePrompts.all),
+                VersionBundle(bundleID: VersionRegistry.previousKnownGoodBundleID,
+                              modelVersion: "ghost", promptVersion: "ghost-prompt"),
+            ], activeBundleID: "current")
+        XCTAssertThrowsError(try labelOnly.rollbackToPreviousKnownGood()) { error in
+            XCTAssertEqual(error as? VersioningError,
+                           .artifactUnavailable(bundleID: VersionRegistry.previousKnownGoodBundleID,
+                                                artifact: "modelFile"))
+        }
+    }
+
+    // Round 4 F4: throwing reads propagate a corrupt persisted store
+    // instead of returning stale cached state; stamping follows suit.
+    func testThrowingReadsPropagateCorruptPersistedState() throws {
+        let store = tempStoreURL()
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: nil)
+        try Data("{{{ corrupt".utf8).write(to: store)
+        XCTAssertThrowsError(try registry.activeBundle)
+        XCTAssertThrowsError(try registry.registeredBundles)
+        XCTAssertThrowsError(try registry.activeBundleID)
+        XCTAssertThrowsError(try SessionRecord.start(sessionId: "s-corrupt", registry: registry))
+    }
+
+    // Round 4 F5: snapshot rejects a source replaced after binding.
+    func testSnapshotRejectsSourceReplacedAfterBinding() throws {
+        let store = tempStoreURL()
+        let model = try tempGGUF(named: "SnapshotSrc.gguf")
+        try Data("GGUF-AAAAAAA".utf8).write(to: model)
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try Data("GGUF-BBBBBBB".utf8).write(to: model)
+        XCTAssertThrowsError(try registry.registerActiveAsPreviousKnownGood()) { error in
+            XCTAssertEqual(error as? VersioningError,
+                           .artifactUnavailable(bundleID: "current", artifact: "modelFile"))
+        }
+        XCTAssertFalse(try registry.registeredBundles.contains {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        })
+    }
+
+    // Round 4 F6: snapshots live at distinct immutable paths; the
+    // old snapshot is retired only after the new entry persists.
+    func testSnapshotsUseDistinctImmutablePathsAndRetireOld() throws {
+        let store = tempStoreURL()
+        let model = try tempGGUF(named: "Immutable.gguf")
+        try Data("GGUF-version-A".utf8).write(to: model)
+        let first = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try first.registerActiveAsPreviousKnownGood()
+        let firstBundle = try first.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!
+        let firstPath = firstBundle.modelFilePath!
+        XCTAssertTrue(firstPath.contains("previous-known-good-model-"))
+        XCTAssertNotEqual(firstPath, store.deletingLastPathComponent()
+            .appendingPathComponent("previous-known-good-model.gguf").path)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: firstPath)),
+                       Data("GGUF-version-A".utf8))
+
+        try Data("GGUF-version-B".utf8).write(to: model)
+        let second = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try second.registerActiveAsPreviousKnownGood()
+        let secondBundle = try second.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!
+        XCTAssertNotEqual(secondBundle.modelFilePath, firstPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: secondBundle.modelFilePath!)),
+                       Data("GGUF-version-B".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath),
+                       "unreferenced previous snapshot must be retired after persist")
+        try second.rollbackToPreviousKnownGood()
+        let artifacts = try second.inferenceArtifacts(defaultModelURL: nil)
+        XCTAssertEqual(artifacts.modelURL?.path, secondBundle.modelFilePath)
+        XCTAssertEqual(artifacts.modelContentDigest, secondBundle.modelContentDigest)
+    }
+
+    // Round 4 F13: reported version keeps the retained model
+    // identity but names the runtime actually running.
+    func testReportedVersionComposesRetainedModelWithRunningRuntime() throws {
+        XCTAssertEqual(
+            ModelRuntime.reportedModelVersion(storedModelVersion: "OldModel.gguf (12 bytes, GGUF, sha256:abc) / stale-runtime-0"),
+            "OldModel.gguf (12 bytes, GGUF, sha256:abc) / \(ModelRuntime.runtimeIdentifier)")
+        XCTAssertEqual(ModelRuntime.reportedModelVersion(storedModelVersion: "plain-model-fixture"),
+                       "plain-model-fixture")
+        let model = try tempGGUF(named: "RuntimeCompose.gguf")
+        let registry = try VersionRegistry(
+            bundles: [
+                VersionBundle(bundleID: "current", modelVersion: ModelRuntime.versionStamp,
+                              promptVersion: SpikePrompts.version,
+                              modelFilePath: model.path, promptTexts: SpikePrompts.all),
+                VersionBundle(bundleID: VersionRegistry.previousKnownGoodBundleID,
+                              modelVersion: "RetainedModel.gguf (12 bytes, GGUF, sha256:deadbeef) / stale-runtime-0",
+                              promptVersion: "prev-prompt",
+                              modelFilePath: model.path, promptTexts: ["Prev."]),
+            ], activeBundleID: "current")
+        try registry.rollbackToPreviousKnownGood()
+        let artifacts = try registry.inferenceArtifacts(defaultModelURL: nil)
+        XCTAssertEqual(artifacts.modelVersion,
+                       "RetainedModel.gguf (12 bytes, GGUF, sha256:deadbeef) / \(ModelRuntime.runtimeIdentifier)")
+        let session = try SessionRecord.start(sessionId: "s-runtime", registry: registry)
+        XCTAssertEqual(session.modelVersion, artifacts.modelVersion)
     }
 }

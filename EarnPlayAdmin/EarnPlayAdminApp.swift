@@ -22,6 +22,7 @@ struct AdminVersionView: View {
     @State private var activeBundle: VersionBundle?
     @State private var bundles: [VersionBundle] = []
     @State private var statusText = ""
+    @State private var isBusy = false
 
     var body: some View {
         ScrollView {
@@ -49,13 +50,21 @@ struct AdminVersionView: View {
                 Text("Rollback operator controls")
                     .font(.headline)
                 Button("Register active bundle as previous known-good") {
-                    perform { try registry?.registerActiveAsPreviousKnownGood() }
+                    perform { reg in try reg.registerActiveAsPreviousKnownGood() }
                 }
+                .disabled(isBusy)
                 Button("Roll back to previous known-good") {
-                    perform { try registry?.rollbackToPreviousKnownGood() }
+                    perform { reg in try reg.rollbackToPreviousKnownGood() }
                 }
+                .disabled(isBusy)
                 Button("Roll forward to current") {
-                    perform { try registry?.select(bundleID: "current") }
+                    perform { reg in try reg.select(bundleID: "current") }
+                }
+                .disabled(isBusy)
+                if isBusy {
+                    Text("Working…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 if !statusText.isEmpty {
                     Text(statusText)
@@ -76,32 +85,49 @@ struct AdminVersionView: View {
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .onAppear(perform: reload)
+        .task { await reload() }
     }
 
-    private func reload() {
+    /// Round 4 F8/F4: registry load (model hashing) and snapshot
+    /// copies run off the main actor; throwing reads propagate
+    /// reload failures to the panel instead of showing stale data.
+    private func reload() async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
         do {
-            let loaded = try VersionRegistry.production()
+            let (loaded, active, all) = try await Task.detached(priority: .userInitiated) {
+                let r = try VersionRegistry.production()
+                return (r, try r.activeBundle, try r.registeredBundles)
+            }.value
             registry = loaded
-            refresh(loaded)
+            activeBundle = active
+            bundles = all
         } catch {
+            activeBundle = nil
+            bundles = []
             statusText = "Failed to load registry: \(String(describing: error))"
         }
     }
 
-    private func refresh(_ registry: VersionRegistry) {
-        activeBundle = registry.activeBundle
-        bundles = registry.registeredBundles
-    }
-
-    private func perform(_ action: () throws -> Void) {
-        guard let registry else { reload(); return }
-        do {
-            try action()
-            refresh(registry)
-            statusText = "Done. Active bundle is now \(registry.activeBundleID)."
-        } catch {
-            statusText = "Failed: \(String(describing: error))"
+    private func perform(_ action: @escaping @Sendable (VersionRegistry) throws -> Void) {
+        guard !isBusy else { return }
+        guard let registry else { Task { await reload() }; return }
+        isBusy = true
+        Task {
+            defer { isBusy = false }
+            do {
+                let (active, all, activeID) = try await Task.detached(priority: .userInitiated) {
+                    try action(registry)
+                    return (try registry.activeBundle, try registry.registeredBundles,
+                            try registry.activeBundleID)
+                }.value
+                activeBundle = active
+                bundles = all
+                statusText = "Done. Active bundle is now \(activeID)."
+            } catch {
+                statusText = "Failed: \(String(describing: error))"
+            }
         }
     }
 }

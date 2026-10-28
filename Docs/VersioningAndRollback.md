@@ -25,6 +25,27 @@ LLD sections 2.2 (Session) and 10.3 (Versioning and rollback).
   later appears at the default path.
 - Prompt version scheme: `"<set-id>-v<major>"` (see `SpikePrompts`).
   Bump the major number on any wording or rule change to the set.
+- Runtime composition (round 4 F13, chosen option): snapshots
+  retain the model file and prompts, not a past llama.cpp
+  runtime (the runtime is linked into the app binary and cannot
+  be swapped per-bundle). The reported version is therefore
+  composed at stamp/inference time by
+  `ModelRuntime.reportedModelVersion(storedModelVersion:)`: the
+  retained model identity (everything before `" / "`) with the
+  runtime identifier actually running. A rolled-back bundle
+  never reports the old runtime it was registered under; it
+  reports the retained model run by the current runtime.
+- Load-time verification (F1/F2): `contentSHA256` always
+  re-reads the file (no path/size/mtime cache), and a
+  `ModelRuntime` created from resolved artifacts is bound to
+  their content digest. `load()` re-hashes and rejects a file
+  replaced after resolution (`modelContentMismatch`) instead of
+  loading it under the old stamp. Registry reads
+  (`activeBundle`, `activeBundleID`, `registeredBundles`) are
+  throwing: a persisted-store reload failure propagates to
+  session stamping and both apps' panels instead of silently
+  showing stale state (F4). `production()` holds the shared
+  per-store lock across restore/create/refresh (F3).
 - A *bundle* (`VersionBundle`) is one selectable model + prompt
   pairing, bound to its artifacts: `modelFilePath` (the GGUF file
   inference loads) and `promptTexts` (the prompts inference runs).
@@ -107,13 +128,20 @@ inference runs; the admin controls change the admin app's own
 persisted registry and demonstrate/verify the same procedure.
 
 1. *Before an update ships:* tap **Register active bundle as
-   previous known-good**. This snapshots the active bundle's
-   resolved prompt texts and retains the actual model file at the
-   stable path `previous-known-good-model.gguf` next to the
-   registry store (with its SHA-256), under bundle ID
-   `previous-known-good`, and persists it, so it survives the
+   previous known-good**. This first checks the installed model
+   file still matches the active bundle's bound SHA-256 (a
+   replaced file is rejected, not snapshotted under the old
+   version), then snapshots the active bundle's resolved prompt
+   texts and retains the actual model file at a distinct
+   immutable path `previous-known-good-model-<digest-prefix>.gguf`
+   next to the registry store (with its SHA-256), under bundle ID
+   `previous-known-good`, and persists the new registry entry;
+   only after that persist succeeds is a previous snapshot file
+   that no bundle references retired. It therefore survives the
    update, a prompt bump, replacement of the default model, and
-   restart.
+   restart, and a failed persist cannot destroy the prior
+   rollback. With no model file installed, the snapshot is
+   rejected (`artifactUnavailable`) instead of reporting success.
 2. Confirm the regression is version-linked: compare session stamps
    between healthy and regressing sessions. If identical, do not
    roll back blind.
@@ -133,9 +161,15 @@ persisted registry and demonstrate/verify the same procedure.
    `testPersistedRegistrySurvivesReconstructionAndPanelReadsIt`.
 5. Record the rollback like any other version change: sessions
    after the rollback carry the older stamp (LLD 10.3).
-6. Roll forward: tap **Roll forward to current** in EarnPlayAdmin
-   (or `select(bundleID: "current")` in code), then confirm a new
-   session stamps the current version.
+6. Roll forward: tap **Roll forward to current** in the child
+   app's **SpikeView** ("Version rollback (this app)"), or call
+   `select(bundleID: "current")` on the child's persisted
+   registry in code, then confirm in the child app that a new
+   session stamps the current version. Do **not** use the
+   EarnPlayAdmin roll-forward button for this step: the admin
+   app has its own sandbox and registry, so its button changes
+   only the admin app's selection and leaves child inference
+   rolled back (see "Note on processes" below).
 
 Programmatic equivalent (same persisted registry):
 `let registry = try VersionRegistry.production()`, then

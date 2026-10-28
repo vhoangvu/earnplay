@@ -34,11 +34,15 @@ public struct InferenceArtifacts: Equatable, Sendable {
     public let promptVersion: String
     public let modelURL: URL?
     public let prompts: [String]
-    public init(modelVersion: String, promptVersion: String, modelURL: URL?, prompts: [String]) {
+    /// SHA-256 the loaded model file must still match at load time.
+    public let modelContentDigest: String?
+    public init(modelVersion: String, promptVersion: String, modelURL: URL?, prompts: [String],
+                modelContentDigest: String? = nil) {
         self.modelVersion = modelVersion
         self.promptVersion = promptVersion
         self.modelURL = modelURL
         self.prompts = prompts
+        self.modelContentDigest = modelContentDigest
     }
 }
 
@@ -69,9 +73,11 @@ public final class VersionRegistry: @unchecked Sendable {
     private let storeURL: URL?
 
     public var activeBundleID: String {
-        lock.lock(); defer { lock.unlock() }
-        try? reloadPersistedLocked()
-        return _activeBundleID
+        get throws {
+            lock.lock(); defer { lock.unlock() }
+            try reloadPersistedLocked()
+            return _activeBundleID
+        }
     }
 
     public init(bundles: [VersionBundle], activeBundleID: String, storeURL: URL? = nil) throws {
@@ -105,6 +111,11 @@ public final class VersionRegistry: @unchecked Sendable {
         modelURL: URL? = ModelRuntime.defaultModelURL()
     ) throws -> VersionRegistry {
         let url = storeURL ?? defaultStoreURL()
+        // Round 4 F3: hold the shared per-store lock across the
+        // entire existence check, restore/create, and refresh
+        // transaction so a concurrent instance cannot be overwritten.
+        let shared = sharedLock(for: url)
+        shared.lock(); defer { shared.unlock() }
         let current = makeCurrentBundle(modelURL: modelURL)
         // F1/F2: restore persisted registry independently of current
         // artifact validity; propagate corrupt-store errors.
@@ -161,15 +172,19 @@ public final class VersionRegistry: @unchecked Sendable {
     }
 
     public var activeBundle: VersionBundle {
-        lock.lock(); defer { lock.unlock() }
-        try? reloadPersistedLocked()
-        return bundlesByID[_activeBundleID]!
+        get throws {
+            lock.lock(); defer { lock.unlock() }
+            try reloadPersistedLocked()
+            return bundlesByID[_activeBundleID]!
+        }
     }
 
     public var registeredBundles: [VersionBundle] {
-        lock.lock(); defer { lock.unlock() }
-        try? reloadPersistedLocked()
-        return orderedIDs.compactMap { bundlesByID[$0] }
+        get throws {
+            lock.lock(); defer { lock.unlock() }
+            try reloadPersistedLocked()
+            return orderedIDs.compactMap { bundlesByID[$0] }
+        }
     }
 
     public func register(_ bundle: VersionBundle) throws {
@@ -224,48 +239,70 @@ public final class VersionRegistry: @unchecked Sendable {
         try reloadPersistedLocked()
         let active = bundlesByID[_activeBundleID]!
         let resolvedPrompts = active.promptTexts ?? SpikePrompts.all
-        var stablePath: String? = active.modelFilePath
-        var digest: String? = active.modelContentDigest
-        let sourceURL = active.modelFilePath.map { URL(fileURLWithPath: $0) } ?? defaultModelURL
-        if let sourceURL, FileManager.default.fileExists(atPath: sourceURL.path) {
-            var isDir: ObjCBool = false
-            _ = FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDir)
-            guard !isDir.boolValue, ModelRuntime.isGGUFFile(at: sourceURL) else {
-                throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
-            }
-            let srcDigest = try ModelRuntime.contentSHA256(forFileAt: sourceURL)
-            digest = srcDigest
-            do {
-                let dir = storeURL?.deletingLastPathComponent()
-                    ?? Self.defaultStoreURL().deletingLastPathComponent()
-                let stable = dir.appendingPathComponent("previous-known-good-model.gguf")
-                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                if sourceURL.standardizedFileURL.path != stable.standardizedFileURL.path {
-                    let existingDigest = (try? ModelRuntime.contentSHA256(forFileAt: stable))
-                    if existingDigest != srcDigest {
-                        let tmp = dir.appendingPathComponent("previous-known-good-model.tmp.gguf")
-                        try? FileManager.default.removeItem(at: tmp)
-                        try FileManager.default.copyItem(at: sourceURL, to: tmp)
-                        if FileManager.default.fileExists(atPath: stable.path) {
-                            _ = try FileManager.default.replaceItemAt(stable, withItemAt: tmp)
-                        } else {
-                            try FileManager.default.moveItem(at: tmp, to: stable)
-                        }
-                    }
-                }
-                stablePath = stable.path
-            }
-        } else if active.modelFilePath != nil {
+        let previousSnapshotPath = bundlesByID[Self.previousKnownGoodBundleID]?.modelFilePath
+        // F12: a snapshot with no model file is not a success.
+        guard let sourceURL = active.modelFilePath.map({ URL(fileURLWithPath: $0) }) ?? defaultModelURL,
+              FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
         }
-        try register(VersionBundle(
-            bundleID: Self.previousKnownGoodBundleID,
-            modelVersion: active.modelVersion,
-            promptVersion: active.promptVersion,
-            modelFilePath: stablePath,
-            promptTexts: resolvedPrompts,
-            modelContentDigest: digest
-        ))
+        var isDir: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDir)
+        guard !isDir.boolValue, ModelRuntime.isGGUFFile(at: sourceURL) else {
+            throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
+        }
+        let srcDigest = try ModelRuntime.contentSHA256(forFileAt: sourceURL)
+        // F5: reject a source that no longer matches the active bundle.
+        if let expected = active.modelContentDigest, expected != srcDigest {
+            throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
+        }
+        if active.modelContentDigest == nil, active.modelFilePath == nil,
+           let verified = try? ModelRuntime.verifiedModelVersion(forModelAt: sourceURL),
+           ModelRuntime.reportedModelVersion(storedModelVersion: verified)
+               != ModelRuntime.reportedModelVersion(storedModelVersion: active.modelVersion),
+           verified != active.modelVersion {
+            throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
+        }
+        // F6: distinct immutable path per content digest. Never
+        // overwrite an existing snapshot file in place.
+        let dir = storeURL?.deletingLastPathComponent()
+            ?? Self.defaultStoreURL().deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stable = dir.appendingPathComponent(
+            "previous-known-good-model-\(String(srcDigest.prefix(16))).gguf")
+        var createdSnapshot = false
+        if sourceURL.standardizedFileURL.path != stable.standardizedFileURL.path {
+            if FileManager.default.fileExists(atPath: stable.path) {
+                guard (try? ModelRuntime.contentSHA256(forFileAt: stable)) == srcDigest else {
+                    throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
+                }
+            } else {
+                let tmp = dir.appendingPathComponent("previous-known-good-model-\(UUID().uuidString).tmp.gguf")
+                try FileManager.default.copyItem(at: sourceURL, to: tmp)
+                do { try FileManager.default.moveItem(at: tmp, to: stable) }
+                catch { try? FileManager.default.removeItem(at: tmp); throw error }
+                createdSnapshot = true
+            }
+        }
+        do {
+            try register(VersionBundle(
+                bundleID: Self.previousKnownGoodBundleID,
+                modelVersion: active.modelVersion,
+                promptVersion: active.promptVersion,
+                modelFilePath: stable.path,
+                promptTexts: resolvedPrompts,
+                modelContentDigest: srcDigest
+            ))
+        } catch {
+            if createdSnapshot { try? FileManager.default.removeItem(at: stable) }
+            throw error
+        }
+        // Only after the new entry is persisted, retire a snapshot
+        // no remaining bundle references.
+        if let previousSnapshotPath,
+           previousSnapshotPath != stable.path,
+           !bundlesByID.values.contains(where: { $0.modelFilePath == previousSnapshotPath }) {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: previousSnapshotPath))
+        }
     }
 
     public func inferenceArtifacts(
@@ -277,9 +314,15 @@ public final class VersionRegistry: @unchecked Sendable {
         try Self.validateArtifacts(bundle, defaultModelURL: defaultModelURL)
         let prompts = bundle.promptTexts ?? SpikePrompts.all
         let modelURL = bundle.modelFilePath.map { URL(fileURLWithPath: $0) } ?? defaultModelURL
-        return InferenceArtifacts(modelVersion: bundle.modelVersion,
-                                  promptVersion: bundle.promptVersion,
-                                  modelURL: modelURL, prompts: prompts)
+        // F13: report retained model identity with running runtime.
+        // F1: carry digest so ModelRuntime can re-verify at load.
+        let digest = bundle.modelContentDigest
+            ?? (modelURL.flatMap { try? ModelRuntime.contentSHA256(forFileAt: $0) })
+        return InferenceArtifacts(
+            modelVersion: ModelRuntime.reportedModelVersion(storedModelVersion: bundle.modelVersion),
+            promptVersion: bundle.promptVersion,
+            modelURL: modelURL, prompts: prompts,
+            modelContentDigest: digest)
     }
 
     private static func enriched(_ bundle: VersionBundle, bindDefaultModel: Bool = false) -> VersionBundle {
@@ -340,9 +383,9 @@ public final class VersionRegistry: @unchecked Sendable {
                 throw VersioningError.artifactUnavailable(bundleID: bundle.bundleID, artifact: "modelFile")
             }
         } else {
-            guard bundle.modelContentDigest == nil, bundle.modelVersion == ModelRuntime.versionStamp else {
-                throw VersioningError.artifactUnavailable(bundleID: bundle.bundleID, artifact: "modelFile")
-            }
+            // F12: no explicit or default model file means no model
+            // can run — never accept it as a selectable bundle.
+            throw VersioningError.artifactUnavailable(bundleID: bundle.bundleID, artifact: "modelFile")
         }
         if let texts = bundle.promptTexts {
             guard !texts.isEmpty,
@@ -441,11 +484,14 @@ public struct SessionRecord: Equatable, Sendable, Codable {
         startedAt: Date = Date(),
         registry: VersionRegistry
     ) throws -> SessionRecord {
-        let bundle = registry.activeBundle
+        // F4: throwing read — a reload failure propagates instead
+        // of stamping stale cached versions. F13: stamp the
+        // retained model identity with the runtime actually running.
+        let bundle = try registry.activeBundle
         return try SessionRecord(
             sessionId: sessionId,
             startedAt: startedAt,
-            modelVersion: bundle.modelVersion,
+            modelVersion: ModelRuntime.reportedModelVersion(storedModelVersion: bundle.modelVersion),
             promptVersion: bundle.promptVersion
         )
     }

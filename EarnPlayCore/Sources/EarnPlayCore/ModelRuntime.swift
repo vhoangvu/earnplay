@@ -21,6 +21,9 @@ public enum ModelRuntimeError: Error, Equatable, Sendable {
     /// The file exists but is not a GGUF model (bad magic), so its
     /// identity cannot be verified as a model artifact (T5.3 F5).
     case invalidModelFile(path: String)
+    /// The file at the model path no longer matches the verified
+    /// digest/version the runtime was created for (T5.3 round 4 F1).
+    case modelContentMismatch(path: String)
 }
 
 /// One prompt-to-response round-trip, with latency split so the spike
@@ -124,22 +127,26 @@ public final class ModelRuntime: @unchecked Sendable {
         return "\(url.lastPathComponent) (\(size?.int64Value ?? 0) bytes, GGUF, sha256:\(digest)) / \(runtimeIdentifier)"
     }
 
-    private nonisolated(unsafe) static var digestCache: [String: String] = [:]
-    private static let digestCacheLock = NSLock()
+    /// Reported model version for a stored bundle version (F13):
+    /// the retained model identity with the runtime actually running.
+    /// A stored version of the form "<model identity> / <runtime>"
+    /// has its runtime component replaced with the current
+    /// `runtimeIdentifier`; a model-only identity is returned as-is.
+    public static func reportedModelVersion(storedModelVersion: String) -> String {
+        guard let range = storedModelVersion.range(of: " / ", options: .backwards) else {
+            return storedModelVersion
+        }
+        let modelIdentity = String(storedModelVersion[..<range.lowerBound])
+        guard !modelIdentity.isEmpty else { return storedModelVersion }
+        return "\(modelIdentity) / \(runtimeIdentifier)"
+    }
 
     /// Streamed SHA-256 (hex) of a file's contents — the immutable
     /// content identity used in verified stamps and bundle binding.
-    /// Cached by path+size+mtime so repeated checks on the same
-    /// unchanged file do not re-read a large model every time.
+    /// Always re-reads the file (round 4 F2): path+size+mtime do not
+    /// uniquely identify contents, so no digest cache is kept for
+    /// mutable model paths.
     public static func contentSHA256(forFileAt url: URL) throws -> String {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
-        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
-        let cacheKey = "\(url.standardizedFileURL.path)|\(size)|\(mtime)"
-        digestCacheLock.lock()
-        let cached = digestCache[cacheKey]
-        digestCacheLock.unlock()
-        if let cached { return cached }
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw ModelRuntimeError.modelNotFound(path: url.path)
         }
@@ -150,9 +157,7 @@ public final class ModelRuntime: @unchecked Sendable {
             if chunk.isEmpty { break }
             hasher.update(data: chunk)
         }
-        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        digestCacheLock.lock(); digestCache[cacheKey] = digest; digestCacheLock.unlock()
-        return digest
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Verified stamp for this instance's own model file.
@@ -180,6 +185,12 @@ public final class ModelRuntime: @unchecked Sendable {
     }
 
     private let modelPath: URL
+    /// Verified identity this runtime is bound to (round 4 F1).
+    /// When set, `load()` re-hashes/re-verifies the file at load
+    /// time and refuses a replaced file instead of loading it
+    /// under the previously resolved version.
+    public let expectedContentDigest: String?
+    public let expectedModelVersion: String?
     private let lock = NSLock()
     #if canImport(CLlamaShim)
     private var handle: OpaquePointer?
@@ -187,8 +198,36 @@ public final class ModelRuntime: @unchecked Sendable {
     private var didLoad = false
     private var cachedInfo: LoadedModelInfo?
 
-    public init(modelPath: URL) {
+    public init(modelPath: URL, expectedContentDigest: String? = nil,
+                expectedModelVersion: String? = nil) {
         self.modelPath = modelPath
+        self.expectedContentDigest = expectedContentDigest
+        self.expectedModelVersion = expectedModelVersion
+    }
+
+    /// Re-verify the file at `modelPath` against the bound identity.
+    /// Caller must hold `lock`. No-op when no identity was bound.
+    private func verifyBoundIdentityLocked() throws {
+        guard expectedContentDigest != nil || expectedModelVersion != nil else { return }
+        guard FileManager.default.fileExists(atPath: modelPath.path) else {
+            throw ModelRuntimeError.modelNotFound(path: modelPath.path)
+        }
+        guard Self.isGGUFFile(at: modelPath) else {
+            throw ModelRuntimeError.invalidModelFile(path: modelPath.path)
+        }
+        if let expectedContentDigest {
+            let actual = try Self.contentSHA256(forFileAt: modelPath)
+            guard actual == expectedContentDigest else {
+                throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+            }
+        } else if let expectedModelVersion {
+            let verified = try Self.verifiedModelVersion(forModelAt: modelPath)
+            guard verified == expectedModelVersion
+                    || Self.reportedModelVersion(storedModelVersion: verified) == expectedModelVersion
+                    || verified == Self.reportedModelVersion(storedModelVersion: expectedModelVersion) else {
+                throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+            }
+        }
     }
 
     deinit {
@@ -244,6 +283,9 @@ public final class ModelRuntime: @unchecked Sendable {
         if didLoad {
             return 0
         }
+        // F1: re-verify a bound identity at load time, before the
+        // (possibly replaced) file is handed to llama.cpp.
+        try verifyBoundIdentityLocked()
         guard Self.isRuntimeLinked else {
             throw ModelRuntimeError.runtimeUnavailable
         }
