@@ -43,6 +43,12 @@ struct ReadAloudPreviewView: View {
             }
             .accessibilityIdentifier("startNewItemButton")
 
+            if service.isVoiceUnavailable {
+                Text("Voice unavailable on this device")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("voiceUnavailableLabel")
+            }
             Text(service.isSpeaking ? "Reading…" : "Not reading")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)

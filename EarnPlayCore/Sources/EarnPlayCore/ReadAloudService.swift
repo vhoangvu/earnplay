@@ -100,26 +100,39 @@ public protocol SpeechEngine: AnyObject {
     var isSpeaking: Bool { get }
     /// Called when an utterance finishes naturally (not when stopped).
     var onPlaybackFinished: (() -> Void)? { get set }
-    func speak(text: String)
+    /// Starts speaking with a verified OS-bundled voice. Returns false
+    /// when no bundled voice is available: nothing is spoken, and the
+    /// caller must surface unavailability rather than mark playback
+    /// active. Implementations must never hand the synthesizer an
+    /// utterance whose voice was not verified bundled, and must never
+    /// fall back to a downloaded voice or a network fetch.
+    @discardableResult
+    func speak(text: String) -> Bool
     func stopSpeaking()
 }
 
 #if canImport(AVFoundation)
 /// Real on-device speech engine backed by `AVSpeechSynthesizer`.
 ///
-/// Uses the default system voice for the locale. It never calls any
+/// Uses only a verified OS-bundled voice. It never calls any
 /// voice-download API and contains no networking code, so it works in
-/// Airplane Mode with no downloaded voice installed.
+/// Airplane Mode with no downloaded voice installed. When no bundled
+/// voice is available it speaks nothing and reports unavailability.
 @MainActor
 public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
+    private let voicesOverride: [AVSpeechSynthesisVoice]?
     public var onPlaybackFinished: (() -> Void)?
 
     /// The most recent utterance handed to the synthesizer. Exposed so
     /// tests can verify real utterance creation (exact text, system voice).
     public private(set) var lastUtterance: AVSpeechUtterance?
 
-    public override init() {
+    /// - Parameter voices: voice list to select from. Defaults to the
+    ///   live `AVSpeechSynthesisVoice.speechVoices()`; tests pass an
+    ///   explicit list (for example empty) to force the missing-voice path.
+    public init(voices: [AVSpeechSynthesisVoice]? = nil) {
+        self.voicesOverride = voices
         super.init()
         synthesizer.delegate = self
     }
@@ -134,9 +147,10 @@ public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDe
     /// T1.7's no-download requirement. Bundled voices ship at default
     /// quality; enhanced/premium voices exist on device only after a
     /// user download. Personal voices are user-created, not bundled.
-    /// Returns nil when no bundled voice matches, and callers then leave
-    /// `utterance.voice` unset so the synthesizer uses the system default
-    /// (itself bundled) — never a download and never a network fetch.
+    /// Returns nil when no bundled voice matches; callers must then
+    /// report unavailability and speak nothing. A nil utterance voice
+    /// would let the synthesizer choose a voice without this filter,
+    /// so it is never an acceptable fallback.
     public static func bundledVoice(
         forLanguage language: String = "en-US",
         voices: [AVSpeechSynthesisVoice] = AVSpeechSynthesisVoice.speechVoices()
@@ -148,15 +162,22 @@ public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDe
             ?? voices.first { $0.language.hasPrefix(String(language.prefix(2))) && isBundled($0) }
     }
 
-    public func speak(text: String) {
+    @discardableResult
+    public func speak(text: String) -> Bool {
+        // Bundled voice only, verified through bundledVoice above. When
+        // no bundled voice is present, speak nothing and report
+        // unavailability: a nil voice would let the synthesizer select
+        // a voice without the bundled-only filter.
+        guard let voice = Self.bundledVoice(
+            forLanguage: "en-US",
+            voices: voicesOverride ?? AVSpeechSynthesisVoice.speechVoices()
+        ) else { return false }
         let utterance = AVSpeechUtterance(string: text)
-        // Bundled voice only, validated through bundledVoice above. When
-        // no bundled en-US voice is present this stays nil and the
-        // synthesizer falls back to the system default voice.
-        utterance.voice = Self.bundledVoice(forLanguage: "en-US")
+        utterance.voice = voice
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         lastUtterance = utterance
         synthesizer.speak(utterance)
+        return true
     }
 
     public func stopSpeaking() {
@@ -209,6 +230,10 @@ public final class ReadAloudService: ObservableObject {
 
     @Published public private(set) var isSpeaking = false
     @Published public private(set) var currentMessageID: String?
+    /// True when the last speak request found no OS-bundled voice. The
+    /// UI observes this to say reading is unavailable; playback is not
+    /// marked active and no hint-listen is recorded in that case.
+    @Published public private(set) var isVoiceUnavailable = false
 
     public init(band: GradeBand,
                 engine: SpeechEngine,
@@ -241,9 +266,17 @@ public final class ReadAloudService: ObservableObject {
         if isSpeaking {
             engine.stopSpeaking()
         }
+        guard engine.speak(text: message.text) else {
+            // No verified bundled voice: surface unavailability without
+            // marking playback active or recording a hint listen.
+            isSpeaking = false
+            currentMessageID = nil
+            isVoiceUnavailable = true
+            return
+        }
+        isVoiceUnavailable = false
         currentMessageID = message.id
         isSpeaking = true
-        engine.speak(text: message.text)
         if message.isHint {
             let event = HintListenEvent(messageID: message.id,
                                         messageText: message.text,

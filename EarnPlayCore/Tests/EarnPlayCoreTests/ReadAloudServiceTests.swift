@@ -10,10 +10,16 @@ private final class FakeSpeechEngine: SpeechEngine {
     private(set) var spokenTexts: [String] = []
     private(set) var stopCallCount = 0
     var isSpeaking = false
+    /// When false, speak reports voice unavailability and speaks nothing,
+    /// mirroring the real engine when no bundled voice exists.
+    var voiceAvailable = true
 
-    func speak(text: String) {
+    @discardableResult
+    func speak(text: String) -> Bool {
+        guard voiceAvailable else { return false }
         spokenTexts.append(text)
         isSpeaking = true
+        return true
     }
 
     func stopSpeaking() {
@@ -25,6 +31,35 @@ private final class FakeSpeechEngine: SpeechEngine {
         isSpeaking = false
         onPlaybackFinished?()
     }
+}
+
+/// Counts every URL load attempted through URLProtocol while speech
+/// plays. Mirrors CountingURLProtocol in the app-target tests; the
+/// package tests cannot share that type across targets.
+private final class SpeechCountingURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    // Guarded by lock on every access.
+    private nonisolated(unsafe) static var _count = 0
+    static var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _count
+    }
+    static func reset() {
+        lock.lock()
+        _count = 0
+        lock.unlock()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.lock.lock()
+        Self._count += 1
+        Self.lock.unlock()
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+    }
+    override func stopLoading() {}
 }
 
 private final class RecordingHintSink: HintListenEventSink {
@@ -61,15 +96,29 @@ final class ReadAloudServiceTests: XCTestCase {
         XCTAssertEqual(engine.spokenTexts, [question.text, hint.text, instruction.text])
     }
 
-    // (b) No network path exists: speech goes only to the on-device
-    // engine. The fake stands in for AVSpeechSynthesizer, so any spoken
-    // text observed here proves the service reached the device engine
-    // and nothing else; the real engine is asserted separately below.
-    func testSpeakingReachesOnlyTheOnDeviceEngine() {
+    // (b) Speech playback makes no network requests: a recording
+    // URLProtocol interceptor is installed while question, hint and
+    // instruction messages play, and the request count must stay zero.
+    // Recording the fake engine call alone cannot detect a network
+    // request made alongside it, so the interceptor is the assertion.
+    func testSpeakingMakesNoNetworkRequestsForQuestionHintAndInstruction() async {
+        SpeechCountingURLProtocol.reset()
+        URLProtocol.registerClass(SpeechCountingURLProtocol.self)
+        addTeardownBlock { URLProtocol.unregisterClass(SpeechCountingURLProtocol.self) }
         let (service, engine, _) = makeService()
         service.speak(question)
-        XCTAssertEqual(engine.spokenTexts, [question.text])
+        service.speak(hint)
+        service.speak(instruction)
+        XCTAssertEqual(engine.spokenTexts, [question.text, hint.text, instruction.text])
         XCTAssertTrue(service.isSpeaking)
+        // Allow asynchronous request interception to run before
+        // checking the count: an inverted expectation waits the full
+        // window and passes only if nothing fulfils it meanwhile.
+        let window = expectation(description: "async network interception window")
+        window.isInverted = true
+        await fulfillment(of: [window], timeout: 0.5)
+        XCTAssertEqual(SpeechCountingURLProtocol.count, 0,
+                       "speech playback attempted a network request")
     }
 
     // Real utterance creation: the AVSpeech engine builds a real
@@ -78,23 +127,64 @@ final class ReadAloudServiceTests: XCTestCase {
     // runs on the host and in the simulator.
     func testAVSpeechEngineCreatesUtteranceWithExactTextAndSystemVoice() {
         let engine = AVSpeechEngine()
-        engine.speak(text: "What is 7 plus 5?")
-        XCTAssertEqual(engine.lastUtterance?.speechString, "What is 7 plus 5?")
+        let started = engine.speak(text: "What is 7 plus 5?")
         // Bundled-ness is verified through the selection path itself, not
         // an identifier substring: downloaded voices also have identifiers
         // without "http", so that check proved nothing. The spoken voice
         // must be exactly what the bundled-only selector returns.
         let expected = AVSpeechEngine.bundledVoice(forLanguage: "en-US")
         if let expected {
+            XCTAssertTrue(started)
+            XCTAssertEqual(engine.lastUtterance?.speechString, "What is 7 plus 5?")
             XCTAssertEqual(engine.lastUtterance?.voice?.identifier, expected.identifier)
             XCTAssertEqual(engine.lastUtterance?.voice?.quality, .default,
                            "only a default-quality (OS-bundled) voice may be selected")
         } else {
-            // No bundled en-US voice on this device: speak() must fall
-            // back to the system default (nil voice), never a download.
-            XCTAssertNil(engine.lastUtterance?.voice)
+            // No bundled en-US voice on this device: speak() must report
+            // unavailability and hand nothing to the synthesizer. A nil
+            // utterance voice would let the synthesizer choose a voice
+            // without the bundled-only filter, so nil is never proof of
+            // a bundled voice.
+            XCTAssertFalse(started, "no bundled voice must report unavailability")
+            XCTAssertNil(engine.lastUtterance,
+                         "no utterance may be created without a verified bundled voice")
         }
         engine.stopSpeaking()
+    }
+
+    // No bundled voice at all: the engine speaks nothing and reports
+    // unavailability instead of letting the synthesizer pick a voice.
+    func testAVSpeechEngineWithNoBundledVoiceReportsUnavailableAndSpeaksNothing() {
+        let engine = AVSpeechEngine(voices: [])
+        XCTAssertFalse(engine.speak(text: "What is 7 plus 5?"))
+        XCTAssertNil(engine.lastUtterance)
+        XCTAssertFalse(engine.isSpeaking)
+        // Downloaded-quality voices alone are likewise unavailable:
+        // they exist on device only after a user download.
+        let downloadedOnly = AVSpeechSynthesisVoice.speechVoices().filter { $0.quality != .default }
+        let downloadedEngine = AVSpeechEngine(voices: downloadedOnly)
+        XCTAssertFalse(downloadedEngine.speak(text: "What is 7 plus 5?"))
+        XCTAssertNil(downloadedEngine.lastUtterance)
+    }
+
+    // Service level: missing voice surfaces unavailability with no
+    // playback-active state and no hint-listen event.
+    func testMissingVoiceReportsUnavailableWithoutPlaybackOrHintListen() {
+        let (service, engine, sink) = makeService()
+        engine.voiceAvailable = false
+        service.speak(hint)
+        XCTAssertTrue(service.isVoiceUnavailable)
+        XCTAssertFalse(service.isSpeaking)
+        XCTAssertNil(service.currentMessageID)
+        XCTAssertTrue(engine.spokenTexts.isEmpty)
+        XCTAssertTrue(service.hintListenEvents.isEmpty)
+        XCTAssertTrue(sink.events.isEmpty)
+        // A later successful speak clears the unavailability report.
+        engine.voiceAvailable = true
+        service.speak(hint)
+        XCTAssertFalse(service.isVoiceUnavailable)
+        XCTAssertTrue(service.isSpeaking)
+        XCTAssertEqual(sink.events.count, 1)
     }
 
     // Finding 2: the selector never returns a downloaded voice. Enhanced
@@ -114,7 +204,8 @@ final class ReadAloudServiceTests: XCTestCase {
             AVSpeechEngine.bundledVoice(forLanguage: "en-US", voices: downloadedOnly),
             "selector must not fall back to a downloaded voice")
         // Absence handling: an unsupported language yields nil, which
-        // speak() turns into the system-default fallback (nil voice).
+        // speak() turns into reported unavailability, never a nil-voice
+        // utterance the synthesizer would voice on its own.
         XCTAssertNil(AVSpeechEngine.bundledVoice(forLanguage: "xx-XX", voices: allVoices))
     }
 
