@@ -109,9 +109,19 @@ public final class ModelRuntime: @unchecked Sendable {
     /// the runtime. Throws `.modelNotFound` when absent and
     /// `.invalidModelFile` when the file is not a GGUF — an
     /// arbitrary file is never reported under the Llama identity.
-    public static func verifiedModelVersion(
+    public struct VerifiedModelIdentity: Equatable, Sendable {
+        public let modelVersion: String
+        public let contentDigest: String
+        public let byteCount: Int64
+    }
+
+    /// Single-pass verified identity (round 5 F2): size, magic and
+    /// SHA-256 all come from one streamed read of the file, so the
+    /// version stamp and the content digest can never describe two
+    /// different replacements of the same path.
+    public static func verifiedModelIdentity(
         forModelAt url: URL, fileManager: FileManager = .default
-    ) throws -> String {
+    ) throws -> VerifiedModelIdentity {
         var isDir: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
             if fileManager.fileExists(atPath: url.path) {
@@ -119,12 +129,33 @@ public final class ModelRuntime: @unchecked Sendable {
             }
             throw ModelRuntimeError.modelNotFound(path: url.path)
         }
-        guard isGGUFFile(at: url) else {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            throw ModelRuntimeError.modelNotFound(path: url.path)
+        }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var byteCount: Int64 = 0
+        var magic = Data()
+        while true {
+            let chunk = try handle.read(upToCount: 65_536) ?? Data()
+            if chunk.isEmpty { break }
+            if magic.count < 4 { magic.append(chunk.prefix(4 - magic.count)) }
+            byteCount += Int64(chunk.count)
+            hasher.update(data: chunk)
+        }
+        guard magic.elementsEqual([0x47, 0x47, 0x55, 0x46]) else {
             throw ModelRuntimeError.invalidModelFile(path: url.path)
         }
-        let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber) ?? nil
-        let digest = try contentSHA256(forFileAt: url)
-        return "\(url.lastPathComponent) (\(size?.int64Value ?? 0) bytes, GGUF, sha256:\(digest)) / \(runtimeIdentifier)"
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return VerifiedModelIdentity(
+            modelVersion: "\(url.lastPathComponent) (\(byteCount) bytes, GGUF, sha256:\(digest)) / \(runtimeIdentifier)",
+            contentDigest: digest, byteCount: byteCount)
+    }
+
+    public static func verifiedModelVersion(
+        forModelAt url: URL, fileManager: FileManager = .default
+    ) throws -> String {
+        try verifiedModelIdentity(forModelAt: url, fileManager: fileManager).modelVersion
     }
 
     /// Reported model version for a stored bundle version (F13):
@@ -279,7 +310,80 @@ public final class ModelRuntime: @unchecked Sendable {
     /// Caller must hold `lock`. The didLoad check and the load itself
     /// happen under that one lock acquisition, so concurrent callers
     /// cannot both observe the not-yet-loaded state.
+    /// Round 5 F1: copy the model once, hashing while copying, into
+    /// a content-addressed read-only artifact and return its URL.
+    /// llama.cpp opens this retained file, never the mutable source
+    /// path, so the bytes loaded are exactly the bytes hashed. The
+    /// copy's digest must match the bound identity when one is set.
+    func verifiedImmutableCopyURL() throws -> URL {
+        guard FileManager.default.fileExists(atPath: modelPath.path) else {
+            throw ModelRuntimeError.modelNotFound(path: modelPath.path)
+        }
+        guard Self.isGGUFFile(at: modelPath) else {
+            throw ModelRuntimeError.invalidModelFile(path: modelPath.path)
+        }
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = caches.appendingPathComponent("EarnPlay/immutable-models", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard let source = try? FileHandle(forReadingFrom: modelPath) else {
+            throw ModelRuntimeError.modelNotFound(path: modelPath.path)
+        }
+        defer { try? source.close() }
+        let tmp = dir.appendingPathComponent("immutable-\(UUID().uuidString).tmp")
+        FileManager.default.createFile(atPath: tmp.path, contents: nil)
+        guard let sink = try? FileHandle(forWritingTo: tmp) else {
+            throw ModelRuntimeError.modelLoadFailed("cannot create immutable model copy")
+        }
+        var hasher = SHA256()
+        do {
+            while true {
+                let chunk = try source.read(upToCount: 65_536) ?? Data()
+                if chunk.isEmpty { break }
+                hasher.update(data: chunk)
+                try sink.write(contentsOf: chunk)
+            }
+            try sink.synchronize()
+            try sink.close()
+        } catch {
+            try? sink.close()
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        if let expectedContentDigest, digest != expectedContentDigest {
+            try? FileManager.default.removeItem(at: tmp)
+            throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+        }
+        if expectedContentDigest == nil, let expectedModelVersion {
+            let size = (try? FileManager.default.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let verified = "\(modelPath.lastPathComponent) (\(size) bytes, GGUF, sha256:\(digest)) / \(Self.runtimeIdentifier)"
+            guard verified == expectedModelVersion
+                    || Self.reportedModelVersion(storedModelVersion: verified) == expectedModelVersion
+                    || verified == Self.reportedModelVersion(storedModelVersion: expectedModelVersion) else {
+                try? FileManager.default.removeItem(at: tmp)
+                throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+            }
+        }
+        let final = dir.appendingPathComponent("\(digest).gguf")
+        if FileManager.default.fileExists(atPath: final.path) {
+            try? FileManager.default.removeItem(at: tmp)
+            if (try? Self.contentSHA256(forFileAt: final)) == digest {
+                return final
+            }
+            try? FileManager.default.removeItem(at: final)
+            // Fall through is impossible here; recreate from source.
+            return try verifiedImmutableCopyURL()
+        }
+        try FileManager.default.moveItem(at: tmp, to: final)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: final.path)
+        return final
+    }
+
     private func loadLocked() throws -> Double {
+        // Round 5 F7: timing starts before identity verification so
+        // loadLatencyMs includes the full verified read of the model.
+        let start = Date()
         if didLoad {
             return 0
         }
@@ -289,16 +393,12 @@ public final class ModelRuntime: @unchecked Sendable {
         guard Self.isRuntimeLinked else {
             throw ModelRuntimeError.runtimeUnavailable
         }
-        guard FileManager.default.fileExists(atPath: modelPath.path) else {
-            throw ModelRuntimeError.modelNotFound(path: modelPath.path)
-        }
-        guard Self.isGGUFFile(at: modelPath) else {
-            throw ModelRuntimeError.invalidModelFile(path: modelPath.path)
-        }
+        // Round 5 F1: load the retained immutable copy, not the
+        // mutable source path verified above.
+        let loadPath = try verifiedImmutableCopyURL()
         #if canImport(CLlamaShim)
-        let start = Date()
         var errorPtr: UnsafeMutablePointer<CChar>?
-        let created = modelPath.path.withCString { ep_llama_create($0, &errorPtr) }
+        let created = loadPath.path.withCString { ep_llama_create($0, &errorPtr) }
         if let errorPtr {
             let message = String(cString: errorPtr)
             ep_llama_free_string(errorPtr)

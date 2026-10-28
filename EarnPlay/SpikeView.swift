@@ -94,7 +94,7 @@ struct SpikeView: View {
             Button(isRunning ? "Running…" : "Run prompt") {
                 run()
             }
-            .disabled(isRunning || isResolving || runtime == nil || prompts.isEmpty)
+            .disabled(isRunning || isResolving || isVersionActionRunning || runtime == nil || prompts.isEmpty)
 
             Text(statusText)
                 .font(.caption)
@@ -155,6 +155,7 @@ struct SpikeView: View {
             let reg = registry
             let (loaded, resolved) = try await Task.detached(priority: .userInitiated) {
                 let r = try reg ?? VersionRegistry.production()
+                SpikeView.installLoadValidator(on: r)
                 return (r, try r.inferenceArtifacts())
             }.value
             applyResolved(resolved, registry: loaded)
@@ -174,6 +175,7 @@ struct SpikeView: View {
                 let reg = registry
                 let loaded = try await Task.detached(priority: .userInitiated) { () -> VersionRegistry in
                     let r = try reg ?? VersionRegistry.production()
+                    SpikeView.installLoadValidator(on: r)
                     try action(r)
                     return r
                 }.value
@@ -185,8 +187,19 @@ struct SpikeView: View {
         }
     }
 
+    /// Round 5 F9: a candidate must load before selection commits.
+    static func installLoadValidator(on registry: VersionRegistry) {
+        registry.candidateLoadValidator = { artifacts in
+            guard let url = artifacts.modelURL else {
+                throw VersioningError.artifactUnavailable(bundleID: "candidate", artifact: "modelFile")
+            }
+            try ModelRuntime(modelPath: url,
+                             expectedContentDigest: artifacts.modelContentDigest).load()
+        }
+    }
+
     private func run() {
-        guard let runtime, !prompts.isEmpty else { return }
+        guard let runtime, !prompts.isEmpty, !isVersionActionRunning else { return }
         isRunning = true
         statusText = "Running on-device…"
         let prompt = prompts[min(selectedPrompt, prompts.count - 1)]

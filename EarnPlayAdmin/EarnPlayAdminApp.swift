@@ -38,7 +38,7 @@ struct AdminVersionView: View {
                 if let activeBundle {
                     Text("Active bundle: \(activeBundle.bundleID)")
                         .font(.body)
-                    Text("Model: \(activeBundle.modelVersion)")
+                    Text("Model: \(ModelRuntime.reportedModelVersion(storedModelVersion: activeBundle.modelVersion))")
                         .font(.body)
                     Text("Prompt: \(activeBundle.promptVersion)")
                         .font(.body)
@@ -98,6 +98,7 @@ struct AdminVersionView: View {
         do {
             let (loaded, active, all) = try await Task.detached(priority: .userInitiated) {
                 let r = try VersionRegistry.production()
+                AdminVersionView.installLoadValidator(on: r)
                 return (r, try r.activeBundle, try r.registeredBundles)
             }.value
             registry = loaded
@@ -107,6 +108,17 @@ struct AdminVersionView: View {
             activeBundle = nil
             bundles = []
             statusText = "Failed to load registry: \(String(describing: error))"
+        }
+    }
+
+    /// Round 5 F9: a candidate must load before selection commits.
+    static func installLoadValidator(on registry: VersionRegistry) {
+        registry.candidateLoadValidator = { artifacts in
+            guard let url = artifacts.modelURL else {
+                throw VersioningError.artifactUnavailable(bundleID: "candidate", artifact: "modelFile")
+            }
+            try ModelRuntime(modelPath: url,
+                             expectedContentDigest: artifacts.modelContentDigest).load()
         }
     }
 

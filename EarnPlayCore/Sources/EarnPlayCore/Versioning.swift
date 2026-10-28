@@ -49,6 +49,24 @@ public struct InferenceArtifacts: Equatable, Sendable {
 private struct PersistedRegistryState: Codable {
     var bundles: [VersionBundle]
     var activeBundleID: String
+    /// Registry-owned snapshot paths (round 5 F4), stored relative
+    /// to the registry directory like snapshot model paths (F8).
+    var ownedSnapshotPaths: [String] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case bundles, activeBundleID, ownedSnapshotPaths
+    }
+    init(bundles: [VersionBundle], activeBundleID: String, ownedSnapshotPaths: [String] = []) {
+        self.bundles = bundles
+        self.activeBundleID = activeBundleID
+        self.ownedSnapshotPaths = ownedSnapshotPaths
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        bundles = try c.decode([VersionBundle].self, forKey: .bundles)
+        activeBundleID = try c.decode(String.self, forKey: .activeBundleID)
+        ownedSnapshotPaths = try c.decodeIfPresent([String].self, forKey: .ownedSnapshotPaths) ?? []
+    }
 }
 
 public final class VersionRegistry: @unchecked Sendable {
@@ -71,6 +89,64 @@ public final class VersionRegistry: @unchecked Sendable {
     private var orderedIDs: [String] = []
     private var _activeBundleID: String
     private let storeURL: URL?
+    /// Absolute paths of snapshots this registry created (F4).
+    private var ownedSnapshotPaths: Set<String> = []
+    /// Round 5 F9: optional load validation run against a
+    /// candidate's artifacts before its selection is committed.
+    /// The app layer installs a validator that loads the candidate
+    /// with `ModelRuntime`; core tests install a stub. When the
+    /// validator throws, the prior selection is left untouched.
+    public var candidateLoadValidator: (@Sendable (InferenceArtifacts) throws -> Void)?
+
+    private var registryDirectory: URL? { storeURL?.deletingLastPathComponent() }
+
+    /// F8: persist paths inside the registry directory relative to
+    /// it, so a restored container resolves them locally.
+    private func storedPath(forAbsolute path: String) -> String {
+        guard let dir = registryDirectory else { return path }
+        let dirPath = dir.standardizedFileURL.path
+        let std = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard std.hasPrefix(dirPath + "/") else { return path }
+        return String(std.dropFirst(dirPath.count + 1))
+    }
+
+    /// Resolve a stored path against the current registry
+    /// directory. Legacy absolute paths from an old container are
+    /// migrated when the file now lives beside the registry (F8).
+    private func resolvedPath(forStored path: String) -> String {
+        guard let dir = registryDirectory else { return path }
+        if !path.hasPrefix("/") {
+            return dir.appendingPathComponent(path).path
+        }
+        if !FileManager.default.fileExists(atPath: path) {
+            let migrated = dir.appendingPathComponent(URL(fileURLWithPath: path).lastPathComponent)
+            if FileManager.default.fileExists(atPath: migrated.path) {
+                return migrated.path
+            }
+        }
+        return path
+    }
+
+    private func resolvedBundle(_ bundle: VersionBundle) -> VersionBundle {
+        guard let path = bundle.modelFilePath else { return bundle }
+        let resolved = resolvedPath(forStored: path)
+        guard resolved != path else { return bundle }
+        return VersionBundle(bundleID: bundle.bundleID, modelVersion: bundle.modelVersion,
+                             promptVersion: bundle.promptVersion, modelFilePath: resolved,
+                             promptTexts: bundle.promptTexts,
+                             modelContentDigest: bundle.modelContentDigest)
+    }
+
+    private func isRegistryOwnedSnapshot(_ path: String) -> Bool {
+        let std = URL(fileURLWithPath: path).standardizedFileURL.path
+        if ownedSnapshotPaths.contains(std) { return true }
+        // Legacy snapshots created before ownership tracking used
+        // this naming scheme inside the registry directory.
+        guard let dir = registryDirectory else { return false }
+        let url = URL(fileURLWithPath: std)
+        return url.deletingLastPathComponent().standardizedFileURL.path == dir.standardizedFileURL.path
+            && url.lastPathComponent.hasPrefix("previous-known-good-model-")
+    }
 
     public var activeBundleID: String {
         get throws {
@@ -90,7 +166,7 @@ public final class VersionRegistry: @unchecked Sendable {
         self.storeURL = storeURL
         self._activeBundleID = activeBundleID
         for bundle in bundles {
-            let bound = Self.enriched(bundle, bindDefaultModel: true)
+            let bound = Self.enriched(resolvedBundle(bundle), bindDefaultModel: true)
             bundlesByID[bound.bundleID] = bound
             orderedIDs.append(bound.bundleID)
         }
@@ -128,7 +204,9 @@ public final class VersionRegistry: @unchecked Sendable {
             let registry = try VersionRegistry(
                 bundles: state.bundles, activeBundleID: state.activeBundleID, storeURL: url
             )
+            registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
             try registry.refreshCurrentBundle(current)
+            registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
             return registry
         }
         return try VersionRegistry(bundles: [current], activeBundleID: "current", storeURL: url)
@@ -146,16 +224,28 @@ public final class VersionRegistry: @unchecked Sendable {
                                  promptVersion: SpikePrompts.version,
                                  modelFilePath: modelURL.path, promptTexts: SpikePrompts.all)
         }
-        if let verified = try? ModelRuntime.verifiedModelVersion(forModelAt: modelURL),
-           let digest = try? ModelRuntime.contentSHA256(forFileAt: modelURL) {
-            return VersionBundle(bundleID: "current", modelVersion: verified,
+        // Round 5 F2: one single-pass read derives both fields.
+        if let identity = try? ModelRuntime.verifiedModelIdentity(forModelAt: modelURL) {
+            return VersionBundle(bundleID: "current", modelVersion: identity.modelVersion,
                                  promptVersion: SpikePrompts.version,
                                  modelFilePath: modelURL.path, promptTexts: SpikePrompts.all,
-                                 modelContentDigest: digest)
+                                 modelContentDigest: identity.contentDigest)
         }
         return VersionBundle(bundleID: "current", modelVersion: ModelRuntime.versionStamp,
                              promptVersion: SpikePrompts.version,
                              modelFilePath: modelURL.path, promptTexts: SpikePrompts.all)
+    }
+
+    /// Restore ownership records decoded outside the registry
+    /// (used by `production`, whose init persist precedes this).
+    func restoreOwnedSnapshotPaths(_ stored: [String]) {
+        guard !stored.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        for path in stored {
+            ownedSnapshotPaths.insert(
+                URL(fileURLWithPath: resolvedPath(forStored: path)).standardizedFileURL.path)
+        }
+        try? persistLocked()
     }
 
     /// Lenient refresh of "current" without artifact validation, so a
@@ -216,11 +306,47 @@ public final class VersionRegistry: @unchecked Sendable {
         }
         // F11: lookup, validation and selection under the same lock.
         try Self.validateArtifacts(bundle)
+        // Round 5 F9: when a load validator is installed, the
+        // candidate must actually load before selection commits;
+        // a failure leaves the prior selection untouched.
+        if let candidateLoadValidator {
+            try candidateLoadValidator(artifacts(for: bundle))
+        }
         let previous = _activeBundleID
         _activeBundleID = bundleID
         do { try persistLocked() } catch {
             _activeBundleID = previous; throw error
         }
+    }
+
+    private func artifacts(for bundle: VersionBundle,
+                           defaultModelURL: URL? = ModelRuntime.defaultModelURL()) -> InferenceArtifacts {
+        let prompts = bundle.promptTexts ?? SpikePrompts.all
+        let modelURL = bundle.modelFilePath.map { URL(fileURLWithPath: $0) } ?? defaultModelURL
+        let digest = bundle.modelContentDigest
+            ?? (modelURL.flatMap { try? ModelRuntime.contentSHA256(forFileAt: $0) })
+        return InferenceArtifacts(
+            modelVersion: ModelRuntime.reportedModelVersion(storedModelVersion: bundle.modelVersion),
+            promptVersion: bundle.promptVersion,
+            modelURL: modelURL, prompts: prompts,
+            modelContentDigest: digest)
+    }
+
+    /// Round 5 F10: resolve artifacts and stamp the session from
+    /// that one immutable snapshot, under one lock acquisition.
+    public func inferenceSession(
+        sessionId: String, startedAt: Date = Date(),
+        defaultModelURL: URL? = ModelRuntime.defaultModelURL()
+    ) throws -> (artifacts: InferenceArtifacts, record: SessionRecord) {
+        lock.lock(); defer { lock.unlock() }
+        try reloadPersistedLocked()
+        let bundle = bundlesByID[_activeBundleID]!
+        try Self.validateArtifacts(bundle, defaultModelURL: defaultModelURL)
+        let resolved = artifacts(for: bundle, defaultModelURL: defaultModelURL)
+        let record = try SessionRecord(sessionId: sessionId, startedAt: startedAt,
+                                       modelVersion: resolved.modelVersion,
+                                       promptVersion: resolved.promptVersion)
+        return (resolved, record)
     }
 
     public func rollbackToPreviousKnownGood() throws {
@@ -278,6 +404,12 @@ public final class VersionRegistry: @unchecked Sendable {
             } else {
                 let tmp = dir.appendingPathComponent("previous-known-good-model-\(UUID().uuidString).tmp.gguf")
                 try FileManager.default.copyItem(at: sourceURL, to: tmp)
+                // Round 5 F3: verify the copied bytes before
+                // publishing; on mismatch preserve the old entry.
+                guard (try? ModelRuntime.contentSHA256(forFileAt: tmp)) == srcDigest else {
+                    try? FileManager.default.removeItem(at: tmp)
+                    throw VersioningError.artifactUnavailable(bundleID: active.bundleID, artifact: "modelFile")
+                }
                 do { try FileManager.default.moveItem(at: tmp, to: stable) }
                 catch { try? FileManager.default.removeItem(at: tmp); throw error }
                 createdSnapshot = true
@@ -296,12 +428,19 @@ public final class VersionRegistry: @unchecked Sendable {
             if createdSnapshot { try? FileManager.default.removeItem(at: stable) }
             throw error
         }
+        // Track ownership of the snapshot just published (F4).
+        ownedSnapshotPaths.insert(stable.standardizedFileURL.path)
+        try? persistLocked()
         // Only after the new entry is persisted, retire a snapshot
-        // no remaining bundle references.
+        // no remaining bundle references — and only a file this
+        // registry owns, never an externally registered artifact.
         if let previousSnapshotPath,
            previousSnapshotPath != stable.path,
+           isRegistryOwnedSnapshot(previousSnapshotPath),
            !bundlesByID.values.contains(where: { $0.modelFilePath == previousSnapshotPath }) {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: previousSnapshotPath))
+            ownedSnapshotPaths.remove(URL(fileURLWithPath: previousSnapshotPath).standardizedFileURL.path)
+            try? persistLocked()
         }
     }
 
@@ -312,17 +451,8 @@ public final class VersionRegistry: @unchecked Sendable {
         try reloadPersistedLocked()
         let bundle = bundlesByID[_activeBundleID]!
         try Self.validateArtifacts(bundle, defaultModelURL: defaultModelURL)
-        let prompts = bundle.promptTexts ?? SpikePrompts.all
-        let modelURL = bundle.modelFilePath.map { URL(fileURLWithPath: $0) } ?? defaultModelURL
-        // F13: report retained model identity with running runtime.
-        // F1: carry digest so ModelRuntime can re-verify at load.
-        let digest = bundle.modelContentDigest
-            ?? (modelURL.flatMap { try? ModelRuntime.contentSHA256(forFileAt: $0) })
-        return InferenceArtifacts(
-            modelVersion: ModelRuntime.reportedModelVersion(storedModelVersion: bundle.modelVersion),
-            promptVersion: bundle.promptVersion,
-            modelURL: modelURL, prompts: prompts,
-            modelContentDigest: digest)
+        // F13/F1 via artifacts(for:): composed version + digest.
+        return artifacts(for: bundle, defaultModelURL: defaultModelURL)
     }
 
     private static func enriched(_ bundle: VersionBundle, bindDefaultModel: Bool = false) -> VersionBundle {
@@ -411,16 +541,28 @@ public final class VersionRegistry: @unchecked Sendable {
         var byID: [String: VersionBundle] = [:]
         var order: [String] = []
         for bundle in state.bundles {
-            byID[bundle.bundleID] = bundle; order.append(bundle.bundleID)
+            let resolved = resolvedBundle(bundle)
+            byID[resolved.bundleID] = resolved; order.append(resolved.bundleID)
         }
         bundlesByID = byID; orderedIDs = order; _activeBundleID = state.activeBundleID
+        ownedSnapshotPaths = Set(state.ownedSnapshotPaths.map { resolvedPath(forStored: $0) }
+            .map { URL(fileURLWithPath: $0).standardizedFileURL.path })
     }
 
     private func persistLocked() throws {
         guard let storeURL else { return }
+        let storedBundles = orderedIDs.compactMap { bundlesByID[$0] }.map { bundle -> VersionBundle in
+            guard let path = bundle.modelFilePath else { return bundle }
+            return VersionBundle(bundleID: bundle.bundleID, modelVersion: bundle.modelVersion,
+                                 promptVersion: bundle.promptVersion,
+                                 modelFilePath: storedPath(forAbsolute: path),
+                                 promptTexts: bundle.promptTexts,
+                                 modelContentDigest: bundle.modelContentDigest)
+        }
         let state = PersistedRegistryState(
-            bundles: orderedIDs.compactMap { bundlesByID[$0] },
-            activeBundleID: _activeBundleID
+            bundles: storedBundles,
+            activeBundleID: _activeBundleID,
+            ownedSnapshotPaths: ownedSnapshotPaths.sorted().map { storedPath(forAbsolute: $0) }
         )
         let data = try JSONEncoder().encode(state)
         try FileManager.default.createDirectory(
@@ -493,6 +635,21 @@ public struct SessionRecord: Equatable, Sendable, Codable {
             startedAt: startedAt,
             modelVersion: ModelRuntime.reportedModelVersion(storedModelVersion: bundle.modelVersion),
             promptVersion: bundle.promptVersion
+        )
+    }
+
+    /// Round 5 F10: stamp from the same immutable artifacts
+    /// snapshot used to start inference — no second registry read.
+    public static func start(
+        sessionId: String,
+        startedAt: Date = Date(),
+        artifacts: InferenceArtifacts
+    ) throws -> SessionRecord {
+        try SessionRecord(
+            sessionId: sessionId,
+            startedAt: startedAt,
+            modelVersion: artifacts.modelVersion,
+            promptVersion: artifacts.promptVersion
         )
     }
 }

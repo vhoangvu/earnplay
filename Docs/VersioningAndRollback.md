@@ -137,7 +137,17 @@ persisted registry and demonstrate/verify the same procedure.
    next to the registry store (with its SHA-256), under bundle ID
    `previous-known-good`, and persists the new registry entry;
    only after that persist succeeds is a previous snapshot file
-   that no bundle references retired. It therefore survives the
+   that no bundle references retired — and only when this
+   registry owns it (tracked snapshot ownership; externally
+   registered model files are never deleted). The copied
+   snapshot bytes are re-hashed and checked against the source
+   digest before publishing, retained model paths persist
+   relative to the registry directory (legacy absolute paths
+   migrate on load), candidate selections are load-validated
+   before committing when the app installs its validator, the
+   runtime loads a retained immutable copy of the verified
+   bytes, and sessions stamp from the same artifacts snapshot
+   used to start inference. It therefore survives the
    update, a prompt bump, replacement of the default model, and
    restart, and a failed persist cannot destroy the prior
    rollback. With no model file installed, the snapshot is

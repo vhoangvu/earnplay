@@ -605,3 +605,121 @@ extension VersioningTests {
         XCTAssertEqual(session.modelVersion, artifacts.modelVersion)
     }
 }
+
+extension VersioningTests {
+    // Round 5 F2: version stamp and digest come from one read.
+    func testSinglePassIdentityMatchesBundleDigest() throws {
+        let model = try tempGGUF(named: "SinglePass.gguf")
+        try Data("GGUF-single-pass".utf8).write(to: model)
+        let identity = try ModelRuntime.verifiedModelIdentity(forModelAt: model)
+        XCTAssertEqual(identity.contentDigest, try ModelRuntime.contentSHA256(forFileAt: model))
+        XCTAssertTrue(identity.modelVersion.contains(identity.contentDigest))
+        let registry = try VersionRegistry.production(storeURL: tempStoreURL(), modelURL: model)
+        let bundle = try registry.activeBundle
+        XCTAssertEqual(bundle.modelContentDigest, identity.contentDigest)
+        XCTAssertTrue(bundle.modelVersion.contains(bundle.modelContentDigest!))
+    }
+
+    // Round 5 F1: the retained immutable copy keeps verified bytes
+    // even after the mutable source path is replaced.
+    func testImmutableCopyRetainsVerifiedBytesAfterSourceReplacement() throws {
+        let model = try tempGGUF(named: "ImmutableSrc.gguf")
+        try Data("GGUF-AAAAAAA".utf8).write(to: model)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: model)
+        let runtime = ModelRuntime(modelPath: model, expectedContentDigest: digest)
+        let copy = try runtime.verifiedImmutableCopyURL()
+        XCTAssertNotEqual(copy.path, model.path)
+        try Data("GGUF-BBBBBBB".utf8).write(to: model)
+        XCTAssertEqual(try Data(contentsOf: copy), Data("GGUF-AAAAAAA".utf8))
+        XCTAssertEqual(try ModelRuntime.contentSHA256(forFileAt: copy), digest)
+    }
+
+    // Round 5 F4: replacing the previous entry never deletes an
+    // externally registered model file.
+    func testSnapshotRetirementPreservesExternallyOwnedFile() throws {
+        let store = tempStoreURL()
+        let external = try tempGGUF(named: "External.gguf")
+        try Data("GGUF-external!".utf8).write(to: external)
+        let model = try tempGGUF(named: "Owned.gguf")
+        try Data("GGUF-owned-model".utf8).write(to: model)
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try registry.register(VersionBundle(
+            bundleID: VersionRegistry.previousKnownGoodBundleID,
+            modelVersion: "external-m", promptVersion: "external-p",
+            modelFilePath: external.path, promptTexts: ["External."]))
+        try registry.registerActiveAsPreviousKnownGood()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: external.path),
+                      "externally owned model must never be retired")
+        let previous = try registry.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!
+        XCTAssertNotEqual(previous.modelFilePath, external.path)
+    }
+
+    // Round 5 F8: retained paths persist relative to the registry
+    // directory and resolve in a restored (moved) container.
+    func testRetainedPathStoredRelativeAndResolvesAfterContainerMove() throws {
+        let store = tempStoreURL()
+        let model = try tempGGUF(named: "Movable.gguf")
+        try Data("GGUF-movable-model".utf8).write(to: model)
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try registry.registerActiveAsPreviousKnownGood()
+        let json = try String(decoding: Data(contentsOf: store), as: UTF8.self)
+        XCTAssertFalse(json.contains(store.deletingLastPathComponent().path + "/previous-known-good-model-"),
+                       "snapshot path must be stored relative, got: \(json)")
+        XCTAssertTrue(json.contains("previous-known-good-model-"))
+        // Simulate iOS restoring the data into a new container.
+        let newDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: newDir, withIntermediateDirectories: true)
+        let oldDir = store.deletingLastPathComponent()
+        for name in try FileManager.default.contentsOfDirectory(atPath: oldDir.path) {
+            try FileManager.default.copyItem(at: oldDir.appendingPathComponent(name),
+                                             to: newDir.appendingPathComponent(name))
+        }
+        let restored = try VersionRegistry.production(
+            storeURL: newDir.appendingPathComponent("version-registry.json"), modelURL: nil)
+        try restored.rollbackToPreviousKnownGood()
+        let artifacts = try restored.inferenceArtifacts(defaultModelURL: nil)
+        XCTAssertEqual(artifacts.modelURL?.deletingLastPathComponent().path, newDir.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.modelURL!.path))
+    }
+
+    // Round 5 F9: a failing load validator blocks selection and
+    // preserves the prior active bundle.
+    func testCandidateLoadValidatorGatesSelection() throws {
+        let registry = try makeRegistry()
+        registry.candidateLoadValidator = { _ in
+            throw ModelRuntimeError.modelLoadFailed("unloadable candidate")
+        }
+        XCTAssertThrowsError(try registry.rollbackToPreviousKnownGood())
+        XCTAssertEqual(try registry.activeBundleID, "current")
+        registry.candidateLoadValidator = { _ in }
+        try registry.rollbackToPreviousKnownGood()
+        XCTAssertEqual(try registry.activeBundleID, VersionRegistry.previousKnownGoodBundleID)
+    }
+
+    // Round 5 F10: artifacts and session stamp share one snapshot.
+    func testInferenceSessionStampsFromSameSnapshot() throws {
+        let currentModel = try tempGGUF(named: "SessionCurrent.gguf")
+        let previousModel = try tempGGUF()
+        let registry = try VersionRegistry(
+            bundles: [
+                VersionBundle(bundleID: "current", modelVersion: ModelRuntime.versionStamp,
+                              promptVersion: SpikePrompts.version,
+                              modelFilePath: currentModel.path, promptTexts: SpikePrompts.all),
+                VersionBundle(bundleID: VersionRegistry.previousKnownGoodBundleID,
+                              modelVersion: "previous-model-fixture",
+                              promptVersion: "previous-prompt-fixture",
+                              modelFilePath: previousModel.path,
+                              promptTexts: ["Previous prompt alpha."]),
+            ], activeBundleID: "current")
+        try registry.rollbackToPreviousKnownGood()
+        let session = try registry.inferenceSession(sessionId: "snap-1", defaultModelURL: nil)
+        XCTAssertEqual(session.record.modelVersion, session.artifacts.modelVersion)
+        XCTAssertEqual(session.record.promptVersion, session.artifacts.promptVersion)
+        XCTAssertEqual(session.record.modelVersion, "previous-model-fixture")
+        let fromArtifacts = try SessionRecord.start(sessionId: "snap-2", artifacts: session.artifacts)
+        XCTAssertEqual(fromArtifacts.modelVersion, session.artifacts.modelVersion)
+    }
+}
