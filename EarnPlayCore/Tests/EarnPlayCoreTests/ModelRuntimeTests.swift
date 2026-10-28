@@ -102,10 +102,10 @@ final class ModelRuntimeTests: XCTestCase {
         let url = dir.appendingPathComponent("TinyTestModel.gguf")
         try Data([0x47, 0x47, 0x55, 0x46, 0, 0, 0, 0, 0, 0, 0, 0]).write(to: url)
         let stamp = try ModelRuntime.verifiedModelVersion(forModelAt: url)
-        XCTAssertEqual(stamp, "TinyTestModel.gguf (12 bytes, GGUF) / llama.cpp b11935, CPU backend")
+        let digest = try ModelRuntime.contentSHA256(forFileAt: url)
+        XCTAssertEqual(stamp, "TinyTestModel.gguf (12 bytes, GGUF, sha256:\(digest)) / llama.cpp b11935, CPU backend")
         XCTAssertFalse(stamp.contains("Llama-3.2-1B"))
-        XCTAssertEqual(try ModelRuntime(modelPath: url).verifiedVersionStamp(),
-                       "TinyTestModel.gguf (12 bytes, GGUF) / llama.cpp b11935, CPU backend")
+        XCTAssertEqual(try ModelRuntime(modelPath: url).verifiedVersionStamp(), stamp)
     }
 
     // F5: a non-GGUF file is rejected, never stamped as Llama.

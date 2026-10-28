@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if canImport(CLlamaShim)
 import CLlamaShim
@@ -108,14 +109,50 @@ public final class ModelRuntime: @unchecked Sendable {
     public static func verifiedModelVersion(
         forModelAt url: URL, fileManager: FileManager = .default
     ) throws -> String {
-        guard fileManager.fileExists(atPath: url.path) else {
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+            if fileManager.fileExists(atPath: url.path) {
+                throw ModelRuntimeError.invalidModelFile(path: url.path)
+            }
             throw ModelRuntimeError.modelNotFound(path: url.path)
         }
         guard isGGUFFile(at: url) else {
             throw ModelRuntimeError.invalidModelFile(path: url.path)
         }
         let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber) ?? nil
-        return "\(url.lastPathComponent) (\(size?.int64Value ?? 0) bytes, GGUF) / \(runtimeIdentifier)"
+        let digest = try contentSHA256(forFileAt: url)
+        return "\(url.lastPathComponent) (\(size?.int64Value ?? 0) bytes, GGUF, sha256:\(digest)) / \(runtimeIdentifier)"
+    }
+
+    private nonisolated(unsafe) static var digestCache: [String: String] = [:]
+    private static let digestCacheLock = NSLock()
+
+    /// Streamed SHA-256 (hex) of a file's contents — the immutable
+    /// content identity used in verified stamps and bundle binding.
+    /// Cached by path+size+mtime so repeated checks on the same
+    /// unchanged file do not re-read a large model every time.
+    public static func contentSHA256(forFileAt url: URL) throws -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        let cacheKey = "\(url.standardizedFileURL.path)|\(size)|\(mtime)"
+        digestCacheLock.lock()
+        let cached = digestCache[cacheKey]
+        digestCacheLock.unlock()
+        if let cached { return cached }
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            throw ModelRuntimeError.modelNotFound(path: url.path)
+        }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = try handle.read(upToCount: 65_536) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        digestCacheLock.lock(); digestCache[cacheKey] = digest; digestCacheLock.unlock()
+        return digest
     }
 
     /// Verified stamp for this instance's own model file.

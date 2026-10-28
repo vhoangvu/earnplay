@@ -18,23 +18,54 @@ struct SpikeView: View {
     @State private var isRunning = false
     @State private var runCount = 0
 
-    private let artifacts: InferenceArtifacts?
-    private let artifactError: String?
+    @State private var artifacts: InferenceArtifacts?
+    @State private var artifactError: String?
+    @State private var registry: VersionRegistry?
+    @State private var versionStatus = ""
     @State private var runtime: ModelRuntime?
 
     init() {
         var resolved: InferenceArtifacts?
         var message: String?
+        var loaded: VersionRegistry?
         do {
-            let registry = try VersionRegistry.production()
-            resolved = try registry.inferenceArtifacts()
+            let reg = try VersionRegistry.production()
+            loaded = reg
+            resolved = try reg.inferenceArtifacts()
         } catch {
             message = "Version artifacts unavailable: \(String(describing: error))"
         }
-        self.artifacts = resolved
-        self.artifactError = message
+        _artifacts = State(initialValue: resolved)
+        _artifactError = State(initialValue: message)
+        _registry = State(initialValue: loaded)
         if let url = resolved?.modelURL {
             _runtime = State(initialValue: ModelRuntime(modelPath: url))
+        }
+    }
+
+    private func reloadArtifacts() {
+        do {
+            let reg: VersionRegistry
+            if let registry { reg = registry } else { reg = try VersionRegistry.production(); registry = reg }
+            let resolved = try reg.inferenceArtifacts()
+            artifacts = resolved
+            artifactError = nil
+            runtime = resolved.modelURL.map { ModelRuntime(modelPath: $0) }
+            selectedPrompt = 0
+            versionStatus = "Active bundle is now \(reg.activeBundleID)."
+        } catch {
+            versionStatus = "Failed: \(String(describing: error))"
+        }
+    }
+
+    private func performVersionAction(_ action: (VersionRegistry) throws -> Void) {
+        do {
+            let reg: VersionRegistry
+            if let registry { reg = registry } else { reg = try VersionRegistry.production(); registry = reg }
+            try action(reg)
+            reloadArtifacts()
+        } catch {
+            versionStatus = "Failed: \(String(describing: error))"
         }
     }
 
@@ -54,6 +85,23 @@ struct SpikeView: View {
             }
             if let artifactError {
                 Text(artifactError)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Divider()
+            Text("Version rollback (this app)")
+                .font(.subheadline.bold())
+            Button("Register active bundle as previous known-good") {
+                performVersionAction { try $0.registerActiveAsPreviousKnownGood() }
+            }
+            Button("Roll back to previous known-good") {
+                performVersionAction { try $0.rollbackToPreviousKnownGood() }
+            }
+            Button("Roll forward to current") {
+                performVersionAction { try $0.select(bundleID: "current") }
+            }
+            if !versionStatus.isEmpty {
+                Text(versionStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

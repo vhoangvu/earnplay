@@ -9,17 +9,20 @@ LLD sections 2.2 (Session) and 10.3 (Versioning and rollback).
 | Kind | Current value | Source of truth in code |
 | --- | --- | --- |
 | Model (configured spike build) | `meta-llama Llama-3.2-1B-Instruct, GGUF Q4_K_M (bartowski/Llama-3.2-1B-Instruct-GGUF) / llama.cpp b11935, CPU backend` | `ModelRuntime.versionStamp` (configured identity only — see verified identity below) |
-| Model (installed file, verified) | `"<file name> (<byte count> bytes, GGUF) / llama.cpp b11935, CPU backend"` | `ModelRuntime.verifiedModelVersion(forModelAt:)` — read from the actual GGUF file (name, size, GGUF magic) |
+| Model (installed file, verified) | `"<file name> (<byte count> bytes, GGUF, sha256:<hex>) / llama.cpp b11935, CPU backend"` | `ModelRuntime.verifiedModelVersion(forModelAt:)` — streamed SHA-256 of the actual GGUF file (plus name, size, GGUF magic); same-size different content yields a different stamp |
 | Prompt | `spike-v1` | `SpikePrompts.version` (EarnPlayCore) |
 
-- Verified model identity (fix round 2, Copilot F5): a session or
-  registry stamp for an *installed* file comes from
-  `verifiedModelVersion(forModelAt:)`, which checks the file exists,
-  starts with the GGUF magic, and names the file itself. A non-GGUF
-  file is rejected with `ModelRuntimeError.invalidModelFile`, and
-  `ModelRuntime.load()` applies the same check — an arbitrary GGUF
-  placed via `modelPath` / `EARNPLAY_MODEL_PATH` /
-  `Documents/EarnPlayModel.gguf` is never reported as Llama.
+- Verified model identity: a session or registry stamp for an
+  *installed* file comes from `verifiedModelVersion(forModelAt:)`,
+  which checks the file is a regular file, starts with the GGUF
+  magic, and includes its streamed SHA-256 (`contentSHA256`).
+  A non-GGUF file or directory is rejected with
+  `ModelRuntimeError.invalidModelFile`, and `ModelRuntime.load()`
+  applies the same check. Each bundle also stores
+  `modelContentDigest`; selection and `inferenceArtifacts()` reject
+  a file whose digest no longer matches, and a bundle claiming only
+  the configured `versionStamp` does not bind an unrelated file that
+  later appears at the default path.
 - Prompt version scheme: `"<set-id>-v<major>"` (see `SpikePrompts`).
   Bump the major number on any wording or rule change to the set.
 - A *bundle* (`VersionBundle`) is one selectable model + prompt
@@ -58,11 +61,18 @@ the active selection as Codable JSON at
 (`VersionRegistry.defaultStoreURL()`), written atomically on every
 register/select, and restores them on construction — so a bundle
 registered before an app update, and a rollback selection, both
-survive restart. On restore, the `current` bundle is refreshed to
+survive restart. If that file exists but cannot be read or decoded,
+production throws instead of silently resetting it; a fresh store
+is created only when the file is absent. A corrupt/non-GGUF current
+model does not block restore: the persisted registry is loaded
+first and current-artifact validation is deferred to
+select/inference. On restore, the `current` bundle is refreshed to
 the running build's (verified, when a model file is installed)
-identity without changing the persisted selection. All registry
-state access is lock-synchronized, so the registry can be shared
-across tasks.
+identity without changing the persisted selection.
+Registries sharing a store also share a per-store lock and reload
+the latest persisted state under it before every write, so two
+instances cannot overwrite each other's updates; failed
+register/select writes restore the prior in-memory state.
 
 ## Session recording
 
@@ -86,16 +96,24 @@ to a version.
 
 ## Rollback procedure (model or prompt)
 
-Operator entry point (shipped): open the **EarnPlayAdmin** app.
-Its "Rollback operator controls" operate on the persisted
-production registry (the same store the "Running version" panel
-reads — the panel never constructs a fresh in-memory registry):
+Operator entry points (shipped): **EarnPlayAdmin** ("Rollback
+operator controls") and the child **EarnPlay** app's SpikeView
+("Version rollback (this app)"). Both obtain the persisted
+production registry via `VersionRegistry.production()` — never a
+fresh in-memory registry — and perform the calls below on it.
+Because the two apps have separate sandboxes (see "Note on
+processes"), use the child app's controls to change what child
+inference runs; the admin controls change the admin app's own
+persisted registry and demonstrate/verify the same procedure.
 
 1. *Before an update ships:* tap **Register active bundle as
-   previous known-good**. This copies the active bundle, with its
-   model file path and prompt texts, under the bundle ID
-   `previous-known-good` (`VersionRegistry.previousKnownGoodBundleID`)
-   and persists it, so it survives the update and restart.
+   previous known-good**. This snapshots the active bundle's
+   resolved prompt texts and retains the actual model file at the
+   stable path `previous-known-good-model.gguf` next to the
+   registry store (with its SHA-256), under bundle ID
+   `previous-known-good`, and persists it, so it survives the
+   update, a prompt bump, replacement of the default model, and
+   restart.
 2. Confirm the regression is version-linked: compare session stamps
    between healthy and regressing sessions. If identical, do not
    roll back blind.
@@ -125,11 +143,15 @@ Programmatic equivalent (same persisted registry):
 
 Note on processes: the child and admin apps are separate
 processes with separate Application Support sandboxes, so each
-persists its own registry file; the admin panel reflects
-selections made through the admin app (and any code writing the
-same store file), and each app reads its persisted selection at
-launch. Live cross-process sync would need a shared app-group
-container, which this project does not configure yet.
+persists its own registry file. That is exactly why the child app
+also ships rollback controls: a rollback performed in EarnPlay's
+SpikeView reloads that app's inference artifacts immediately, so
+it is the entry point that affects child inference. The admin
+panel reflects selections made through the admin app, and each
+app reads its persisted selection at launch. Live cross-process
+sync would need a shared app-group container, which this project
+does not configure yet — the admin rollback is not claimed to
+change the child app.
 
 ### Explicitly out of scope
 
