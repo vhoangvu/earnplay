@@ -5,6 +5,7 @@ import EarnPlayCore
 /// exercised through the real AVSpeechSynthesizer engine boundary.
 /// Utterance creation and start/stop state are real; no audio output is
 /// asserted because the simulator cannot produce audible speech.
+@MainActor
 final class ReadAloudTests: XCTestCase {
     func testSpeakerButtonContractEveryTutorMessageKindIsSpeakable() {
         // The button is rendered for every tutor message; each kind must

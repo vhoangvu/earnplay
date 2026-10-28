@@ -95,6 +95,7 @@ public protocol HintListenEventSink: AnyObject {
 ///
 /// On-device rule: implementations must use the system's built-in speech
 /// only. No network calls and no downloaded voices, ever.
+@MainActor
 public protocol SpeechEngine: AnyObject {
     var isSpeaking: Bool { get }
     /// Called when an utterance finishes naturally (not when stopped).
@@ -109,6 +110,7 @@ public protocol SpeechEngine: AnyObject {
 /// Uses the default system voice for the locale. It never calls any
 /// voice-download API and contains no networking code, so it works in
 /// Airplane Mode with no downloaded voice installed.
+@MainActor
 public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     public var onPlaybackFinished: (() -> Void)?
@@ -124,11 +126,34 @@ public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDe
 
     public var isSpeaking: Bool { synthesizer.isSpeaking }
 
+    /// Selects an OS-bundled voice for `language` from `voices`.
+    ///
+    /// Bundled-only policy: `AVSpeechSynthesisVoice(language:)` can return
+    /// an installed downloaded voice (its header promises an enhanced
+    /// voice "if available"), so language lookup alone does not enforce
+    /// T1.7's no-download requirement. Bundled voices ship at default
+    /// quality; enhanced/premium voices exist on device only after a
+    /// user download. Personal voices are user-created, not bundled.
+    /// Returns nil when no bundled voice matches, and callers then leave
+    /// `utterance.voice` unset so the synthesizer uses the system default
+    /// (itself bundled) — never a download and never a network fetch.
+    public static func bundledVoice(
+        forLanguage language: String = "en-US",
+        voices: [AVSpeechSynthesisVoice] = AVSpeechSynthesisVoice.speechVoices()
+    ) -> AVSpeechSynthesisVoice? {
+        func isBundled(_ voice: AVSpeechSynthesisVoice) -> Bool {
+            voice.quality == .default && !voice.voiceTraits.contains(.isPersonalVoice)
+        }
+        return voices.first { $0.language == language && isBundled($0) }
+            ?? voices.first { $0.language.hasPrefix(String(language.prefix(2))) && isBundled($0) }
+    }
+
     public func speak(text: String) {
         let utterance = AVSpeechUtterance(string: text)
-        // System built-in voice only: the default voice for en-US ships
-        // with the OS and needs no download and no network.
-        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        // Bundled voice only, validated through bundledVoice above. When
+        // no bundled en-US voice is present this stays nil and the
+        // synthesizer falls back to the system default voice.
+        utterance.voice = Self.bundledVoice(forLanguage: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         lastUtterance = utterance
         synthesizer.speak(utterance)
@@ -138,9 +163,22 @@ public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDe
         _ = synthesizer.stopSpeaking(at: .immediate)
     }
 
-    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                  didFinish utterance: AVSpeechUtterance) {
-        onPlaybackFinished?()
+    // The delegate conformance is nonisolated (the synthesizer may call
+    // this off the main actor), so it forwards only the finished
+    // utterance's identity and hops to the main actor for the check.
+    public nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                              didFinish utterance: AVSpeechUtterance) {
+        let finishedID = ObjectIdentifier(utterance)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let lastUtterance,
+                  ObjectIdentifier(lastUtterance) == finishedID else { return }
+            // Ignore completions for older utterances: a stale finish for
+            // a previous message must not clear the speaking state of the
+            // message that replaced it, or stop/lifecycle calls would
+            // return early and let the newer reading play on.
+            self.onPlaybackFinished?()
+        }
     }
 }
 #endif
@@ -157,6 +195,7 @@ public final class AVSpeechEngine: NSObject, SpeechEngine, AVSpeechSynthesizerDe
 /// Lifecycle: starting to speak stops any reading already in progress,
 /// starting a new item stops the current reading, and leaving the view
 /// stops the current reading.
+@MainActor
 public final class ReadAloudService: ObservableObject {
     public let band: GradeBand
 

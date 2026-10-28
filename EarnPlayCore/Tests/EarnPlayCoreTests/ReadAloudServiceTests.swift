@@ -4,6 +4,7 @@ import AVFoundation
 
 /// Recording fake at the synthesizer boundary only. The service logic
 /// under test (start/stop, lifecycle, event emission) is the real code.
+@MainActor
 private final class FakeSpeechEngine: SpeechEngine {
     var onPlaybackFinished: (() -> Void)?
     private(set) var spokenTexts: [String] = []
@@ -31,6 +32,7 @@ private final class RecordingHintSink: HintListenEventSink {
     func recordHintListen(_ event: HintListenEvent) { events.append(event) }
 }
 
+@MainActor
 final class ReadAloudServiceTests: XCTestCase {
     private let question = TutorMessage(id: "q1", text: "What is 7 plus 5?", kind: .question)
     private let hint = TutorMessage(id: "h1", text: "Try counting on from 7.", kind: .hint)
@@ -78,11 +80,42 @@ final class ReadAloudServiceTests: XCTestCase {
         let engine = AVSpeechEngine()
         engine.speak(text: "What is 7 plus 5?")
         XCTAssertEqual(engine.lastUtterance?.speechString, "What is 7 plus 5?")
-        XCTAssertNotNil(engine.lastUtterance?.voice)
-        // A system voice identifier is a built-in voice, never a
-        // downloaded-voice file URL or a network resource.
-        let identifier = engine.lastUtterance?.voice?.identifier ?? ""
-        XCTAssertFalse(identifier.contains("http"), "voice must not be a network resource: \(identifier)")
+        // Bundled-ness is verified through the selection path itself, not
+        // an identifier substring: downloaded voices also have identifiers
+        // without "http", so that check proved nothing. The spoken voice
+        // must be exactly what the bundled-only selector returns.
+        let expected = AVSpeechEngine.bundledVoice(forLanguage: "en-US")
+        if let expected {
+            XCTAssertEqual(engine.lastUtterance?.voice?.identifier, expected.identifier)
+            XCTAssertEqual(engine.lastUtterance?.voice?.quality, .default,
+                           "only a default-quality (OS-bundled) voice may be selected")
+        } else {
+            // No bundled en-US voice on this device: speak() must fall
+            // back to the system default (nil voice), never a download.
+            XCTAssertNil(engine.lastUtterance?.voice)
+        }
+        engine.stopSpeaking()
+    }
+
+    // Finding 2: the selector never returns a downloaded voice. Enhanced
+    // and premium voices exist on device only after a user download, so
+    // any voice the selector returns must be default quality, and when
+    // the candidate list contains only downloaded-quality voices for the
+    // language the selector must return nil (absence -> fallback).
+    func testBundledVoiceSelectionNeverSelectsDownloadedVoices() {
+        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+        let selected = AVSpeechEngine.bundledVoice(forLanguage: "en-US", voices: allVoices)
+        if let selected {
+            XCTAssertEqual(selected.quality, .default)
+            XCTAssertTrue(selected.language.hasPrefix("en"))
+        }
+        let downloadedOnly = allVoices.filter { $0.quality != .default }
+        XCTAssertNil(
+            AVSpeechEngine.bundledVoice(forLanguage: "en-US", voices: downloadedOnly),
+            "selector must not fall back to a downloaded voice")
+        // Absence handling: an unsupported language yields nil, which
+        // speak() turns into the system-default fallback (nil voice).
+        XCTAssertNil(AVSpeechEngine.bundledVoice(forLanguage: "xx-XX", voices: allVoices))
     }
 
     // (c) Band B: a new tutor message does not trigger speak until tapped.
@@ -196,6 +229,52 @@ final class ReadAloudServiceTests: XCTestCase {
         XCTAssertTrue(engine.spokenTexts.isEmpty)
         XCTAssertTrue(sink.events.isEmpty)
         XCTAssertFalse(service.isSpeaking)
+    }
+
+    // Regression (Copilot HIGH): message A's finish callback arriving
+    // after message B has started must not clear B's speaking state.
+    // Otherwise stop/lifecycle calls return early and B keeps playing
+    // after the view disappears or a new item starts.
+    func testStaleUtteranceFinishDoesNotClearNewerSpeakingState() async {
+        let engine = AVSpeechEngine()
+        var finishCount = 0
+        engine.onPlaybackFinished = { finishCount += 1 }
+        engine.speak(text: "Message A")
+        let utteranceA = engine.lastUtterance
+        engine.speak(text: "Message B")
+        let utteranceB = engine.lastUtterance
+        XCTAssertNotNil(utteranceA)
+        XCTAssertNotNil(utteranceB)
+        XCTAssertFalse(utteranceA === utteranceB)
+        // A's stale completion arrives after B started: must be ignored.
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA!)
+        await Task.yield()
+        XCTAssertEqual(finishCount, 0, "stale finish for A must not fire the completion callback")
+        // B's own completion still fires exactly once.
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceB!)
+        await Task.yield()
+        XCTAssertEqual(finishCount, 1)
+        engine.stopSpeaking()
+    }
+
+    // Same regression through the service: after A's stale completion,
+    // B is still marked speaking and lifecycle stop still stops it.
+    func testStaleFinishThroughServiceLeavesNewerMessageStoppable() async {
+        let engine = AVSpeechEngine()
+        let service = ReadAloudService(band: GradeBand(grade: "4"), engine: engine)
+        let messageA = TutorMessage(id: "a1", text: "Message A", kind: .question)
+        let messageB = TutorMessage(id: "b1", text: "Message B", kind: .question)
+        service.speak(messageA)
+        let utteranceA = engine.lastUtterance
+        service.speak(messageB)
+        XCTAssertNotNil(utteranceA)
+        engine.speechSynthesizer(AVSpeechSynthesizer(), didFinish: utteranceA!)
+        await Task.yield()
+        XCTAssertTrue(service.isSpeaking, "stale finish must not clear B's speaking state")
+        XCTAssertEqual(service.currentMessageID, messageB.id)
+        service.handleViewDisappeared()
+        XCTAssertFalse(service.isSpeaking, "leaving the view must still stop B")
+        XCTAssertNil(service.currentMessageID)
     }
 
     func testStopWhenIdleIsNoOp() {
