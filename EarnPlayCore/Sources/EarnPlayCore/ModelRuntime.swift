@@ -87,6 +87,13 @@ public final class ModelRuntime: @unchecked Sendable {
         "(bartowski/Llama-3.2-1B-Instruct-GGUF)"
     /// Runtime exercised by the spike (llama.cpp, MLC-style on-device route).
     public static let runtimeIdentifier = "llama.cpp b11935, CPU backend"
+    /// Model version stamped on every session record (T5.3, LLD
+    /// sections 2.2 and 10.3). Derived from the two identifiers above
+    /// so a session stamp always names the model build actually
+    /// configured — never a copied string that can drift from it.
+    public static var versionStamp: String {
+        "\(modelIdentifier) / \(runtimeIdentifier)"
+    }
     /// Round-trip budget asserted by the spike tests and recorded in
     /// Docs/ModelRuntimeSpike.md. Generous because simulator CI hosts vary.
     public static let spikeTimeoutMs: Double = 300_000
