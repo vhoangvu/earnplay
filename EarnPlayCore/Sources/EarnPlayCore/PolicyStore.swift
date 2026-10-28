@@ -7,6 +7,10 @@ public enum PolicyApplyResult: Equatable, Sendable {
     /// The policy's version was lower than or equal to the cached version
     /// and was discarded untouched (admin's newer version wins, LLD §8.2).
     case rejectedStaleVersion(currentVersion: Int)
+    /// The policy was newer but could not be persisted. The cached policy
+    /// and version are unchanged, so the caller may retry the same update
+    /// once writing works — it is not rejected as stale.
+    case persistenceFailed(currentVersion: Int)
 }
 
 /// Versioned policy store on the child device (LLD `PolicyStore`, T2.1).
@@ -60,6 +64,7 @@ public final class PolicyStore: @unchecked Sendable {
 
     private let directory: URL
     private let fileManager: FileManager
+    private let dataWriter: (Data, URL) throws -> Void
     private let lock = NSLock()
     private var cached: Policy
 
@@ -68,9 +73,21 @@ public final class PolicyStore: @unchecked Sendable {
     /// Loading never throws and never crashes: a missing file yields
     /// `Policy.defaultPolicy`; a corrupt primary falls back to the backup;
     /// a corrupt backup too falls back to `Policy.defaultPolicy`.
-    public init(directory: URL, fileManager: FileManager = .default) {
+    ///
+    /// `dataWriter` is the persistence seam: it writes encoded policy data
+    /// to a file URL and must throw on failure. Production uses the default
+    /// atomic `Data.write`; tests inject a throwing writer to exercise the
+    /// persistence-failure path deterministically. It has no other effect.
+    public init(
+        directory: URL,
+        fileManager: FileManager = .default,
+        dataWriter: ((Data, URL) throws -> Void)? = nil
+    ) {
         self.directory = directory
         self.fileManager = fileManager
+        self.dataWriter = dataWriter ?? { data, url in
+            try data.write(to: url, options: [.atomic])
+        }
         self.cached = Self.load(directory: directory, fileManager: fileManager)
             ?? .defaultPolicy
     }
@@ -104,7 +121,10 @@ public final class PolicyStore: @unchecked Sendable {
     /// Only a strictly higher version is stored; a lower or equal version
     /// is rejected without changing memory or disk, so the admin's newer
     /// version always wins. An accepted policy is persisted atomically
-    /// (plus backup copy) before this returns `.applied`.
+    /// (plus backup copy) before the cache advances and this returns
+    /// `.applied`. If persistence fails, the cache is left unchanged and
+    /// `.persistenceFailed` is returned, so the same version can be
+    /// retried once writing works — it is not rejected as stale.
     @discardableResult
     public func apply(_ policy: Policy) -> PolicyApplyResult {
         lock.lock()
@@ -112,7 +132,11 @@ public final class PolicyStore: @unchecked Sendable {
         guard policy.version > cached.version else {
             return .rejectedStaleVersion(currentVersion: cached.version)
         }
-        persist(policy)
+        do {
+            try persist(policy)
+        } catch {
+            return .persistenceFailed(currentVersion: cached.version)
+        }
         cached = policy
         return .applied
     }
@@ -133,38 +157,28 @@ public final class PolicyStore: @unchecked Sendable {
 
     // MARK: - Persistence (caller holds `lock`, except load at init)
 
-    private func persist(_ policy: Policy) {
-        do {
-            try fileManager.createDirectory(
-                at: directory, withIntermediateDirectories: true
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(policy)
-            // Atomic replace: a crash mid-write leaves the old file intact.
-            try data.write(
-                to: directory.appendingPathComponent(Self.policyFileName),
-                options: [.atomic]
-            )
-            // Last-good backup for the corrupt-primary fallback. Best
-            // effort: the primary is already authoritative at this point.
-            try? data.write(
-                to: directory.appendingPathComponent(Self.backupFileName),
-                options: [.atomic]
-            )
-        } catch {
-            // Persistence failure must not crash enforcement: the accepted
-            // policy still takes effect in memory for this process, and the
-            // previous on-disk policy (or default) returns at next launch.
-            // Deliberately no rethrow — `apply` has no throwing contract in
-            // the LLD, and a disk error must never unlock anything by error.
-        }
+    private func persist(_ policy: Policy) throws {
+        try fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        // `.deferredToDate` preserves fractional seconds (e.g. a chore
+        // expiry of 1_800_000_000.125); `.iso8601` would truncate them.
+        encoder.dateEncodingStrategy = .deferredToDate
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(policy)
+        // Atomic replace: a crash mid-write leaves the old file intact.
+        // A failure here propagates: `apply` reports it and does not
+        // advance the cached version.
+        try dataWriter(data, directory.appendingPathComponent(Self.policyFileName))
+        // Last-good backup for the corrupt-primary fallback. Best
+        // effort: the primary is already authoritative at this point.
+        try? dataWriter(data, directory.appendingPathComponent(Self.backupFileName))
     }
 
     private static func load(directory: URL, fileManager: FileManager) -> Policy? {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .deferredToDate
         for name in [policyFileName, backupFileName] {
             let url = directory.appendingPathComponent(name)
             guard let data = try? Data(contentsOf: url),

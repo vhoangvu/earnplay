@@ -110,6 +110,51 @@ final class PolicyStoreTests: XCTestCase {
         XCTAssertEqual(readBack, policy)
     }
 
+    func testFractionalSecondChoreExpiryRoundTripsExactly() {
+        var policy = samplePolicy(version: 1)
+        policy.chorePool[0].expiry = Date(timeIntervalSince1970: 1_800_000_000.125)
+        let store = PolicyStore(directory: directory)
+        XCTAssertEqual(store.apply(policy), .applied)
+        let readBack = PolicyStore(directory: directory).currentPolicy
+        XCTAssertEqual(readBack.chorePool[0].expiry.timeIntervalSince1970, 1_800_000_000.125)
+        XCTAssertEqual(readBack, policy)
+    }
+
+    func testPersistenceFailureDoesNotAdvanceVersionAndAllowsRetry() {
+        // Injected writer throws until the test clears the failure,
+        // simulating a full disk that later frees space.
+        var shouldFail = true
+        let store = PolicyStore(directory: directory, dataWriter: { data, url in
+            if shouldFail {
+                throw NSError(domain: "PolicyStoreTests", code: 1)
+            }
+            try data.write(to: url, options: [.atomic])
+        })
+        let policy = samplePolicy(version: 1)
+        XCTAssertEqual(store.apply(policy), .persistenceFailed(currentVersion: 0))
+        XCTAssertEqual(store.storedVersion, 0)
+        XCTAssertEqual(store.currentPolicy, .defaultPolicy)
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, .defaultPolicy)
+
+        // Retry of the same version succeeds once writing works: it must
+        // not be rejected as stale.
+        shouldFail = false
+        XCTAssertEqual(store.apply(policy), .applied)
+        XCTAssertEqual(store.storedVersion, 1)
+        XCTAssertEqual(PolicyStore(directory: directory).currentPolicy, policy)
+
+        // A later failure likewise leaves the last persisted version cached.
+        shouldFail = true
+        XCTAssertEqual(
+            store.apply(samplePolicy(version: 2)),
+            .persistenceFailed(currentVersion: 1)
+        )
+        XCTAssertEqual(store.storedVersion, 1)
+        shouldFail = false
+        XCTAssertEqual(store.apply(samplePolicy(version: 2)), .applied)
+        XCTAssertEqual(store.storedVersion, 2)
+    }
+
     // MARK: - Per-element CRUD via successive versions
 
     func testAlwaysAllowedCRUD() {
