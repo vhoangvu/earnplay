@@ -58,21 +58,31 @@ struct SpikeView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Divider()
-            Text("Version rollback (this app)")
-                .font(.subheadline.bold())
-            Button("Register active bundle as previous known-good") {
-                performVersionAction { try $0.registerActiveAsPreviousKnownGood() }
+            // Round 6 F1 (chosen option): child rollback controls
+            // are debug-only. This section is not compiled in
+            // non-DEBUG builds, so no child-app rollback action is
+            // reachable in production; production rollback runs
+            // through the EarnPlayAdmin operator app (see
+            // Docs/VersioningAndRollback.md).
+            #if DEBUG
+            if RollbackControlPolicy.allowsChildAppRollbackControls {
+                Divider()
+                Text("Version rollback (this app, debug only)")
+                    .font(.subheadline.bold())
+                Button("Register active bundle as previous known-good") {
+                    performVersionAction { try $0.registerActiveAsPreviousKnownGood() }
+                }
+                .disabled(versionActionsDisabled)
+                Button("Roll back to previous known-good") {
+                    performVersionAction { try $0.rollbackToPreviousKnownGood() }
+                }
+                .disabled(versionActionsDisabled)
+                Button("Roll forward to current") {
+                    performVersionAction { try $0.select(bundleID: "current") }
+                }
+                .disabled(versionActionsDisabled)
             }
-            .disabled(versionActionsDisabled)
-            Button("Roll back to previous known-good") {
-                performVersionAction { try $0.rollbackToPreviousKnownGood() }
-            }
-            .disabled(versionActionsDisabled)
-            Button("Roll forward to current") {
-                performVersionAction { try $0.select(bundleID: "current") }
-            }
-            .disabled(versionActionsDisabled)
+            #endif
             if !versionStatus.isEmpty {
                 Text(versionStatus)
                     .font(.caption)
@@ -123,6 +133,11 @@ struct SpikeView: View {
     /// results are cleared and the run counter resets; a failed
     /// reload clears artifacts/runtime so Run stays disabled.
     private func applyResolved(_ resolved: InferenceArtifacts, registry reg: VersionRegistry) {
+        // Round 6 F4: release the superseded session's retained
+        // snapshot only after the new artifacts are resolved.
+        if let old = artifacts {
+            (registry ?? reg).releaseInferenceArtifacts(old)
+        }
         artifacts = resolved
         artifactError = nil
         runtime = resolved.modelURL.map {
@@ -139,6 +154,9 @@ struct SpikeView: View {
     }
 
     private func applyResolutionFailure(_ error: Error) {
+        if let old = artifacts, let registry {
+            registry.releaseInferenceArtifacts(old)
+        }
         artifacts = nil
         runtime = nil
         artifactError = "Version artifacts unavailable: \(String(describing: error))"
@@ -166,6 +184,8 @@ struct SpikeView: View {
         }
     }
 
+    // Round 6 F1: only the debug-only controls call this.
+    #if DEBUG
     private func performVersionAction(_ action: @escaping @Sendable (VersionRegistry) throws -> Void) {
         guard !versionActionsDisabled else { return }
         isVersionActionRunning = true
@@ -186,6 +206,7 @@ struct SpikeView: View {
             }
         }
     }
+    #endif
 
     /// Round 5 F9: a candidate must load before selection commits.
     static func installLoadValidator(on registry: VersionRegistry) {

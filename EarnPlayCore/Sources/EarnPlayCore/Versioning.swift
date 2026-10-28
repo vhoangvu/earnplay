@@ -69,6 +69,21 @@ private struct PersistedRegistryState: Codable {
     }
 }
 
+/// Round 6 F1: child-app rollback controls are debug-only.
+/// The child `SpikeView` compiles its rollback section only in
+/// `DEBUG` builds and checks this policy; the production rollback
+/// path is the separate EarnPlayAdmin operator app (see
+/// Docs/VersioningAndRollback.md), not the child app.
+public enum RollbackControlPolicy: Sendable {
+    public static var allowsChildAppRollbackControls: Bool {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+}
+
 public final class VersionRegistry: @unchecked Sendable {
     public static let previousKnownGoodBundleID = "previous-known-good"
 
@@ -97,6 +112,68 @@ public final class VersionRegistry: @unchecked Sendable {
     /// with `ModelRuntime`; core tests install a stub. When the
     /// validator throws, the prior selection is left untouched.
     public var candidateLoadValidator: (@Sendable (InferenceArtifacts) throws -> Void)?
+
+    // Round 6 F4: snapshots handed to a resolved session are
+    // retained (process-wide, keyed by standardized path) until
+    // that session releases them; retirement is deferred, not
+    // performed solely from current registry entries.
+    private static let retentionGuard = NSLock()
+    private nonisolated(unsafe) static var retentionCounts: [String: Int] = [:]
+    private nonisolated(unsafe) static var pendingRetirements: Set<String> = []
+
+    private static func standardized(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+    private static func retainSnapshot(atPath path: String) {
+        let key = standardized(path)
+        retentionGuard.lock(); defer { retentionGuard.unlock() }
+        retentionCounts[key, default: 0] += 1
+    }
+    private static func retentionCount(forPath path: String) -> Int {
+        retentionGuard.lock(); defer { retentionGuard.unlock() }
+        return retentionCounts[standardized(path)] ?? 0
+    }
+
+    /// Retain the model file behind resolved artifacts when it is
+    /// a registry-owned snapshot. Caller must hold `lock`.
+    private func retainResolvedArtifacts(_ artifacts: InferenceArtifacts) {
+        guard let url = artifacts.modelURL,
+              isRegistryOwnedSnapshot(url.path) else { return }
+        Self.retainSnapshot(atPath: url.path)
+    }
+
+    /// Release artifacts previously returned by
+    /// `inferenceArtifacts()` / `inferenceSession(sessionId:)`.
+    /// When the last resolved session releases a snapshot whose
+    /// retirement was deferred, the file is retired then — and
+    /// only if no registered bundle references it again.
+    public func releaseInferenceArtifacts(_ artifacts: InferenceArtifacts) {
+        guard let url = artifacts.modelURL else { return }
+        let key = Self.standardized(url.path)
+        Self.retentionGuard.lock()
+        let count = Self.retentionCounts[key] ?? 0
+        if count > 1 { Self.retentionCounts[key] = count - 1 }
+        else { Self.retentionCounts.removeValue(forKey: key) }
+        let isPending = Self.pendingRetirements.contains(key)
+        Self.retentionGuard.unlock()
+        guard count <= 1, isPending else { return }
+        lock.lock(); defer { lock.unlock() }
+        try? reloadPersistedLocked()
+        Self.retentionGuard.lock()
+        if bundlesByID.values.contains(where: {
+            $0.modelFilePath.map { Self.standardized($0) == key } ?? false
+        }) {
+            Self.pendingRetirements.remove(key)
+            Self.retentionGuard.unlock()
+            return
+        }
+        Self.pendingRetirements.remove(key)
+        Self.retentionGuard.unlock()
+        guard isRegistryOwnedSnapshot(key) else { return }
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: key))
+        ownedSnapshotPaths.remove(key)
+        try? persistLocked()
+    }
 
     private var registryDirectory: URL? { storeURL?.deletingLastPathComponent() }
 
@@ -283,8 +360,17 @@ public final class VersionRegistry: @unchecked Sendable {
         try reloadPersistedLocked()
         let candidate = Self.enriched(bundle, bindDefaultModel: true)
         // F9: replacing the active bundle must validate first.
+        // Round 6 F5: this active-register commit path previously
+        // bypassed `candidateLoadValidator` (only GGUF/digest
+        // checks), so a truncated/unloadable model could become
+        // the persisted active bundle. Run the load validator
+        // before any mutation, exactly as `selectLocked` does;
+        // a failure leaves the prior selection untouched.
         if candidate.bundleID == _activeBundleID {
             try Self.validateArtifacts(candidate)
+            if let candidateLoadValidator {
+                try candidateLoadValidator(artifacts(for: candidate))
+            }
         }
         let savedByID = bundlesByID; let savedOrder = orderedIDs; let savedActive = _activeBundleID
         if bundlesByID[candidate.bundleID] == nil { orderedIDs.append(candidate.bundleID) }
@@ -343,6 +429,7 @@ public final class VersionRegistry: @unchecked Sendable {
         let bundle = bundlesByID[_activeBundleID]!
         try Self.validateArtifacts(bundle, defaultModelURL: defaultModelURL)
         let resolved = artifacts(for: bundle, defaultModelURL: defaultModelURL)
+        retainResolvedArtifacts(resolved)
         let record = try SessionRecord(sessionId: sessionId, startedAt: startedAt,
                                        modelVersion: resolved.modelVersion,
                                        promptVersion: resolved.promptVersion)
@@ -434,13 +521,21 @@ public final class VersionRegistry: @unchecked Sendable {
         // Only after the new entry is persisted, retire a snapshot
         // no remaining bundle references — and only a file this
         // registry owns, never an externally registered artifact.
+        // Round 6 F4: defer retirement while a resolved session
+        // still retains the snapshot; it is retired on release.
         if let previousSnapshotPath,
            previousSnapshotPath != stable.path,
            isRegistryOwnedSnapshot(previousSnapshotPath),
            !bundlesByID.values.contains(where: { $0.modelFilePath == previousSnapshotPath }) {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: previousSnapshotPath))
-            ownedSnapshotPaths.remove(URL(fileURLWithPath: previousSnapshotPath).standardizedFileURL.path)
-            try? persistLocked()
+            if Self.retentionCount(forPath: previousSnapshotPath) > 0 {
+                Self.retentionGuard.lock()
+                Self.pendingRetirements.insert(Self.standardized(previousSnapshotPath))
+                Self.retentionGuard.unlock()
+            } else {
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: previousSnapshotPath))
+                ownedSnapshotPaths.remove(URL(fileURLWithPath: previousSnapshotPath).standardizedFileURL.path)
+                try? persistLocked()
+            }
         }
     }
 
@@ -452,7 +547,9 @@ public final class VersionRegistry: @unchecked Sendable {
         let bundle = bundlesByID[_activeBundleID]!
         try Self.validateArtifacts(bundle, defaultModelURL: defaultModelURL)
         // F13/F1 via artifacts(for:): composed version + digest.
-        return artifacts(for: bundle, defaultModelURL: defaultModelURL)
+        let resolved = artifacts(for: bundle, defaultModelURL: defaultModelURL)
+        retainResolvedArtifacts(resolved)
+        return resolved
     }
 
     private static func enriched(_ bundle: VersionBundle, bindDefaultModel: Bool = false) -> VersionBundle {

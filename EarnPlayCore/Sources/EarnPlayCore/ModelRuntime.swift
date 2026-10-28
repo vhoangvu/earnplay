@@ -315,6 +315,26 @@ public final class ModelRuntime: @unchecked Sendable {
     /// llama.cpp opens this retained file, never the mutable source
     /// path, so the bytes loaded are exactly the bytes hashed. The
     /// copy's digest must match the bound identity when one is set.
+    /// Publish `tmp` as the immutable `final` file. Round 6 F3:
+    /// if another instance won the publication race, verify and
+    /// reuse the winning file and remove the losing temporary copy
+    /// instead of failing an otherwise valid load.
+    private func publishImmutableCopy(tmp: URL, to final: URL, digest: String) throws -> URL {
+        do {
+            try FileManager.default.moveItem(at: tmp, to: final)
+        } catch {
+            if FileManager.default.fileExists(atPath: final.path),
+               (try? Self.contentSHA256(forFileAt: final)) == digest {
+                try? FileManager.default.removeItem(at: tmp)
+                return final
+            }
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: final.path)
+        return final
+    }
+
     func verifiedImmutableCopyURL() throws -> URL {
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw ModelRuntimeError.modelNotFound(path: modelPath.path)
@@ -326,6 +346,18 @@ public final class ModelRuntime: @unchecked Sendable {
             ?? FileManager.default.temporaryDirectory
         let dir = caches.appendingPathComponent("EarnPlay/immutable-models", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Round 6 F2: when a digest is already bound, check and
+        // verify the existing cache entry before creating any
+        // temporary copy — a cache hit needs no extra 770 MiB.
+        if let expectedContentDigest {
+            let cached = dir.appendingPathComponent("\(expectedContentDigest).gguf")
+            if FileManager.default.fileExists(atPath: cached.path) {
+                if (try? Self.contentSHA256(forFileAt: cached)) == expectedContentDigest {
+                    return cached
+                }
+                try? FileManager.default.removeItem(at: cached)
+            }
+        }
         guard let source = try? FileHandle(forReadingFrom: modelPath) else {
             throw ModelRuntimeError.modelNotFound(path: modelPath.path)
         }
@@ -367,17 +399,13 @@ public final class ModelRuntime: @unchecked Sendable {
         }
         let final = dir.appendingPathComponent("\(digest).gguf")
         if FileManager.default.fileExists(atPath: final.path) {
-            try? FileManager.default.removeItem(at: tmp)
             if (try? Self.contentSHA256(forFileAt: final)) == digest {
+                try? FileManager.default.removeItem(at: tmp)
                 return final
             }
             try? FileManager.default.removeItem(at: final)
-            // Fall through is impossible here; recreate from source.
-            return try verifiedImmutableCopyURL()
         }
-        try FileManager.default.moveItem(at: tmp, to: final)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: final.path)
-        return final
+        return try publishImmutableCopy(tmp: tmp, to: final, digest: digest)
     }
 
     private func loadLocked() throws -> Double {

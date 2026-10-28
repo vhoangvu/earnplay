@@ -106,7 +106,12 @@ restored or synced record cannot bypass the invariant.
 
 Note on scope: the full LLD 2.2 Session schema belongs to T1.6,
 which has not landed yet. `SessionRecord` carries the
-version-bearing subset (ID, start time, both versions).
+version-bearing subset (ID, start time, both versions). The
+apps do not yet create or persist `SessionRecord`s (they resolve
+`inferenceArtifacts()` and call `generate` only), so every
+verification step below that inspects session stamps is marked
+DEFERRED until session recording is integrated in a separate
+task.
 
 ## When to roll back
 
@@ -117,15 +122,26 @@ to a version.
 
 ## Rollback procedure (model or prompt)
 
-Operator entry points (shipped): **EarnPlayAdmin** ("Rollback
-operator controls") and the child **EarnPlay** app's SpikeView
-("Version rollback (this app)"). Both obtain the persisted
-production registry via `VersionRegistry.production()` — never a
-fresh in-memory registry — and perform the calls below on it.
-Because the two apps have separate sandboxes (see "Note on
-processes"), use the child app's controls to change what child
-inference runs; the admin controls change the admin app's own
-persisted registry and demonstrate/verify the same procedure.
+Operator entry points: **EarnPlayAdmin** ("Rollback
+operator controls") is the production rollback path — a separate
+operator app, not the child app. The child **EarnPlay** app's
+SpikeView rollback controls ("Version rollback (this app, debug
+only)") are **debug-only** (round 6 F1, chosen option): that
+section is compiled only in `DEBUG` builds
+(`RollbackControlPolicy` in EarnPlayCore) and is unreachable in
+a non-debug child build, so a child user cannot replace or
+delete the previous known-good snapshot. No authentication
+system is invented for this spike; a future authenticated
+operator path may replace the admin-app-mediated path, but
+production rollback today runs only through EarnPlayAdmin.
+Both obtain the persisted production registry via
+`VersionRegistry.production()` — never a fresh in-memory
+registry — and perform the calls below on it. Because the two
+apps have separate sandboxes (see "Note on processes"), use
+the child app's (debug) controls to change what child
+inference runs in a debug build; the admin controls change the
+admin app's own persisted registry and demonstrate/verify the
+same procedure.
 
 1. *Before an update ships:* tap **Register active bundle as
    previous known-good**. This first checks the installed model
@@ -152,9 +168,13 @@ persisted registry and demonstrate/verify the same procedure.
    restart, and a failed persist cannot destroy the prior
    rollback. With no model file installed, the snapshot is
    rejected (`artifactUnavailable`) instead of reporting success.
-2. Confirm the regression is version-linked: compare session stamps
-   between healthy and regressing sessions. If identical, do not
-   roll back blind.
+2. **DEFERRED — do not execute until session recording is
+   integrated.** Confirm the regression is version-linked:
+   compare session stamps between healthy and regressing
+   sessions. If identical, do not roll back blind. The app only
+   resolves `inferenceArtifacts()` and calls `generate`; it
+   never creates or persists a `SessionRecord`, so there are no
+   inspectable session stamps to compare yet.
 3. Tap **Roll back to previous known-good**. This calls
    `registry.rollbackToPreviousKnownGood()` on the persisted
    registry: it throws `VersioningError.noPreviousBundle` when no
@@ -163,23 +183,33 @@ persisted registry and demonstrate/verify the same procedure.
    model file is not on the device — both shown in the panel, with
    the active bundle unchanged. On success the selection is
    persisted and the panel shows the rolled-back versions.
-4. Verify: in the child app, `SpikeView` now loads the rolled-back
-   bundle's model file and prompts (it resolves
-   `inferenceArtifacts()` from the persisted registry at launch),
-   and a new session stamps the older versions. Automated
-   equivalents: `testRollbackArtifactsAreUsedByInference` and
+4. Verify (executable part): in the child app, `SpikeView` now
+   loads the rolled-back bundle's model file and prompts (it
+   resolves `inferenceArtifacts()` from the persisted registry
+   at launch). Automated equivalents:
+   `testRollbackArtifactsAreUsedByInference` and
    `testPersistedRegistrySurvivesReconstructionAndPanelReadsIt`.
-5. Record the rollback like any other version change: sessions
-   after the rollback carry the older stamp (LLD 10.3).
+   **DEFERRED:** the claim that a new child session stamps the
+   older versions is not an executable check until session
+   recording is integrated — the app never creates or persists
+   a `SessionRecord`.
+5. **DEFERRED — do not execute until session recording is
+   integrated.** Record the rollback like any other version
+   change: sessions after the rollback carry the older stamp
+   (LLD 10.3). There are no persisted session records to inspect
+   yet.
 6. Roll forward: tap **Roll forward to current** in the child
-   app's **SpikeView** ("Version rollback (this app)"), or call
-   `select(bundleID: "current")` on the child's persisted
-   registry in code, then confirm in the child app that a new
-   session stamps the current version. Do **not** use the
-   EarnPlayAdmin roll-forward button for this step: the admin
-   app has its own sandbox and registry, so its button changes
-   only the admin app's selection and leaves child inference
-   rolled back (see "Note on processes" below).
+   app's **SpikeView** ("Version rollback (this app, debug
+   only)", debug builds only) or in EarnPlayAdmin for the admin
+   registry, or call `select(bundleID: "current")` on the
+   child's persisted registry in code. **DEFERRED:** confirming
+   in the child app that a new session stamps the current
+   version is not executable until session recording is
+   integrated. Do **not** use the EarnPlayAdmin roll-forward
+   button for the child step: the admin app has its own sandbox
+   and registry, so its button changes only the admin app's
+   selection and leaves child inference rolled back (see "Note
+   on processes" below).
 
 Programmatic equivalent (same persisted registry):
 `let registry = try VersionRegistry.production()`, then
@@ -188,9 +218,11 @@ Programmatic equivalent (same persisted registry):
 Note on processes: the child and admin apps are separate
 processes with separate Application Support sandboxes, so each
 persists its own registry file. That is exactly why the child app
-also ships rollback controls: a rollback performed in EarnPlay's
-SpikeView reloads that app's inference artifacts immediately, so
-it is the entry point that affects child inference. The admin
+also ships rollback controls in debug builds only: a rollback
+performed in EarnPlay's SpikeView reloads that app's inference
+artifacts immediately, so it is the entry point that affects
+child inference in a debug build. In production builds the
+child app has no rollback controls (round 6 F1). The admin
 panel reflects selections made through the admin app, and each
 app reads its persisted selection at launch. Live cross-process
 sync would need a shared app-group container, which this project

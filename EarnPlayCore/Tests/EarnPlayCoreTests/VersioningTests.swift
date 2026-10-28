@@ -723,3 +723,116 @@ extension VersioningTests {
         XCTAssertEqual(fromArtifacts.modelVersion, session.artifacts.modelVersion)
     }
 }
+
+extension VersioningTests {
+    // Round 6 F1: child rollback policy follows the build config.
+    func testChildRollbackControlsAreDebugOnly() {
+        #if DEBUG
+        XCTAssertTrue(RollbackControlPolicy.allowsChildAppRollbackControls)
+        #else
+        XCTAssertFalse(RollbackControlPolicy.allowsChildAppRollbackControls)
+        #endif
+    }
+
+    // Round 6 F2: a bound digest reuses the verified cache entry
+    // without recopied source bytes; a corrupt entry is republished.
+    func testBoundDigestReusesVerifiedImmutableCache() throws {
+        let model = try tempGGUF(named: "CacheHit.gguf")
+        try Data("GGUF-cache-hit-A".utf8).write(to: model)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: model)
+        let first = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+            .verifiedImmutableCopyURL()
+        // Replacing the source must not change the cached bytes a
+        // digest-bound copy returns (load() still rejects this via
+        // verifyBoundIdentityLocked; the copy lookup is cache-first).
+        try Data("GGUF-cache-hit-B".utf8).write(to: model)
+        let second = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+            .verifiedImmutableCopyURL()
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(try Data(contentsOf: second), Data("GGUF-cache-hit-A".utf8))
+        // Corrupt the cache entry: it is verified, rejected, rebuilt.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: first.path)
+        try Data("GGUF-corrupt!!!".utf8).write(to: first)
+        try Data("GGUF-cache-hit-A".utf8).write(to: model)
+        let rebuilt = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+            .verifiedImmutableCopyURL()
+        XCTAssertEqual(try Data(contentsOf: rebuilt), Data("GGUF-cache-hit-A".utf8))
+        XCTAssertEqual(try ModelRuntime.contentSHA256(forFileAt: rebuilt), digest)
+    }
+
+    // Round 6 F3: concurrent publication of the same model — all
+    // instances reuse the winning file, no temp copies remain.
+    func testConcurrentImmutablePublicationReusesWinningFile() throws {
+        let model = try tempGGUF(named: "Race.gguf")
+        var bytes = Data("GGUF".utf8)
+        bytes.append(Data(repeating: 0x41, count: 4_000_000))
+        try bytes.write(to: model)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: model)
+        final class Box: @unchecked Sendable {
+            let lock = NSLock(); var urls: [URL] = []; var errors: [Error] = []
+        }
+        let box = Box()
+        DispatchQueue.concurrentPerform(iterations: 4) { _ in
+            do {
+                let url = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+                    .verifiedImmutableCopyURL()
+                box.lock.lock(); box.urls.append(url); box.lock.unlock()
+            } catch {
+                box.lock.lock(); box.errors.append(error); box.lock.unlock()
+            }
+        }
+        XCTAssertTrue(box.errors.isEmpty, "race losers must reuse winner: \(box.errors)")
+        XCTAssertEqual(box.urls.count, 4)
+        XCTAssertEqual(Set(box.urls).count, 1)
+        let dir = box.urls[0].deletingLastPathComponent()
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.contains(".tmp") }
+        XCTAssertTrue(leftovers.isEmpty, "temp copies must be removed: \(leftovers)")
+    }
+
+    // Round 6 F5: the active-register commit path runs the load
+    // validator (selectLocked already did); failure preserves prior.
+    func testCandidateLoadValidatorGatesActiveRegisterReplacement() throws {
+        let registry = try makeRegistry()
+        let candidateModel = try tempGGUF(named: "Candidate.gguf")
+        registry.candidateLoadValidator = { _ in
+            throw ModelRuntimeError.modelLoadFailed("unloadable candidate")
+        }
+        XCTAssertThrowsError(try registry.register(VersionBundle(
+            bundleID: "current", modelVersion: "candidate-m", promptVersion: "candidate-p",
+            modelFilePath: candidateModel.path, promptTexts: ["Candidate."])))
+        XCTAssertEqual(try registry.activeBundle.modelVersion, ModelRuntime.versionStamp)
+        XCTAssertEqual(try registry.activeBundleID, "current")
+        registry.candidateLoadValidator = { _ in }
+        try registry.register(VersionBundle(
+            bundleID: "current", modelVersion: "candidate-m", promptVersion: "candidate-p",
+            modelFilePath: candidateModel.path, promptTexts: ["Candidate."]))
+        XCTAssertEqual(try registry.activeBundle.modelVersion, "candidate-m")
+    }
+
+    // Round 6 F4: a snapshot handed to a resolved session is
+    // retained when a new previous snapshot replaces it, and is
+    // retired only when that session releases its artifacts.
+    func testRetiredSnapshotRetainedUntilResolvedSessionReleases() throws {
+        let store = tempStoreURL()
+        let model = try tempGGUF(named: "Retained.gguf")
+        try Data("GGUF-retained-A".utf8).write(to: model)
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try registry.registerActiveAsPreviousKnownGood()
+        let firstPath = try registry.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!.modelFilePath!
+        try registry.rollbackToPreviousKnownGood()
+        let sessionArtifacts = try registry.inferenceArtifacts(defaultModelURL: nil)
+        XCTAssertEqual(sessionArtifacts.modelURL?.path, firstPath)
+        try registry.select(bundleID: "current")
+        try Data("GGUF-retained-B".utf8).write(to: model)
+        let second = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try second.registerActiveAsPreviousKnownGood()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPath),
+                      "resolved session's snapshot must be retained")
+        second.releaseInferenceArtifacts(sessionArtifacts)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath),
+                       "snapshot must retire after the session releases it")
+    }
+}
