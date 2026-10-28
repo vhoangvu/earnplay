@@ -44,7 +44,7 @@ These values must match Xcode's Bundle Identifier fields exactly
 
 ## CI (Route 1)
 
-Every push to `main` and every pull request runs GitHub Actions on a
+Every push and every pull request runs GitHub Actions on a
 macOS runner (`.github/workflows/ci.yml`): installs XcodeGen, generates
 the project, runs `swift test` for EarnPlayCore, then
 `xcodebuild test` for the EarnPlay scheme and `xcodebuild build`

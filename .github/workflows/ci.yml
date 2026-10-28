@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -23,6 +22,9 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      # Known CI gap (T7.1): runners do not fetch llama.xcframework (gitignored,
+      # ~380 MB unpacked) or the spike GGUF, so real-inference tests XCTSkip.
+      # Staging the model into CI is a separate human decision (cost/runtime).
       - name: Test EarnPlayCore package
         run: swift test --package-path EarnPlayCore
 
