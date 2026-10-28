@@ -648,6 +648,129 @@ final class QuestionGenerationTests: XCTestCase {
                       "reading prompt must request combined passage+question text: \(prompt)")
     }
 
+    // MARK: - Copilot round-3 regressions (tests-first)
+
+    private func readingProposal(passage: String, candidate: String, question: String) -> ProposedProblem {
+        ProposedProblem(
+            skill: .readingComprehension, form: .story, passage: passage,
+            candidateAnswer: candidate, promptText: "Read: \(passage) \(question)")
+    }
+
+    func testR3F1QuantityAnswerMustMatchQuestionedNoun() throws {
+        let passage = "Maya has three apples and five pears."
+        let question = "How many pears does Maya have?"
+        let bad = readingProposal(passage: passage, candidate: "three", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "unrelated quantity span must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "three")
+        XCTAssertEqual(badResult.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "five", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "five")
+        XCTAssertEqual(solver.checkAnswer(goodResult.question, proposedAnswer: "five"), .correct)
+        XCTAssertEqual(solver.checkAnswer(goodResult.question, proposedAnswer: "three"), .incorrect(expected: "five"))
+        assertReallyVerified(goodResult)
+    }
+
+    func testR3F1WhoAnswerMustBeSubjectOfQuestionedVerb() throws {
+        let passage = "Maya gave Leo a book."
+        let question = "Who gave Leo a book?"
+        let bad = readingProposal(passage: passage, candidate: "Leo", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "non-subject name span must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "Leo")
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "Maya", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "Maya")
+        assertReallyVerified(goodResult)
+    }
+
+    func testR3F1ColorAnswerMustDescribeQuestionedNoun() throws {
+        let passage = "The blue box has a red lid."
+        let question = "What color is the box's lid?"
+        let bad = readingProposal(passage: passage, candidate: "blue", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "color of a different noun must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "blue")
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "red", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "red")
+        assertReallyVerified(goodResult)
+    }
+
+    func testR3F1VerbObjectAnswerMustFollowQuestionedVerb() throws {
+        let passage = "Maya planted seeds in the garden and watered the flowers."
+        let question = "What did Maya water?"
+        let bad = readingProposal(passage: passage, candidate: "seeds", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "object of a different verb must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "seeds")
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "flowers", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "flowers")
+        assertReallyVerified(goodResult)
+    }
+
+    private final class AlwaysStoryProposer: QuestionProposing, @unchecked Sendable {
+        func propose(request: QuestionGenerationRequest) throws -> ProposedProblem? {
+            ProposedProblem(
+                skill: request.skill, form: .story, operands: [7, 8],
+                promptText: "Seven shelves hold 8 books each. How many books in all?")
+        }
+    }
+
+    func testR3F2ProposerIgnoringFormHintStillYieldsThreeFormsInTen() throws {
+        let generator = QuestionGenerator(proposer: AlwaysStoryProposer())
+        var forms: [SolverForm] = []
+        for _ in 0..<10 {
+            let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
+            forms.append(result.question.formType)
+            assertReallyVerified(result)
+        }
+        XCTAssertFalse(forms.contains(.direct))
+        XCTAssertGreaterThanOrEqual(Set(forms).count, 3,
+                                    "hint-ignoring proposer must not yield one form, got \(forms)")
+    }
+
+    func testR3F3FallbackScansPastPresentationInvalidEntry() throws {
+        let passage = "Leo kept books in a blue box."
+        let passageLess = ProposedProblem(
+            skill: .readingComprehension, form: .story, passage: passage,
+            candidateAnswer: "blue", promptText: "What color was the box?")
+        let presentable = ProposedProblem(
+            skill: .readingComprehension, form: .story, passage: passage,
+            candidateAnswer: "blue", promptText: "Read: Leo kept books in a blue box. What color was the box?")
+        let bank = FallbackQuestionBank(proposals: [passageLess, presentable])
+        XCTAssertEqual(bank.entries.count, 2, "both entries are solver-accepted and must be retained")
+        let stub = StubProposer(steps: Array(repeating: .nothing, count: 5))
+        let generator = QuestionGenerator(proposer: stub, fallbackBank: bank, maxAttempts: 1)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(result.source, .fallbackBank)
+        XCTAssertEqual(result.question.verifiedAnswer, "blue")
+        XCTAssertTrue(result.question.promptText.contains(passage))
+        assertReallyVerified(result)
+    }
+
     func testCopilotF4SamplingSeedVariesAndReplaysDeterministically() throws {
         final class Capture: @unchecked Sendable {
             var prompts: [String] = []

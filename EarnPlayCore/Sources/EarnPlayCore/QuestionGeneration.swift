@@ -192,6 +192,7 @@ public final class QuestionGenerator: @unchecked Sendable {
     private var formRotation = 0
     private var questionCounter = 0
     private var fallbackRotation: [SolverSkill: Int] = [:]
+    private var deliveredForms: [SolverForm] = []
 
     public init(proposer: any QuestionProposing,
                 solver: SolverService = SolverService(),
@@ -214,8 +215,9 @@ public final class QuestionGenerator: @unchecked Sendable {
         let variationIndex = nextVariationIndex()
 
         for attempt in 1...maxAttempts {
+            let formHint = nextFormHint()
             let attemptRequest = request.forAttempt(
-                attempt, formHint: nextFormHint(), variationIndex: variationIndex)
+                attempt, formHint: formHint, variationIndex: variationIndex)
             let proposal: ProposedProblem?
             do {
                 proposal = try proposer.propose(request: attemptRequest)
@@ -229,20 +231,32 @@ public final class QuestionGenerator: @unchecked Sendable {
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .noProposal))
                 continue
             }
+            // F2 (round 3): enforce the rotating form hint at rendering
+            // time for computed skills. A proposer that keeps returning a
+            // form this generator has already delivered, despite a
+            // different hint, is re-rendered in the hinted form from the
+            // same structured values, so ten questions cannot all share
+            // one form. A first-seen form is left as proposed.
+            var effectiveProposal = proposal
+            if proposal.skill != .readingComprehension,
+               proposal.form != formHint,
+               hasDeliveredForm(proposal.form) {
+                effectiveProposal.form = formHint
+            }
             // Loop-level gates (LLD 10.2 schema/safety gates, SSOT form
             // rule). These run before the solver so a proposal that could
             // never be presented does not consume solver trust by accident.
-            guard proposal.skill == request.skill else {
+            guard effectiveProposal.skill == request.skill else {
                 log.append(GenerationAttemptLog(
                     attemptNumber: attempt,
-                    outcome: .skillMismatch(proposed: proposal.skill.rawValue)))
+                    outcome: .skillMismatch(proposed: effectiveProposal.skill.rawValue)))
                 continue
             }
-            guard QuestionForms.isPresentable(proposal.form) else {
+            guard QuestionForms.isPresentable(effectiveProposal.form) else {
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .plainTextbookForm))
                 continue
             }
-            guard !proposal.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard !effectiveProposal.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .emptyPromptText))
                 continue
             }
@@ -250,7 +264,7 @@ public final class QuestionGenerator: @unchecked Sendable {
             // (or, for reading, checked against its passage), never the
             // proposer's unverified wording for a computed skill.
             let checked: ProposedProblem
-            switch Self.checkedForPresentation(proposal) {
+            switch Self.checkedForPresentation(effectiveProposal) {
             case .ready(let ready): checked = ready
             case .mismatch:
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .promptTextMismatch))
@@ -265,6 +279,7 @@ public final class QuestionGenerator: @unchecked Sendable {
             switch solver.verify(checked, questionId: makeQuestionID()) {
             case .success(let question):
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .verified))
+                recordDeliveredForm(question.formType)
                 return QuestionGenerationResult(
                     question: question, source: .modelVerified,
                     attemptsUsed: attempt, attempts: log, proposal: checked,
@@ -283,26 +298,32 @@ public final class QuestionGenerator: @unchecked Sendable {
         // solver verified when the bank was built, and the serve below
         // re-verifies with this question's own id, so the fallback path
         // is verified by construction, not by trust.
-        guard let fallback = nextFallback(for: request.skill) else {
-            throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
+        // F3 (round 3): scan the skill's entries once in round-robin
+        // order, skipping presentation-invalid (or no longer verifying)
+        // candidates, instead of throwing when only the first is unusable.
+        let (fallbackStart, fallbackCandidates) = fallbackScan(for: request.skill)
+        for (offset, fallback) in fallbackCandidates.enumerated() {
+            guard case .ready(let checkedFallback) = Self.checkedForPresentation(fallback) else {
+                continue
+            }
+            switch solver.verify(checkedFallback, questionId: makeQuestionID()) {
+            case .success(let question):
+                advanceFallbackRotation(for: request.skill, start: fallbackStart, consumed: offset + 1)
+                recordDeliveredForm(question.formType)
+                // F5: fallback solver pass is recorded separately; `attempts`
+                // stays the bounded model-attempt log (all failures here).
+                return QuestionGenerationResult(
+                    question: question, source: .fallbackBank,
+                    attemptsUsed: maxAttempts, attempts: log, proposal: checkedFallback,
+                    finalVerification: FinalVerificationRecord(
+                        source: .fallbackBank, outcome: .verified,
+                        attemptNumber: nil, questionId: question.questionId))
+            case .failure:
+                // A bank entry that no longer verifies must never be served.
+                continue
+            }
         }
-        guard case .ready(let checkedFallback) = Self.checkedForPresentation(fallback) else {
-            throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
-        }
-        switch solver.verify(checkedFallback, questionId: makeQuestionID()) {
-        case .success(let question):
-            // F5: fallback solver pass is recorded separately; `attempts`
-            // stays the bounded model-attempt log (all failures here).
-            return QuestionGenerationResult(
-                question: question, source: .fallbackBank,
-                attemptsUsed: maxAttempts, attempts: log, proposal: checkedFallback,
-                finalVerification: FinalVerificationRecord(
-                    source: .fallbackBank, outcome: .verified,
-                    attemptNumber: nil, questionId: question.questionId))
-        case .failure:
-            // A bank entry that no longer verifies must never be served.
-            throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
-        }
+        throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
     }
 
     private enum PresentationCheck {
@@ -357,30 +378,54 @@ public final class QuestionGenerator: @unchecked Sendable {
         return form
     }
 
-    private func nextFallback(for skill: SolverSkill) -> ProposedProblem? {
+    private func hasDeliveredForm(_ form: SolverForm) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let proposal = fallbackBank.proposal(for: skill, rotationIndex: fallbackRotation[skill, default: 0]) else {
-            return nil
-        }
-        fallbackRotation[skill, default: 0] += 1
-        return proposal
+        return deliveredForms.contains(form)
+    }
+
+    private func recordDeliveredForm(_ form: SolverForm) {
+        lock.lock()
+        defer { lock.unlock() }
+        deliveredForms.append(form)
+    }
+
+    /// Entries for `skill` in round-robin order starting at the current
+    /// rotation, each at most once, plus the starting rotation index.
+    private func fallbackScan(for skill: SolverSkill) -> (start: Int, candidates: [ProposedProblem]) {
+        lock.lock()
+        defer { lock.unlock() }
+        let matching = fallbackBank.entries(for: skill)
+        guard !matching.isEmpty else { return (fallbackRotation[skill, default: 0], []) }
+        let start = fallbackRotation[skill, default: 0]
+        let normalizedStart = ((start % matching.count) + matching.count) % matching.count
+        let candidates = (0..<matching.count).map { matching[(normalizedStart + $0) % matching.count] }
+        return (start, candidates)
+    }
+
+    private func advanceFallbackRotation(for skill: SolverSkill, start: Int, consumed: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        fallbackRotation[skill] = start + consumed
     }
 }
 
-/// Deterministic reading question/answer check (round-2 F2). Passage
-/// containment plus a passage span is NOT support for an answer: the
-/// question must ask for the kind of thing the candidate is, in a way
-/// checkable from the passage text alone. Accepted shapes, all
-/// fail-closed (anything else is a mismatch and falls back):
+/// Deterministic reading question/answer check (round-2 F2, round-3 F1).
+/// Passage containment plus a passage span is NOT support for an answer:
+/// for each supported shape the candidate must provably answer the
+/// relationship asked about, checkable from the passage text alone.
+/// Accepted shapes, all fail-closed (anything else falls back):
 /// - a vetted fallback-bank (passage, question, answer) tuple, matched
 ///   on normalized passage, question, and candidate;
-/// - a color question, whose candidate is a color word used as the
-///   adjective of the questioned noun in the passage ("blue box");
-/// - a how-many/much question, whose candidate begins with a number;
-/// - a who question, whose candidate is a capitalized name span;
-/// - a what-did question, whose candidate starts at most two tokens
-///   after a passage verb sharing a stem with a question verb.
+/// - a color question, whose candidate colors the questioned noun in
+///   the passage (adjective before it, or predicative after it);
+/// - a how-many/much question, whose candidate number is the quantity
+///   of the questioned noun in the passage;
+/// - a who question, whose candidate is the subject (or, for an
+///   auxiliary question, the non-subject participant) of the questioned
+///   verb in the passage;
+/// - a what-did question, whose candidate follows the questioned verb
+///   (with the questioned subject before that verb) in the passage.
 enum ReadingPresentationVerifier {
     private static let colors: Set<String> = [
         "red", "orange", "yellow", "green", "blue", "purple", "pink",
@@ -416,12 +461,12 @@ enum ReadingPresentationVerifier {
                                  passage: passage)
         }
         if qLower.contains("how many") || qLower.contains("how much") {
-            guard let first = candidateTokens.first else { return false }
-            return numberWords.contains(first) || (!first.isEmpty && first.allSatisfy(\.isNumber))
+            return isQuantityAnswer(candidateTokens: candidateTokens, questionTokens: qTokens,
+                                    passage: passage)
         }
         if qTokens.first == "who" {
-            let trimmedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmedCandidate.first?.isUppercase == true && passage.contains(trimmedCandidate)
+            return isWhoAnswer(candidate: candidate, candidateTokens: candidateTokens,
+                               questionTokens: qTokens, passage: passage)
         }
         if qTokens.first == "what", qTokens.count > 1,
            ["did", "do", "does"].contains(qTokens[1]) {
@@ -452,41 +497,164 @@ enum ReadingPresentationVerifier {
         }
     }
 
-    private static func isColorAnswer(candidateTokens: [String], questionTokens: [String],
-                                      passage: String) -> Bool {
-        guard candidateTokens.count == 1, colors.contains(candidateTokens[0]) else { return false }
-        guard let colorIndex = questionTokens.firstIndex(where: { $0 == "color" || $0 == "colour" }),
-              let theIndex = questionTokens[colorIndex...].firstIndex(of: "the"),
-              theIndex + 1 < questionTokens.count else { return false }
-        let noun = questionTokens[theIndex + 1]
+    private static func isQuantityAnswer(candidateTokens: [String], questionTokens: [String],
+                                         passage: String) -> Bool {
+        guard let first = candidateTokens.first,
+              numberWords.contains(first) || (!first.isEmpty && first.allSatisfy(\.isNumber))
+        else { return false }
+        guard let trigger = questionTokens.firstIndex(where: { $0 == "many" || $0 == "much" }),
+              trigger + 1 < questionTokens.count else { return false }
+        let noun = questionTokens[trigger + 1]
         let passageTokens = tokens(passage)
-        for index in passageTokens.indices.dropLast()
-        where passageTokens[index] == candidateTokens[0] && passageTokens[index + 1] == noun {
-            return true
+        for index in passageTokens.indices where passageTokens[index] == first {
+            for offset in 1...3
+            where index + offset < passageTokens.count && nounMatches(passageTokens[index + offset], noun) {
+                return true
+            }
         }
         return false
     }
 
-    private static func isVerbObjectAnswer(candidateTokens: [String], questionTokens: [String],
-                                           passage: String) -> Bool {
-        let verbCandidates = questionTokens.dropFirst(2).filter { !stopwords.contains($0) && $0.count >= 3 }
+    private static func isWhoAnswer(candidate: String, candidateTokens: [String],
+                                    questionTokens: [String], passage: String) -> Bool {
+        let trimmedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedCandidate.first?.isUppercase == true, passage.contains(trimmedCandidate),
+              questionTokens.count >= 2 else { return false }
+        let auxiliaries: Set<String> = ["did", "do", "does", "is", "are", "was", "were"]
+        let sentences = SolverService.passageSentences(passage).map(tokens)
+        if !auxiliaries.contains(questionTokens[1]) {
+            // "Who gave ...?": candidate must be the subject span directly
+            // before the questioned verb in a passage sentence.
+            let verb = questionTokens[1]
+            for sentenceTokens in sentences {
+                guard let start = firstIndex(of: candidateTokens, in: sentenceTokens) else { continue }
+                let end = start + candidateTokens.count
+                if end < sentenceTokens.count, verbMatches(sentenceTokens[end], verb) { return true }
+            }
+            return false
+        }
+        let aux = questionTokens[1]
+        let rest = Array(questionTokens.dropFirst(2))
+        if ["is", "are", "was", "were"].contains(aux) {
+            // "Who is the teacher?": candidate before the copula, with the
+            // questioned description after it in the same sentence.
+            let description = rest.filter { !["the", "a", "an"].contains($0) }
+            if !description.isEmpty {
+                for sentenceTokens in sentences {
+                    guard let start = firstIndex(of: candidateTokens, in: sentenceTokens) else { continue }
+                    let end = start + candidateTokens.count
+                    guard end < sentenceTokens.count, sentenceTokens[end] == aux else { continue }
+                    if description.allSatisfy({ sentenceTokens[end...].contains($0) }) { return true }
+                }
+            }
+        }
+        // "Who did Maya give ...?": candidate is a non-subject participant
+        // after the questioned verb, with the questioned subject before it.
+        return followsQuestionedVerb(candidateTokens: candidateTokens, rest: rest,
+                                     sentences: sentences, maxDistance: 4)
+    }
+
+    private static func isColorAnswer(candidateTokens: [String], questionTokens: [String],
+                                      passage: String) -> Bool {
+        guard candidateTokens.count == 1, colors.contains(candidateTokens[0]) else { return false }
+        // The questioned noun is the last content token ("the box's lid"
+        // asks about the lid, not the box).
+        let excluded: Set<String> = ["what", "color", "colour", "is", "was", "were", "are",
+                                     "the", "a", "an", "s"]
+        guard let noun = questionTokens.last(where: { !excluded.contains($0) }) else { return false }
+        let color = candidateTokens[0]
         for sentence in SolverService.passageSentences(passage) {
             let sentenceTokens = tokens(sentence)
-            guard let candidateStart = firstIndex(of: candidateTokens, in: sentenceTokens) else { continue }
-            for verb in verbCandidates {
-                for index in sentenceTokens.indices
-                where sharesStem(sentenceTokens[index], verb) {
-                    if candidateStart > index, candidateStart - index <= 2 { return true }
+            for index in sentenceTokens.indices where sentenceTokens[index] == color {
+                if index + 1 < sentenceTokens.count, nounMatches(sentenceTokens[index + 1], noun) {
+                    return true
+                }
+                for nounIndex in sentenceTokens.indices
+                where nounMatches(sentenceTokens[nounIndex], noun)
+                    && index - nounIndex >= 1 && index - nounIndex <= 3 {
+                    return true
                 }
             }
         }
         return false
     }
 
-    private static func sharesStem(_ a: String, _ b: String) -> Bool {
-        let stem = min(a.count, b.count)
-        guard stem >= 3 else { return a == b }
-        return a.prefix(stem) == b.prefix(stem) && (a.count <= b.count + 3)
+    private static func isVerbObjectAnswer(candidateTokens: [String], questionTokens: [String],
+                                           passage: String) -> Bool {
+        let rest = Array(questionTokens.dropFirst(2))
+        let sentences = SolverService.passageSentences(passage).map(tokens)
+        return followsQuestionedVerb(candidateTokens: candidateTokens, rest: rest,
+                                     sentences: sentences, maxDistance: 3)
+    }
+
+    /// Shared relational core for who-object and what-did shapes: the
+    /// candidate must start within `maxDistance` tokens after an occurrence
+    /// of the questioned verb in a passage sentence that also contains the
+    /// questioned subject before that verb. The verb is the first rest
+    /// token (after at least one subject token) that governs the candidate;
+    /// subject/object nouns from the question never qualify as the verb,
+    /// and a candidate already named in the question never qualifies.
+    private static func followsQuestionedVerb(candidateTokens: [String], rest: [String],
+                                              sentences: [[String]], maxDistance: Int) -> Bool {
+        guard rest.count >= 2, !candidateTokens.isEmpty else { return false }
+        if candidateTokens.allSatisfy({ rest.contains($0) }) { return false }
+        for verbIndex in 1..<rest.count {
+            let verb = rest[verbIndex]
+            guard verb.count >= 3, !stopwords.contains(verb) else { continue }
+            let subjectTokens = rest[..<verbIndex].filter { !["the", "a", "an"].contains($0) }
+            guard !subjectTokens.isEmpty else { continue }
+            for sentenceTokens in sentences {
+                guard let candidateStart = firstIndex(of: candidateTokens, in: sentenceTokens)
+                else { continue }
+                for index in sentenceTokens.indices where verbMatches(sentenceTokens[index], verb) {
+                    let distance = candidateStart - index
+                    guard distance >= 1, distance <= maxDistance else { continue }
+                    if subjectTokens.allSatisfy({ sentenceTokens[..<index].contains($0) }) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private static func nounMatches(_ token: String, _ noun: String) -> Bool {
+        canonicalNoun(token) == canonicalNoun(noun)
+    }
+
+    private static func canonicalNoun(_ token: String) -> String {
+        if token.hasSuffix("ies"), token.count > 3 { return String(token.dropLast(3)) + "y" }
+        if token.hasSuffix("es"), token.count > 2 { return String(token.dropLast(2)) }
+        if token.hasSuffix("s"), token.count > 1 { return String(token.dropLast()) }
+        return token
+    }
+
+    private static let irregularVerbGroups: [Set<String>] = [
+        ["give", "gave", "given"], ["see", "saw", "seen"], ["take", "took", "taken"],
+        ["go", "went", "gone"], ["eat", "ate", "eaten"], ["write", "wrote", "written"],
+        ["say", "said"], ["make", "made"], ["find", "found"], ["tell", "told"],
+        ["sing", "sang", "sung"], ["run", "ran"], ["swim", "swam", "swum"],
+        ["draw", "drew", "drawn"], ["bring", "brought"], ["buy", "bought"],
+        ["think", "thought"], ["teach", "taught"], ["catch", "caught"],
+        ["leave", "left"], ["keep", "kept"], ["feel", "felt"], ["grow", "grew", "grown"],
+    ]
+
+    private static func verbMatches(_ token: String, _ verb: String) -> Bool {
+        if token == verb { return true }
+        if irregularVerbGroups.contains(where: { $0.contains(token) && $0.contains(verb) }) {
+            return true
+        }
+        let tokenStem = verbStem(token)
+        return tokenStem == verbStem(verb) && tokenStem.count >= 3
+    }
+
+    private static func verbStem(_ token: String) -> String {
+        if token.hasSuffix("ing"), token.count > 5 { return String(token.dropLast(3)) }
+        if token.hasSuffix("ed"), token.count > 4 { return String(token.dropLast(2)) }
+        if token.hasSuffix("ies"), token.count > 3 { return String(token.dropLast(3)) + "y" }
+        if token.hasSuffix("es"), token.count > 3 { return String(token.dropLast(2)) }
+        if token.hasSuffix("s"), token.count > 3 { return String(token.dropLast()) }
+        return token
     }
 
     private static func firstIndex(of needle: [String], in haystack: [String]) -> Int? {
