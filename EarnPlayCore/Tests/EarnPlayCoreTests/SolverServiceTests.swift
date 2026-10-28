@@ -435,6 +435,80 @@ final class SolverServiceTests: XCTestCase {
         }
         XCTAssertEqual(evidence, "Dr. Maya planted 3.5 rows of seeds, laughing.")
     }
+
+    // MARK: Fix round 4 Finding 1 — sentence-final ordinary words are boundaries
+
+    func testReadingSentenceFinalOrdinaryWordsAreBoundaries() {
+        let cases: [(passage: String, answer: String)] = [
+            ("Maya said no. Birds flew away.", "no birds"),
+            ("Maya ate a fig. Birds flew away.", "fig birds"),
+            ("Maya did one rep. Birds flew away.", "rep birds"),
+        ]
+        for (passage, answer) in cases {
+            XCTAssertEqual(
+                solver.verifyReadingSupport(passage: passage, proposedAnswer: answer),
+                .unsupported,
+                "cross-sentence span must be unsupported: \(passage) / \(answer)")
+        }
+    }
+
+    func testReadingGenuineAbbreviationsStillSupported() {
+        guard case .supported = solver.verifyReadingSupport(
+            passage: "Dr. Maya planted seeds. Birds flew away.",
+            proposedAnswer: "Dr. Maya planted seeds") else {
+            return XCTFail("title abbreviation inside one sentence must stay supported")
+        }
+        guard case .supported = solver.verifyReadingSupport(
+            passage: "See Fig. 3 for the seeds. Birds flew away.",
+            proposedAnswer: "Fig. 3") else {
+            return XCTFail("label abbreviation followed by a number must stay supported")
+        }
+    }
+
+    // MARK: Fix round 4 Finding 2 — decimals, line breaks, distinct numbers
+
+    func testReadingDecimalAnswerSupported() {
+        let verdict = solver.verifyReadingSupport(
+            passage: "Maya walked 2.5 miles.", proposedAnswer: "2.5 miles")
+        guard case .supported(let evidence) = verdict else {
+            return XCTFail("expected supported, got \(verdict)")
+        }
+        XCTAssertEqual(evidence, "Maya walked 2.5 miles.")
+    }
+
+    func testReadingLineBreakInsideAnswerSupported() {
+        let verdict = solver.verifyReadingSupport(
+            passage: "Maya planted twelve sunflower\nseeds in the garden. She watered them.",
+            proposedAnswer: "twelve sunflower seeds")
+        guard case .supported = verdict else {
+            return XCTFail("line break inside a sentence must stay supported, got \(verdict)")
+        }
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "Maya planted seeds.\nBirds ate them.",
+                proposedAnswer: "seeds birds"),
+            .unsupported)
+    }
+
+    func testReadingDistinctNumbersNotConflated() {
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "Maya walked 2.5 miles.", proposedAnswer: "25 miles"),
+            .unsupported)
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "Maya walked 25 miles.", proposedAnswer: "2.5 miles"),
+            .unsupported)
+        XCTAssertEqual(
+            solver.verifyReadingSupport(
+                passage: "Maya walked 2.5 miles.", proposedAnswer: "2 5 miles"),
+            .unsupported)
+        let p = problem(.readingComprehension, passage: "Maya walked 2.5 miles.",
+                        candidate: "2.5 miles")
+        XCTAssertEqual(solver.checkAnswer(p, proposedAnswer: "25 miles"),
+                       .incorrect(expected: "2.5 miles"))
+        XCTAssertEqual(solver.checkAnswer(p, proposedAnswer: "2.5 miles"), .correct)
+    }
 }
 
 // MARK: - Finding 6 acceptance coverage (issue #3)

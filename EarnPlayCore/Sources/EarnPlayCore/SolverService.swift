@@ -482,17 +482,27 @@ public struct SolverService: Sendable {
     }
 
     /// Splits a passage into sentences without dropping punctuation.
-    /// A boundary is a terminator (`.`, `!`, `?`, or newline) followed by
-    /// whitespace or the end of the passage; closing quotes/brackets after
-    /// a terminator stay with their sentence. Periods inside a sentence —
-    /// decimals and abbreviations — are not boundaries, and commas,
-    /// quotes, apostrophes, and other internal punctuation are kept
-    /// verbatim in the returned sentences.
+    /// A boundary is a terminator (`.`, `!`, `?`) followed by whitespace
+    /// or the end of the passage; closing quotes/brackets after a
+    /// terminator stay with their sentence. Periods inside a sentence —
+    /// decimals and unambiguous abbreviations — are not boundaries, and
+    /// commas, quotes, apostrophes, and other internal punctuation are
+    /// kept verbatim in the returned sentences. A line break is not by
+    /// itself a boundary: it is whitespace unless the next line starts
+    /// a new sentence (an uppercase letter). An abbreviation period is
+    /// suppressed only in unambiguous context — a lowercase or numeric
+    /// continuation, a numeric label (`Fig.`/`No.`/`Vol.`) before a
+    /// digit, or a capitalized title before a proper name. Sentence-
+    /// final ordinary words (`no`, `fig`, `rep`, …) are boundaries.
     static func passageSentences(_ passage: String) -> [String] {
         let abbreviations: Set<String> = [
             "dr", "mr", "mrs", "ms", "st", "jr", "sr", "prof", "sgt",
             "capt", "lt", "gen", "sen", "rep", "gov", "fig", "no", "vol",
         ]
+        let titles: Set<String> = [
+            "dr", "mr", "mrs", "ms", "prof", "sgt", "capt", "lt", "gen", "sen", "rep", "gov",
+        ]
+        let numericLabels: Set<String> = ["fig", "no", "vol"]
         let closers: Set<Character> = ["\"", "'", "\u{201D}", "\u{2019}", ")", "]", "}"]
         let chars = Array(passage)
         var sentences: [String] = []
@@ -505,9 +515,16 @@ public struct SolverService: Sendable {
         var i = 0
         while i < chars.count {
             let c = chars[i]
-            if c == "\n" {
-                flush()
-                i += 1
+            if c == "\n" || c == "\r" {
+                var j = i + 1
+                while j < chars.count, chars[j].isWhitespace { j += 1 }
+                if j < chars.count, chars[j].isUppercase {
+                    flush()
+                    i = j
+                } else {
+                    current.append(" ")
+                    i += 1
+                }
                 continue
             }
             current.append(c)
@@ -518,10 +535,25 @@ public struct SolverService: Sendable {
                 if atEnd || chars[j].isWhitespace {
                     var isInternalPeriod = false
                     if c == "." {
-                        let word = current.dropLast()
+                        let token = current.dropLast()
                             .split(whereSeparator: { !$0.isLetter })
-                            .last.map(String.init)?.lowercased() ?? ""
-                        isInternalPeriod = abbreviations.contains(word)
+                            .last.map(String.init) ?? ""
+                        let word = token.lowercased()
+                        if abbreviations.contains(word) {
+                            var k = j
+                            while k < chars.count, chars[k].isWhitespace { k += 1 }
+                            let next = k < chars.count ? chars[k] : nil
+                            if let next, next.isLowercase {
+                                isInternalPeriod = true
+                            } else if let next, next.isNumber,
+                                      numericLabels.contains(word) {
+                                isInternalPeriod = true
+                            } else if let next, next.isUppercase,
+                                      token.first?.isUppercase == true,
+                                      titles.contains(word) {
+                                isInternalPeriod = true
+                            }
+                        }
                     }
                     if !isInternalPeriod {
                         for k in (i + 1)..<j { current.append(chars[k]) }
@@ -544,10 +576,36 @@ public struct SolverService: Sendable {
         return verifyReadingSupport(passage: passage, proposedAnswer: proposedAnswer)
     }
 
+    /// Lowercases and tokenizes on non-alphanumeric boundaries, keeping
+    /// numeric punctuation inside a number: `2.5` stays one token (never
+    /// `2 5` or `25`), `1/2` stays one token, and a thousands comma is
+    /// dropped (`1,000` becomes `1000`). Distinct numbers therefore
+    /// never conflate during support checks or reading grading.
     static func normalizeForSupport(_ text: String) -> String {
-        let lowered = text.lowercased()
-        let words = lowered.components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-        return words.joined(separator: " ")
+        let chars = Array(text.lowercased())
+        var tokens: [String] = []
+        var current = ""
+        func flushToken() {
+            if !current.isEmpty { tokens.append(current) }
+            current = ""
+        }
+        for index in chars.indices {
+            let c = chars[index]
+            if c.isLetter || c.isNumber {
+                current.append(c)
+            } else if (c == "." || c == "/"),
+                      current.last?.isNumber == true,
+                      index + 1 < chars.count, chars[index + 1].isNumber {
+                current.append(c)
+            } else if c == ",",
+                      current.last?.isNumber == true,
+                      index + 1 < chars.count, chars[index + 1].isNumber {
+                continue
+            } else {
+                flushToken()
+            }
+        }
+        flushToken()
+        return tokens.joined(separator: " ")
     }
 }
