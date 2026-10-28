@@ -189,6 +189,11 @@ public final class QuestionGenerator: @unchecked Sendable {
     private let makeQuestionID: @Sendable () -> String
 
     private let lock = NSLock()
+    /// Serializes fallback selection, verification, and rotation
+    /// advancement as one operation (round-4 F4). Held only around the
+    /// fallback serve; never acquired while `lock` is held, and fallback
+    /// helpers acquire `lock` (never the reverse), so lock order is fixed.
+    private let fallbackLock = NSLock()
     private var formRotation = 0
     private var questionCounter = 0
     private var fallbackRotation: [SolverSkill: Int] = [:]
@@ -298,9 +303,25 @@ public final class QuestionGenerator: @unchecked Sendable {
         // solver verified when the bank was built, and the serve below
         // re-verifies with this question's own id, so the fallback path
         // is verified by construction, not by trust.
-        // F3 (round 3): scan the skill's entries once in round-robin
-        // order, skipping presentation-invalid (or no longer verifying)
-        // candidates, instead of throwing when only the first is unusable.
+        if let fallbackResult = serveFallback(for: request, log: log) {
+            return fallbackResult
+        }
+        throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
+    }
+
+    /// Fallback serve, serialized as one operation under `fallbackLock`:
+    /// scan, presentation check, solver verification, and rotation
+    /// advancement all complete before any other caller may scan, so two
+    /// concurrent `generate` calls can never capture the same fallback
+    /// start, serve the same entry out of turn, or overwrite each other's
+    /// rotation advance (round-4 F4). Within the serve, F3 (round 3)
+    /// applies: scan the skill's entries once in round-robin order,
+    /// skipping presentation-invalid (or no longer verifying) candidates,
+    /// instead of failing when only the first is unusable.
+    private func serveFallback(for request: QuestionGenerationRequest,
+                               log: [GenerationAttemptLog]) -> QuestionGenerationResult? {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
         let (fallbackStart, fallbackCandidates) = fallbackScan(for: request.skill)
         for (offset, fallback) in fallbackCandidates.enumerated() {
             guard case .ready(let checkedFallback) = Self.checkedForPresentation(fallback) else {
@@ -323,7 +344,7 @@ public final class QuestionGenerator: @unchecked Sendable {
                 continue
             }
         }
-        throw QuestionGenerationError.noVerifiedFallback(skill: request.skill.rawValue)
+        return nil
     }
 
     private enum PresentationCheck {
@@ -418,14 +439,21 @@ public final class QuestionGenerator: @unchecked Sendable {
 /// - a vetted fallback-bank (passage, question, answer) tuple, matched
 ///   on normalized passage, question, and candidate;
 /// - a color question, whose candidate colors the questioned noun in
-///   the passage (adjective before it, or predicative after it);
+///   the passage under a supported, non-negated template: adjective
+///   immediately before the noun, or predicative after it (noun +
+///   copula + optional intensifier + color). Any other construction —
+///   negated, or mere proximity after the noun — fails closed;
 /// - a how-many/much question, whose candidate number is the quantity
 ///   of the questioned noun in the passage;
 /// - a who question, whose candidate is the subject (or, for an
 ///   auxiliary question, the non-subject participant) of the questioned
-///   verb in the passage;
-/// - a what-did question, whose candidate follows the questioned verb
-///   (with the questioned subject before that verb) in the passage.
+///   verb in the passage, with the rest of the questioned clause
+///   (recipient/object after the verb) matching that same clause;
+/// - a what-did question, whose candidate is the questioned verb's
+///   actual object span (only determiners/quantities between verb and
+///   candidate, the questioned subject before that verb) in the
+///   passage. A noun in a following prepositional phrase is not the
+///   object, however close to the verb it sits.
 enum ReadingPresentationVerifier {
     private static let colors: Set<String> = [
         "red", "orange", "yellow", "green", "blue", "purple", "pink",
@@ -524,12 +552,23 @@ enum ReadingPresentationVerifier {
         let sentences = SolverService.passageSentences(passage).map(tokens)
         if !auxiliaries.contains(questionTokens[1]) {
             // "Who gave ...?": candidate must be the subject span directly
-            // before the questioned verb in a passage sentence.
+            // before the questioned verb in a passage sentence, and the
+            // rest of the questioned clause (recipient/object after the
+            // verb) must match that same sentence after the verb. Matching
+            // candidate + verb alone accepts the subject of a different
+            // clause ("Maya gave Leo a book. Nora gave Sam a pen." /
+            // "Who gave Sam a pen?" must not accept Maya).
             let verb = questionTokens[1]
+            let questionedTail = questionTokens.dropFirst(2)
+                .filter { !["the", "a", "an"].contains($0) }
             for sentenceTokens in sentences {
                 guard let start = firstIndex(of: candidateTokens, in: sentenceTokens) else { continue }
                 let end = start + candidateTokens.count
-                if end < sentenceTokens.count, verbMatches(sentenceTokens[end], verb) { return true }
+                guard end < sentenceTokens.count, verbMatches(sentenceTokens[end], verb) else { continue }
+                let afterVerb = sentenceTokens[(end + 1)...]
+                if questionedTail.allSatisfy({ tailToken in
+                    afterVerb.contains(where: { nounMatches($0, tailToken) })
+                }) { return true }
             }
             return false
         }
@@ -563,15 +602,33 @@ enum ReadingPresentationVerifier {
                                      "the", "a", "an", "s"]
         guard let noun = questionTokens.last(where: { !excluded.contains($0) }) else { return false }
         let color = candidateTokens[0]
+        let negations: Set<String> = ["not", "no", "never", "isn", "aren", "wasn", "weren"]
+        let copulas: Set<String> = ["is", "are", "was", "were"]
+        let intensifiers: Set<String> = ["very", "bright", "dark", "light", "pale", "deep", "really"]
         for sentence in SolverService.passageSentences(passage) {
             let sentenceTokens = tokens(sentence)
-            for index in sentenceTokens.indices where sentenceTokens[index] == color {
-                if index + 1 < sentenceTokens.count, nounMatches(sentenceTokens[index + 1], noun) {
-                    return true
-                }
-                for nounIndex in sentenceTokens.indices
-                where nounMatches(sentenceTokens[nounIndex], noun)
-                    && index - nounIndex >= 1 && index - nounIndex <= 3 {
+            for nounIndex in sentenceTokens.indices where nounMatches(sentenceTokens[nounIndex], noun) {
+                for colorIndex in sentenceTokens.indices where sentenceTokens[colorIndex] == color {
+                    // Attributive template: the color immediately precedes
+                    // the noun ("a blue box"), unnegated.
+                    if colorIndex + 1 == nounIndex,
+                       colorIndex == 0 || !negations.contains(sentenceTokens[colorIndex - 1]) {
+                        return true
+                    }
+                    // Predicative template: noun immediately before a
+                    // copula, then only intensifiers, then the color
+                    // ("the box is blue"). Anything between the noun and
+                    // the color beyond that template — a negation ("the
+                    // box is not red"), another noun, a prepositional
+                    // phrase — is unsupported and fails closed.
+                    guard nounIndex < colorIndex else { continue }
+                    let between = sentenceTokens[(nounIndex + 1)..<colorIndex]
+                    guard let copulaOffset = between.firstIndex(where: { copulas.contains($0) }),
+                          copulaOffset == between.startIndex else { continue }
+                    let afterCopula = between[(copulaOffset + 1)...]
+                    guard afterCopula.allSatisfy({ intensifiers.contains($0) }),
+                          !sentenceTokens[nounIndex...colorIndex].contains(where: { negations.contains($0) })
+                    else { continue }
                     return true
                 }
             }
@@ -609,6 +666,15 @@ enum ReadingPresentationVerifier {
                 for index in sentenceTokens.indices where verbMatches(sentenceTokens[index], verb) {
                     let distance = candidateStart - index
                     guard distance >= 1, distance <= maxDistance else { continue }
+                    // The candidate must be the verb's actual object span:
+                    // only determiners / quantities may intervene between
+                    // the verb and the candidate ("watered the flowers").
+                    // Any other intervening token — the real object, or a
+                    // preposition opening a following phrase ("planted
+                    // seeds beside roses") — means the candidate is not
+                    // the object, however close it sits to the verb.
+                    let intervening = sentenceTokens[(index + 1)..<candidateStart]
+                    guard intervening.allSatisfy({ isObjectBridgeToken($0) }) else { continue }
                     if subjectTokens.allSatisfy({ sentenceTokens[..<index].contains($0) }) {
                         return true
                     }
@@ -616,6 +682,15 @@ enum ReadingPresentationVerifier {
             }
         }
         return false
+    }
+
+    /// Tokens allowed between a verb and its object span: determiners and
+    /// quantities only. A noun, verb, or preposition in this slot means the
+    /// candidate is not the verb's object.
+    private static func isObjectBridgeToken(_ token: String) -> Bool {
+        if ["the", "a", "an", "some", "any", "this", "that"].contains(token) { return true }
+        if numberWords.contains(token) { return true }
+        return !token.isEmpty && token.allSatisfy(\.isNumber)
     }
 
     private static func nounMatches(_ token: String, _ noun: String) -> Bool {

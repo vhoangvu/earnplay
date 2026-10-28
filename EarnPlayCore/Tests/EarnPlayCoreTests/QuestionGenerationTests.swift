@@ -802,4 +802,109 @@ final class QuestionGenerationTests: XCTestCase {
                           ModelQuestionProposer.samplingSeed(
                             for: QuestionGenerationRequest(skill: .division).forAttempt(1, formHint: .story, variationIndex: 4)))
     }
+
+    // MARK: - Copilot round-4 regressions (tests-first)
+
+    func testR4F1WhoAnswerMustMatchFullQuestionedClause() throws {
+        let passage = "Maya gave Leo a book. Nora gave Sam a pen."
+        let question = "Who gave Sam a pen?"
+        let bad = readingProposal(passage: passage, candidate: "Maya", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "subject of a different clause must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "Maya")
+        XCTAssertEqual(badResult.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "Nora", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "Nora")
+        assertReallyVerified(goodResult)
+    }
+
+    func testR4F2NegatedColorIsNotAnAssertedColor() throws {
+        let passage = "The box is not red. It is blue."
+        let question = "What color is the box?"
+        let bad = readingProposal(passage: passage, candidate: "red", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "negated color must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "red")
+        XCTAssertEqual(badResult.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(badResult)
+
+        let predicative = readingProposal(passage: "The box is blue.", candidate: "blue", question: question)
+        let predGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(predicative)]))
+        let predResult = try predGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(predResult.source, .modelVerified)
+        XCTAssertEqual(predResult.question.verifiedAnswer, "blue")
+        assertReallyVerified(predResult)
+
+        let attributive = readingProposal(passage: "The red box is on the table.", candidate: "red", question: question)
+        let attrGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(attributive)]))
+        let attrResult = try attrGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(attrResult.source, .modelVerified)
+        XCTAssertEqual(attrResult.question.verifiedAnswer, "red")
+        assertReallyVerified(attrResult)
+    }
+
+    func testR4F3VerbObjectMustBeActualObjectNotPrepositionalNoun() throws {
+        let passage = "Maya planted seeds beside roses."
+        let question = "What did Maya plant?"
+        let bad = readingProposal(passage: passage, candidate: "roses", question: question)
+        let badGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(bad)]), maxAttempts: 1)
+        let badResult = try badGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(badResult.usedFallback, "noun in a prepositional phrase must fall back, got \(badResult.question)")
+        XCTAssertNotEqual(badResult.question.verifiedAnswer, "roses")
+        XCTAssertEqual(badResult.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(badResult)
+
+        let good = readingProposal(passage: passage, candidate: "seeds", question: question)
+        let goodGen = QuestionGenerator(proposer: StubProposer(steps: [.proposal(good)]))
+        let goodResult = try goodGen.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(goodResult.source, .modelVerified)
+        XCTAssertEqual(goodResult.question.verifiedAnswer, "seeds")
+        assertReallyVerified(goodResult)
+    }
+
+    func testR4F4ConcurrentFallbackServingReservesDistinctRotations() throws {
+        final class NothingProposer: QuestionProposing, @unchecked Sendable {
+            func propose(request: QuestionGenerationRequest) throws -> ProposedProblem? { nil }
+        }
+        let bank = FallbackQuestionBank(proposals: [
+            ProposedProblem(skill: .multiplicationFacts, form: .story, operands: [2, 3], promptText: "Two groups of three."),
+            ProposedProblem(skill: .multiplicationFacts, form: .story, operands: [3, 4], promptText: "Three groups of four."),
+            ProposedProblem(skill: .multiplicationFacts, form: .story, operands: [4, 5], promptText: "Four groups of five."),
+            ProposedProblem(skill: .multiplicationFacts, form: .story, operands: [5, 6], promptText: "Five groups of six."),
+        ])
+        XCTAssertEqual(bank.entries.count, 4)
+        let generator = QuestionGenerator(proposer: NothingProposer(), fallbackBank: bank, maxAttempts: 1)
+        final class Collector: @unchecked Sendable {
+            private let lock = NSLock()
+            private(set) var prompts: [String] = []
+            private(set) var errors: [String] = []
+            func addPrompt(_ prompt: String) { lock.lock(); prompts.append(prompt); lock.unlock() }
+            func addError(_ error: String) { lock.lock(); errors.append(error); lock.unlock() }
+        }
+        let collector = Collector()
+        DispatchQueue.concurrentPerform(iterations: 40) { _ in
+            do {
+                let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
+                collector.addPrompt(result.question.promptText)
+            } catch {
+                collector.addError(String(describing: error))
+            }
+        }
+        let prompts = collector.prompts
+        let errors = collector.errors
+        XCTAssertTrue(errors.isEmpty, "concurrent fallback serving must not throw: \(errors)")
+        XCTAssertEqual(prompts.count, 40)
+        var counts: [String: Int] = [:]
+        for prompt in prompts { counts[prompt, default: 0] += 1 }
+        XCTAssertEqual(counts.count, 4, "every fallback entry must be served, got \(counts)")
+        XCTAssertTrue(counts.values.allSatisfy { $0 == 10 },
+                      "serialized round-robin must serve each entry exactly 10 times, got \(counts)")
+    }
 }
