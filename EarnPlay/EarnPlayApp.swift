@@ -20,6 +20,8 @@ struct ContentView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Divider()
+                ReadAloudPreviewView()
+                Divider()
                 SpikeView()
             }
             .padding()
