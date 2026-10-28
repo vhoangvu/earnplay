@@ -452,7 +452,15 @@ public struct FileSkillProfileStore: SkillProfileStore {
 
     public func save(_ profile: SkillProfile) throws {
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        // Encode with fractional seconds so a sub-second `completedAt`
+        // (e.g. from `Date()`) survives a round trip exactly at
+        // millisecond precision; `.iso8601` would truncate it.
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var container = encoder.singleValueContainer()
+            try container.encode(formatter.string(from: date))
+        }
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(profile)
         try FileManager.default.createDirectory(
@@ -464,7 +472,21 @@ public struct FileSkillProfileStore: SkillProfileStore {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         let data = try Data(contentsOf: fileURL)
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        // Decode fractional seconds first, then fall back to plain
+        // ISO8601: a fractional-only formatter fails on whole-second
+        // strings persisted before this fix on some OS versions.
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let string = try container.decode(String.self)
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: string) { return date }
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            if let date = plain.date(from: string) { return date }
+            throw DecodingError.dataCorruptedError(
+                in: container, debugDescription: "Invalid ISO8601 date: \(string)")
+        }
         return try decoder.decode(SkillProfile.self, from: data)
     }
 }

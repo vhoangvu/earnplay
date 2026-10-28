@@ -547,4 +547,50 @@ final class DiagnosticTests: XCTestCase {
         try Data("not json".utf8).write(to: url)
         XCTAssertThrowsError(try FileSkillProfileStore(fileURL: url).load())
     }
+
+    // MARK: - Copilot round-4 regression tests
+
+    func testProfilePersistencePreservesFractionalSeconds() throws {
+        // Millisecond-aligned fractional date: ISO8601 fractional
+        // formatting preserves it exactly, whole-second does not.
+        let profile = SkillProfile(
+            grade: "4",
+            estimates: [SkillEstimate(area: .fractions, level: .proficient, accuracy: 1.0,
+                                      itemsAttempted: 5, itemsCorrect: 5,
+                                      medianResponseMs: 2_000, recommendedDifficulty: 2)],
+            diagnosticSessionId: "diag-r4-fractional",
+            completedAt: Date(timeIntervalSince1970: 1_700_000_000.123),
+            isComplete: true)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("diag-r4-\(UUID().uuidString)/profile.json")
+        let store = FileSkillProfileStore(fileURL: url)
+        try store.save(profile)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded?.completedAt, profile.completedAt)
+        XCTAssertEqual(loaded, profile)
+    }
+
+    func testProfilePersistenceDecodesLegacyWholeSecondISO8601() throws {
+        // Profiles persisted before the fractional-second fix carry a
+        // whole-second ISO8601 completedAt; they must still decode.
+        let legacyJSON = """
+        {"completedAt":"2023-11-14T22:13:20Z","diagnosticSessionId":"diag-r4-legacy","estimates":[{"accuracy":1,"area":"fractions","itemsAttempted":5,"itemsCorrect":5,"level":"proficient","medianResponseMs":2000,"recommendedDifficulty":2}],"grade":"4","isComplete":true}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("diag-r4-legacy-\(UUID().uuidString)/profile.json")
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(legacyJSON.utf8).write(to: url)
+        let loaded = try FileSkillProfileStore(fileURL: url).load()
+        let expected = SkillProfile(
+            grade: "4",
+            estimates: [SkillEstimate(area: .fractions, level: .proficient, accuracy: 1.0,
+                                      itemsAttempted: 5, itemsCorrect: 5,
+                                      medianResponseMs: 2_000, recommendedDifficulty: 2)],
+            diagnosticSessionId: "diag-r4-legacy",
+            completedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            isComplete: true)
+        XCTAssertEqual(loaded?.completedAt, expected.completedAt)
+        XCTAssertEqual(loaded, expected)
+    }
 }
