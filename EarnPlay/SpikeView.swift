@@ -1,14 +1,14 @@
 import SwiftUI
 import EarnPlayCore
 
-/// Minimal T0.2 spike/debug screen: runs one fixed prompt on-device and
-/// shows the round-trip latency. This is the screen the card's manual
-/// Airplane Mode test uses (human checkpoint, not an automated step).
+/// Minimal T0.2 spike/debug screen: runs one fixed prompt on-device.
 ///
-/// The model file is never bundled. Install it with
-/// `Scripts/setup-model-spike.sh` (simulator) or copy a GGUF named
-/// `EarnPlayModel.gguf` into the app's Documents (device). Without a
-/// model the screen says so — it never invents a response.
+/// Inference uses the PERSISTED production registry's active bundle
+/// artifacts (T5.3 F2/F6): the model file and prompt texts come from
+/// `VersionRegistry.inferenceArtifacts()`, so after a rollback the
+/// rolled-back model/prompts are the ones actually loaded — never
+/// the current artifacts under an old label. Without a model the
+/// screen says so — it never invents a response.
 struct SpikeView: View {
     @State private var selectedPrompt = 0
     @State private var responseText = ""
@@ -17,36 +17,63 @@ struct SpikeView: View {
     @State private var warmText = "—"
     @State private var isRunning = false
     @State private var runCount = 0
-    @State private var runtime: ModelRuntime? = {
-        guard let url = ModelRuntime.defaultModelURL() else { return nil }
-        return ModelRuntime(modelPath: url)
-    }()
+
+    private let artifacts: InferenceArtifacts?
+    private let artifactError: String?
+    @State private var runtime: ModelRuntime?
+
+    init() {
+        var resolved: InferenceArtifacts?
+        var message: String?
+        do {
+            let registry = try VersionRegistry.production()
+            resolved = try registry.inferenceArtifacts()
+        } catch {
+            message = "Version artifacts unavailable: \(String(describing: error))"
+        }
+        self.artifacts = resolved
+        self.artifactError = message
+        if let url = resolved?.modelURL {
+            _runtime = State(initialValue: ModelRuntime(modelPath: url))
+        }
+    }
+
+    private var prompts: [String] { artifacts?.prompts ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Model spike (T0.2)")
                 .font(.headline)
-            Text(ModelRuntime.modelIdentifier)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(ModelRuntime.runtimeIdentifier)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Picker("Prompt", selection: $selectedPrompt) {
-                ForEach(SpikePrompts.all.indices, id: \.self) { index in
-                    Text("Prompt \(index + 1)").tag(index)
-                }
+            if let artifacts {
+                Text("Model version: \(artifacts.modelVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Prompt version: \(artifacts.promptVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .pickerStyle(.segmented)
+            if let artifactError {
+                Text(artifactError)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-            Text(SpikePrompts.all[selectedPrompt])
-                .font(.subheadline)
+            if !prompts.isEmpty {
+                Picker("Prompt", selection: $selectedPrompt) {
+                    ForEach(prompts.indices, id: \.self) { index in
+                        Text("Prompt \(index + 1)").tag(index)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(prompts[min(selectedPrompt, prompts.count - 1)])
+                    .font(.subheadline)
+            }
 
             Button(isRunning ? "Running…" : "Run prompt") {
                 run()
             }
-            .disabled(isRunning || runtime == nil)
+            .disabled(isRunning || runtime == nil || prompts.isEmpty)
 
             Text(statusText)
                 .font(.caption)
@@ -71,10 +98,10 @@ struct SpikeView: View {
     }
 
     private func run() {
-        guard let runtime else { return }
+        guard let runtime, !prompts.isEmpty else { return }
         isRunning = true
         statusText = "Running on-device…"
-        let prompt = SpikePrompts.all[selectedPrompt]
+        let prompt = prompts[min(selectedPrompt, prompts.count - 1)]
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {

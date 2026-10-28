@@ -94,6 +94,43 @@ final class ModelRuntimeTests: XCTestCase {
         XCTAssertEqual(results.coldFlags.filter { $0 }.count, 1, "exactly one concurrent caller may report a cold start")
     }
 
+    // F5: a non-Llama GGUF is stamped under its true file identity.
+    func testVerifiedIdentityForNonLlamaGGUF() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("TinyTestModel.gguf")
+        try Data([0x47, 0x47, 0x55, 0x46, 0, 0, 0, 0, 0, 0, 0, 0]).write(to: url)
+        let stamp = try ModelRuntime.verifiedModelVersion(forModelAt: url)
+        XCTAssertEqual(stamp, "TinyTestModel.gguf (12 bytes, GGUF) / llama.cpp b11935, CPU backend")
+        XCTAssertFalse(stamp.contains("Llama-3.2-1B"))
+        XCTAssertEqual(try ModelRuntime(modelPath: url).verifiedVersionStamp(),
+                       "TinyTestModel.gguf (12 bytes, GGUF) / llama.cpp b11935, CPU backend")
+    }
+
+    // F5: a non-GGUF file is rejected, never stamped as Llama.
+    func testVerifiedIdentityRejectsNonGGUF() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("NotAModel.gguf")
+        try Data("plain text, not a model".utf8).write(to: url)
+        XCTAssertThrowsError(try ModelRuntime.verifiedModelVersion(forModelAt: url)) { error in
+            XCTAssertEqual(error as? ModelRuntimeError, .invalidModelFile(path: url.path))
+        }
+        let runtime = ModelRuntime(modelPath: url)
+        XCTAssertThrowsError(try runtime.load()) { error in
+            guard let e = error as? ModelRuntimeError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            if ModelRuntime.isRuntimeLinked {
+                XCTAssertEqual(e, .invalidModelFile(path: url.path))
+            } else {
+                XCTAssertEqual(e, .runtimeUnavailable)
+            }
+        }
+    }
+
     /// Regression (Copilot re-review, PR #33): a huge maxTokens must
     /// clamp to the remaining context instead of overflowing
     /// `n_prompt + max_tokens` in the C shim (signed-overflow UB).

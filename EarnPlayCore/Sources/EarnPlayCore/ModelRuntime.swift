@@ -17,6 +17,9 @@ public enum ModelRuntimeError: Error, Equatable, Sendable {
     case generationFailed(String)
     /// The caller passed an empty prompt.
     case emptyPrompt
+    /// The file exists but is not a GGUF model (bad magic), so its
+    /// identity cannot be verified as a model artifact (T5.3 F5).
+    case invalidModelFile(path: String)
 }
 
 /// One prompt-to-response round-trip, with latency split so the spike
@@ -87,12 +90,44 @@ public final class ModelRuntime: @unchecked Sendable {
         "(bartowski/Llama-3.2-1B-Instruct-GGUF)"
     /// Runtime exercised by the spike (llama.cpp, MLC-style on-device route).
     public static let runtimeIdentifier = "llama.cpp b11935, CPU backend"
-    /// Model version stamped on every session record (T5.3, LLD
-    /// sections 2.2 and 10.3). Derived from the two identifiers above
-    /// so a session stamp always names the model build actually
-    /// configured — never a copied string that can drift from it.
+    /// Configured spike identity (T5.3, LLD 2.2/10.3). This names
+    /// the model this build was configured for — it is NOT a
+    /// verified stamp for an arbitrary GGUF file. For the identity
+    /// of an actual file on disk use `verifiedModelVersion(forModelAt:)`
+    /// / `verifiedVersionStamp()`, which read the file itself and
+    /// reject non-GGUF files instead of stamping them as Llama.
     public static var versionStamp: String {
         "\(modelIdentifier) / \(runtimeIdentifier)"
+    }
+
+    /// Verified identity of the GGUF file at `url`, derived from
+    /// the file itself (its name, byte count, and GGUF magic) plus
+    /// the runtime. Throws `.modelNotFound` when absent and
+    /// `.invalidModelFile` when the file is not a GGUF — an
+    /// arbitrary file is never reported under the Llama identity.
+    public static func verifiedModelVersion(
+        forModelAt url: URL, fileManager: FileManager = .default
+    ) throws -> String {
+        guard fileManager.fileExists(atPath: url.path) else {
+            throw ModelRuntimeError.modelNotFound(path: url.path)
+        }
+        guard isGGUFFile(at: url) else {
+            throw ModelRuntimeError.invalidModelFile(path: url.path)
+        }
+        let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber) ?? nil
+        return "\(url.lastPathComponent) (\(size?.int64Value ?? 0) bytes, GGUF) / \(runtimeIdentifier)"
+    }
+
+    /// Verified stamp for this instance's own model file.
+    public func verifiedVersionStamp() throws -> String {
+        try Self.verifiedModelVersion(forModelAt: modelPath)
+    }
+
+    static func isGGUFFile(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
+        return data.elementsEqual([0x47, 0x47, 0x55, 0x46]) // "GGUF"
     }
     /// Round-trip budget asserted by the spike tests and recorded in
     /// Docs/ModelRuntimeSpike.md. Generous because simulator CI hosts vary.
@@ -177,6 +212,9 @@ public final class ModelRuntime: @unchecked Sendable {
         }
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw ModelRuntimeError.modelNotFound(path: modelPath.path)
+        }
+        guard Self.isGGUFFile(at: modelPath) else {
+            throw ModelRuntimeError.invalidModelFile(path: modelPath.path)
         }
         #if canImport(CLlamaShim)
         let start = Date()
