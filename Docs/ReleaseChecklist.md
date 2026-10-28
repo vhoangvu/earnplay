@@ -79,12 +79,22 @@ uploaded build follows the same checklist.
         known-good build is still in TestFlight, select / re-enable
         that existing build for the tester group in App Store Connect.
         Nothing is uploaded again.
-      - Publish a rebuilt rollback: restore the known-good source, but
-        assign a NEW build number (`Scripts/bump-version.sh
-        --bump-build`, or `--set-build N` with an unused N), and — when
-        required for an App Store release — a newer marketing version
-        than the release being rolled back. Then repeat steps 1–5 for
-        the rebuilt rollback.
+      - Publish a rebuilt rollback: restore the known-good source.
+        Do NOT use `--bump-build` for this: it only adds 1 to the
+        build number in the restored source, which may already have
+        been uploaded. For example, rolling back from 0.1.0/2 to the
+        source for 0.1.0/1 and running `--bump-build` produces
+        0.1.0/2 again, which App Store Connect rejects as a duplicate.
+        Instead, check App Store Connect / TestFlight for the uploaded
+        builds of the intended marketing version for BOTH apps
+        (EarnPlay and EarnPlayAdmin), note the highest build number
+        uploaded for each, and run `Scripts/bump-version.sh
+        --set-build N` with N greater than both of those highest
+        build numbers (the script writes the same N to both targets;
+        `--set-build` is described under "How versioning works"
+        below). When required for an App Store release, also use a
+        newer marketing version than the release being rolled back.
+        Then repeat steps 1–5 for the rebuilt rollback.
       Model and prompt rollback inside the apps follows
       [VersioningAndRollback.md](VersioningAndRollback.md).
 - [ ] (v1) App Store submission is a separate, later step and is not
