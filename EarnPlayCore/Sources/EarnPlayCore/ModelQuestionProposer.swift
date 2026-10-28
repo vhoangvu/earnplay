@@ -13,7 +13,7 @@ import Foundation
 public final class ModelQuestionProposer: QuestionProposing, @unchecked Sendable {
     /// Prompt-set version for question proposals (LLD 10.3 versioning).
     /// Bump the major number on any wording change.
-    public static let promptVersion = "question-gen-v1"
+    public static let promptVersion = "question-gen-v2"
 
     private let generateWithSeed: @Sendable (String, UInt32) throws -> String
 
@@ -38,7 +38,21 @@ public final class ModelQuestionProposer: QuestionProposing, @unchecked Sendable
 
     public func propose(request: QuestionGenerationRequest) throws -> ProposedProblem? {
         let response = try generateWithSeed(Self.prompt(for: request), Self.samplingSeed(for: request))
-        return ProposedProblemParser.parse(response)
+        guard var proposal = ProposedProblemParser.parse(response) else { return nil }
+        // F6: a well-formed reading reply may carry the passage in its
+        // own field and only the question in "promptText". Assemble the
+        // combined passage-and-question text here, before the loop's
+        // presentation validation, so such a reply is not wasted.
+        if proposal.skill == .readingComprehension,
+           let passage = proposal.passage {
+            let trimmedPassage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
+            let question = proposal.promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedPassage.isEmpty, !question.isEmpty,
+               !proposal.promptText.contains(trimmedPassage) {
+                proposal.promptText = "Read: \(trimmedPassage) \(question)"
+            }
+        }
+        return proposal
     }
 
     /// Deterministic per-request seed (F4): same request replay gives the
@@ -65,7 +79,7 @@ public final class ModelQuestionProposer: QuestionProposing, @unchecked Sendable
         - Do NOT state the final answer anywhere. The answer is computed by a separate checker.
         - For fraction skills, give "fractions" as strings like "3/4".
         - For word problems, give "operation" as one of: add, subtract, multiply, divide.
-        - For reading, give a short "passage" and a "candidateAnswer" copied word for word from the passage.
+        - For reading, give a short "passage", a "candidateAnswer" copied word for word from the passage that directly answers the question (for example a color word for a color question), and a combined "promptText" that contains the passage word for word followed by the short question, like "Read: <passage> <question>".
         - Stay inside grade \(request.grade) ranges (multiplication facts up to 12x12).
 
         Reply with only this JSON shape:

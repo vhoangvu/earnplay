@@ -462,6 +462,192 @@ final class QuestionGenerationTests: XCTestCase {
         }
     }
 
+    // MARK: - Copilot round-2 regressions (tests-first)
+
+    func testR2F1WordSubtractInvalidWhichIsWrongRetriesNotTrap() throws {
+        let invalid = ProposedProblem(
+            skill: .wordProblem, form: .whichIsWrong, operands: [3, 10], operation: .subtract,
+            promptText: "A baker made 3 muffins. Then 10 were sold. How many left?")
+        let valid = ProposedProblem(
+            skill: .wordProblem, form: .story, operands: [50, 18], operation: .subtract,
+            promptText: "A baker made 50 muffins. Then 18 were sold. How many left?")
+        let stub = StubProposer(steps: [.proposal(invalid), .proposal(valid)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .wordProblem))
+        XCTAssertEqual(result.source, .modelVerified)
+        XCTAssertEqual(result.question.verifiedAnswer, "32")
+        guard case .solverRejected = result.attempts[0].outcome else {
+            return XCTFail("invalid subtraction must be solver-rejected pre-render, got \(result.attempts[0].outcome)")
+        }
+        assertReallyVerified(result)
+    }
+
+    func testR2F1WordSubtractInvalidStoryVariantFallsBackNotTrap() throws {
+        let invalid = ProposedProblem(
+            skill: .wordProblem, form: .story, operands: [3, 10], operation: .subtract,
+            promptText: "A baker made 3 muffins. Then 10 were sold. How many left?")
+        let stub = StubProposer(steps: [.proposal(invalid)])
+        let generator = QuestionGenerator(proposer: stub, maxAttempts: 1)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .wordProblem))
+        XCTAssertTrue(result.usedFallback)
+        guard case .solverRejected = result.attempts[0].outcome else {
+            return XCTFail("invalid story subtraction must be solver-rejected pre-render, got \(result.attempts[0].outcome)")
+        }
+        assertReallyVerified(result)
+    }
+
+    func testR2F2ContainedButWrongReadingAnswerNotDelivered() throws {
+        let bad = ProposedProblem(
+            skill: .readingComprehension, form: .story,
+            passage: "Leo kept books in a blue box.", candidateAnswer: "books",
+            promptText: "Read: Leo kept books in a blue box. What color was the box?")
+        let stub = StubProposer(steps: [.proposal(bad)])
+        let generator = QuestionGenerator(proposer: stub, maxAttempts: 1)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(result.usedFallback, "unverifiable reading Q/A must fall back, got \(result.question)")
+        XCTAssertNotEqual(result.question.verifiedAnswer, "books")
+        XCTAssertEqual(result.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(result)
+    }
+
+    func testR2F2ValidColorReadingStillPasses() throws {
+        let good = ProposedProblem(
+            skill: .readingComprehension, form: .story,
+            passage: "Leo kept books in a blue box.", candidateAnswer: "blue",
+            promptText: "Read: Leo kept books in a blue box. What color was the box?")
+        let stub = StubProposer(steps: [.proposal(good)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(result.source, .modelVerified)
+        XCTAssertEqual(result.question.verifiedAnswer, "blue")
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "blue"), .correct)
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "books"), .incorrect(expected: "blue"))
+        assertReallyVerified(result)
+    }
+
+    func testR2F3ExactDivisionRequestsJustQuotient() throws {
+        let exact = ProposedProblem(
+            skill: .division, form: .story, operands: [48, 8],
+            promptText: "48 cookies shared among 8 friends. How many each?")
+        let stub = StubProposer(steps: [.proposal(exact)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .division))
+        XCTAssertEqual(result.question.verifiedAnswer, "6")
+        XCTAssertFalse(result.question.promptText.contains("r remainder"),
+                       "exact division must not instruct r format: \(result.question.promptText)")
+        XCTAssertFalse(result.question.promptText.contains("6 r 0"))
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "6"), .correct)
+        assertReallyVerified(result)
+    }
+
+    func testR2F3WordExactDivisionRequestsJustQuotient() throws {
+        let exact = ProposedProblem(
+            skill: .wordProblem, form: .story, operands: [36, 4], operation: .divide,
+            promptText: "36 pencils shared among 4 tables. How many each?")
+        let stub = StubProposer(steps: [.proposal(exact)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .wordProblem))
+        XCTAssertEqual(result.question.verifiedAnswer, "9")
+        XCTAssertFalse(result.question.promptText.contains("r remainder"),
+                       "exact word division must not instruct r format: \(result.question.promptText)")
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "9"), .correct)
+        assertReallyVerified(result)
+    }
+
+    func testR2F3NonExactDivisionStillUsesRFormat() throws {
+        let nonExact = ProposedProblem(
+            skill: .division, form: .story, operands: [17, 5],
+            promptText: "17 cookies shared among 5 friends. How many each?")
+        let stub = StubProposer(steps: [.proposal(nonExact)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .division))
+        XCTAssertEqual(result.question.verifiedAnswer, "3 r 2")
+        XCTAssertTrue(result.question.promptText.contains("quotient r remainder"),
+                      "non-exact division must keep r format: \(result.question.promptText)")
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "3 r 2"), .correct)
+        assertReallyVerified(result)
+    }
+
+    func testR2F4FractionMaxSumDistractorsDoNotTrap() throws {
+        let problem = ProposedProblem(
+            skill: .fractionAddition, form: .whichIsWrong,
+            fractions: [SolverFraction(numerator: Int.max, denominator: 1)!,
+                        SolverFraction(numerator: 0, denominator: 1)!],
+            promptText: "Add the fractions.")
+        let stub = StubProposer(steps: [.proposal(problem)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .fractionAddition))
+        XCTAssertEqual(result.source, .modelVerified)
+        XCTAssertEqual(result.question.verifiedAnswer, "\(Int.max)")
+        XCTAssertTrue(result.question.promptText.contains("\(Int.max - 1)"),
+                      "representable alternative distractors expected: \(result.question.promptText)")
+        assertReallyVerified(result)
+    }
+
+    func testR2F4FractionMaxSumStoryAndZeroSumDoNotTrap() throws {
+        for fractions in [
+            [SolverFraction(numerator: Int.max, denominator: 1)!, SolverFraction(numerator: 0, denominator: 1)!],
+            [SolverFraction(numerator: 0, denominator: 1)!, SolverFraction(numerator: 0, denominator: 1)!],
+        ] {
+            let problem = ProposedProblem(
+                skill: .fractionAddition, form: .story, fractions: fractions,
+                promptText: "Add the fractions.")
+            let stub = StubProposer(steps: [.proposal(problem)])
+            let generator = QuestionGenerator(proposer: stub)
+            let result = try generator.generate(QuestionGenerationRequest(skill: .fractionAddition))
+            XCTAssertEqual(result.source, .modelVerified)
+            assertReallyVerified(result)
+        }
+    }
+
+    func testR2F5IntMaxMultiplicationDistractorsDoNotTrap() throws {
+        let problem = ProposedProblem(
+            skill: .multiDigitMultiplication, form: .whichIsWrong, operands: [Int.max, 1],
+            promptText: "Multiply.")
+        let stub = StubProposer(steps: [.proposal(problem)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .multiDigitMultiplication))
+        XCTAssertEqual(result.source, .modelVerified)
+        XCTAssertEqual(result.question.verifiedAnswer, "\(Int.max)")
+        XCTAssertTrue(result.question.promptText.contains("\(Int.max - 1)"),
+                      "representable alternative distractors expected: \(result.question.promptText)")
+        assertReallyVerified(result)
+    }
+
+    func testR2F5IntMaxWordMultiplyStoryVariantDoesNotTrap() throws {
+        let problem = ProposedProblem(
+            skill: .wordProblem, form: .story, operands: [Int.max, 1], operation: .multiply,
+            promptText: "Multiply.")
+        let stub = StubProposer(steps: [.proposal(problem)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .wordProblem))
+        XCTAssertEqual(result.source, .modelVerified)
+        XCTAssertEqual(result.question.verifiedAnswer, "\(Int.max)")
+        assertReallyVerified(result)
+    }
+
+    func testR2F6SeparateReadingFieldsResponseNotWasted() throws {
+        let proposer = ModelQuestionProposer(generateText: { _ in
+            "{\"skill\":\"readingComprehension\",\"form\":\"story\",\"passage\":\"Leo kept books in a blue box.\",\"candidateAnswer\":\"blue\",\"promptText\":\"What color was the box?\"}"
+        })
+        let generator = QuestionGenerator(proposer: proposer)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertEqual(result.source, .modelVerified, "separate-fields reading must not waste retries: \(result.attempts)")
+        XCTAssertEqual(result.attemptsUsed, 1)
+        XCTAssertEqual(result.question.verifiedAnswer, "blue")
+        XCTAssertTrue(result.question.promptText.contains("Leo kept books in a blue box."))
+        XCTAssertTrue(result.question.promptText.contains("What color was the box?"))
+        assertReallyVerified(result)
+    }
+
+    func testR2F6PromptRequestsCombinedReadingText() {
+        let request = QuestionGenerationRequest(skill: .readingComprehension)
+            .forAttempt(1, formHint: .story)
+        let prompt = ModelQuestionProposer.prompt(for: request)
+        XCTAssertTrue(prompt.lowercased().contains("combined"),
+                      "reading prompt must request combined passage+question text: \(prompt)")
+    }
+
     func testCopilotF4SamplingSeedVariesAndReplaysDeterministically() throws {
         final class Capture: @unchecked Sendable {
             var prompts: [String] = []

@@ -255,6 +255,10 @@ public final class QuestionGenerator: @unchecked Sendable {
             case .mismatch:
                 log.append(GenerationAttemptLog(attemptNumber: attempt, outcome: .promptTextMismatch))
                 continue
+            case .rejected(let reason):
+                log.append(GenerationAttemptLog(
+                    attemptNumber: attempt, outcome: .solverRejected(reason)))
+                continue
             }
             // Solver gate (LLD Section 5 steps 2-4). The model's own
             // stated answer is never consulted; the solver computes it.
@@ -304,24 +308,38 @@ public final class QuestionGenerator: @unchecked Sendable {
     private enum PresentationCheck {
         case ready(ProposedProblem)
         case mismatch
+        case rejected(SolverRejectionReason)
     }
 
-    /// Computed skills: replace free-form text with rendered text.
-    /// Reading: require the text to contain its passage verbatim.
-    /// Unrenderable computed shapes pass through for solver rejection.
+    /// Structured values are solver-validated BEFORE any rendering, so
+    /// an invalid proposal (e.g. a subtraction that would go negative)
+    /// never reaches distractor construction, whose arguments Swift
+    /// evaluates eagerly for every form. The loop still verifies the
+    /// final rendered proposal afterwards. Computed skills: replace
+    /// free-form text with rendered text. Reading: require the text to
+    /// contain its passage verbatim and the question/answer pair to
+    /// satisfy a deterministically checkable relationship (see
+    /// `ReadingPresentationVerifier`); containment alone is not enough.
     private static func checkedForPresentation(_ proposal: ProposedProblem) -> PresentationCheck {
-        if let rendered = QuestionPromptRenderer.render(proposal) {
-            var copy = proposal
-            copy.promptText = rendered
-            return .ready(copy)
+        if case .rejected(let reason) = SolverService().solve(proposal) {
+            return .rejected(reason)
         }
-        if proposal.skill == .readingComprehension,
-           let passage = proposal.passage,
-           !passage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if proposal.skill == .readingComprehension {
+            guard let passage = proposal.passage,
+                  !passage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .mismatch
+            }
             let trimmedPassage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
             guard proposal.promptText.contains(trimmedPassage) else { return .mismatch }
+            guard ReadingPresentationVerifier.isVerified(proposal) else { return .mismatch }
+            return .ready(proposal)
         }
-        return .ready(proposal)
+        guard let rendered = QuestionPromptRenderer.render(proposal) else {
+            return .mismatch
+        }
+        var copy = proposal
+        copy.promptText = rendered
+        return .ready(copy)
     }
 
     private func nextVariationIndex() -> Int {
@@ -347,5 +365,140 @@ public final class QuestionGenerator: @unchecked Sendable {
         }
         fallbackRotation[skill, default: 0] += 1
         return proposal
+    }
+}
+
+/// Deterministic reading question/answer check (round-2 F2). Passage
+/// containment plus a passage span is NOT support for an answer: the
+/// question must ask for the kind of thing the candidate is, in a way
+/// checkable from the passage text alone. Accepted shapes, all
+/// fail-closed (anything else is a mismatch and falls back):
+/// - a vetted fallback-bank (passage, question, answer) tuple, matched
+///   on normalized passage, question, and candidate;
+/// - a color question, whose candidate is a color word used as the
+///   adjective of the questioned noun in the passage ("blue box");
+/// - a how-many/much question, whose candidate begins with a number;
+/// - a who question, whose candidate is a capitalized name span;
+/// - a what-did question, whose candidate starts at most two tokens
+///   after a passage verb sharing a stem with a question verb.
+enum ReadingPresentationVerifier {
+    private static let colors: Set<String> = [
+        "red", "orange", "yellow", "green", "blue", "purple", "pink",
+        "brown", "black", "white", "gray", "grey", "gold", "silver",
+    ]
+    private static let numberWords: Set<String> = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    ]
+    private static let stopwords: Set<String> = [
+        "what", "did", "do", "does", "the", "a", "an", "in", "on", "at",
+        "to", "of", "was", "were", "is", "are", "was", "for", "with",
+    ]
+    private static let vettedReading = FallbackQuestionBank.demo.entries(for: .readingComprehension)
+
+    static func isVerified(_ proposal: ProposedProblem) -> Bool {
+        guard let passage = proposal.passage,
+              let candidate = proposal.candidateAnswer else { return false }
+        let trimmedPassage = passage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPassage.isEmpty,
+              let question = questionText(in: proposal.promptText, passage: trimmedPassage)
+        else { return false }
+        let candidateTokens = tokens(candidate)
+        guard !candidateTokens.isEmpty else { return false }
+        if isVetted(passage: trimmedPassage, question: question, candidate: candidate) {
+            return true
+        }
+        let qTokens = tokens(question)
+        let qLower = question.lowercased()
+        if qLower.contains("what color") || qLower.contains("what colour") {
+            return isColorAnswer(candidateTokens: candidateTokens, questionTokens: qTokens,
+                                 passage: passage)
+        }
+        if qLower.contains("how many") || qLower.contains("how much") {
+            guard let first = candidateTokens.first else { return false }
+            return numberWords.contains(first) || (!first.isEmpty && first.allSatisfy(\.isNumber))
+        }
+        if qTokens.first == "who" {
+            let trimmedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmedCandidate.first?.isUppercase == true && passage.contains(trimmedCandidate)
+        }
+        if qTokens.first == "what", qTokens.count > 1,
+           ["did", "do", "does"].contains(qTokens[1]) {
+            return isVerbObjectAnswer(candidateTokens: candidateTokens,
+                                      questionTokens: qTokens, passage: passage)
+        }
+        return false
+    }
+
+    private static func questionText(in promptText: String, passage: String) -> String? {
+        guard let range = promptText.range(of: passage) else { return nil }
+        let rest = promptText[range.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? nil : rest
+    }
+
+    private static func isVetted(passage: String, question: String, candidate: String) -> Bool {
+        vettedReading.contains { entry in
+            guard let entryPassage = entry.passage,
+                  let entryCandidate = entry.candidateAnswer,
+                  let entryQuestion = questionText(
+                    in: entry.promptText,
+                    passage: entryPassage.trimmingCharacters(in: .whitespacesAndNewlines))
+            else { return false }
+            return SolverService.normalizeForSupport(entryPassage) == SolverService.normalizeForSupport(passage)
+                && SolverService.normalizeForSupport(entryQuestion) == SolverService.normalizeForSupport(question)
+                && SolverService.normalizeForSupport(entryCandidate) == SolverService.normalizeForSupport(candidate)
+        }
+    }
+
+    private static func isColorAnswer(candidateTokens: [String], questionTokens: [String],
+                                      passage: String) -> Bool {
+        guard candidateTokens.count == 1, colors.contains(candidateTokens[0]) else { return false }
+        guard let colorIndex = questionTokens.firstIndex(where: { $0 == "color" || $0 == "colour" }),
+              let theIndex = questionTokens[colorIndex...].firstIndex(of: "the"),
+              theIndex + 1 < questionTokens.count else { return false }
+        let noun = questionTokens[theIndex + 1]
+        let passageTokens = tokens(passage)
+        for index in passageTokens.indices.dropLast()
+        where passageTokens[index] == candidateTokens[0] && passageTokens[index + 1] == noun {
+            return true
+        }
+        return false
+    }
+
+    private static func isVerbObjectAnswer(candidateTokens: [String], questionTokens: [String],
+                                           passage: String) -> Bool {
+        let verbCandidates = questionTokens.dropFirst(2).filter { !stopwords.contains($0) && $0.count >= 3 }
+        for sentence in SolverService.passageSentences(passage) {
+            let sentenceTokens = tokens(sentence)
+            guard let candidateStart = firstIndex(of: candidateTokens, in: sentenceTokens) else { continue }
+            for verb in verbCandidates {
+                for index in sentenceTokens.indices
+                where sharesStem(sentenceTokens[index], verb) {
+                    if candidateStart > index, candidateStart - index <= 2 { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    private static func sharesStem(_ a: String, _ b: String) -> Bool {
+        let stem = min(a.count, b.count)
+        guard stem >= 3 else { return a == b }
+        return a.prefix(stem) == b.prefix(stem) && (a.count <= b.count + 3)
+    }
+
+    private static func firstIndex(of needle: [String], in haystack: [String]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        for start in 0...(haystack.count - needle.count)
+        where Array(haystack[start..<(start + needle.count)]) == needle {
+            return start
+        }
+        return nil
+    }
+
+    private static func tokens(_ text: String) -> [String] {
+        SolverService.normalizeForSupport(text).split(separator: " ").map(String.init)
     }
 }
