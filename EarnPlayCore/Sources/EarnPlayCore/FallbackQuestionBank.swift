@@ -89,7 +89,7 @@ public struct FallbackQuestionBank: Equatable, Sendable {
         // Division with remainder — 17 / 5 = 3 r 2.
         ProposedProblem(
             skill: .division, form: .story, operands: [17, 5],
-            promptText: "Seventeen cookies are shared equally among 5 friends. How many cookies does each friend get, and how many are left over? Answer like: 3 r 2.",
+            promptText: "Seventeen cookies are shared equally among 5 friends. How many cookies does each friend get, and how many are left over? Answer as quotient r remainder.",
             difficulty: 2),
 
         // Fraction comparison — 3/4 > 1/2.
@@ -112,7 +112,7 @@ public struct FallbackQuestionBank: Equatable, Sendable {
             skill: .fractionAddition, form: .story,
             fractions: [SolverFraction(numerator: 1, denominator: 4)!,
                         SolverFraction(numerator: 1, denominator: 2)!],
-            promptText: "For a recipe, Priya pours 1/4 cup of milk and then 1/2 cup of milk into a bowl. How much milk is in the bowl in all? Answer as a fraction like 3/4.",
+            promptText: "For a recipe, Priya pours 1/4 cup of milk and then 1/2 cup of milk into a bowl. How much milk is in the bowl in all? Answer as a fraction.",
             difficulty: 1),
         // Fraction addition — 1/6 + 1/3 = 1/2; the ribbon length is a distractor.
         ProposedProblem(

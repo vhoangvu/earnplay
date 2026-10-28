@@ -15,25 +15,37 @@ public final class ModelQuestionProposer: QuestionProposing, @unchecked Sendable
     /// Bump the major number on any wording change.
     public static let promptVersion = "question-gen-v1"
 
-    private let generateText: @Sendable (String) throws -> String
+    private let generateWithSeed: @Sendable (String, UInt32) throws -> String
 
     /// Designated initializer: any text generator (kept injectable so the
     /// parser path is testable without a loaded model).
     public init(generateText: @escaping @Sendable (String) throws -> String) {
-        self.generateText = generateText
+        self.generateWithSeed = { prompt, _ in try generateText(prompt) }
+    }
+
+    /// Generator that also receives the per-request sampling seed (F4).
+    public init(generateWithSeed: @escaping @Sendable (String, UInt32) throws -> String) {
+        self.generateWithSeed = generateWithSeed
     }
 
     /// Production initializer over the T0.2 runtime. Each proposal is one
-    /// prompt-to-response round-trip, fully on-device.
+    /// prompt-to-response round-trip, fully on-device, seeded per request.
     public convenience init(runtime: ModelRuntime) {
-        self.init(generateText: { prompt in
-            try runtime.generate(prompt: prompt, maxTokens: 256).response
+        self.init(generateWithSeed: { prompt, seed in
+            try runtime.generate(prompt: prompt, maxTokens: 256, seed: seed).response
         })
     }
 
     public func propose(request: QuestionGenerationRequest) throws -> ProposedProblem? {
-        let response = try generateText(Self.prompt(for: request))
+        let response = try generateWithSeed(Self.prompt(for: request), Self.samplingSeed(for: request))
         return ProposedProblemParser.parse(response)
+    }
+
+    /// Deterministic per-request seed (F4): same request replay gives the
+    /// same seed; different variation/attempt gives a different seed.
+    public static func samplingSeed(for request: QuestionGenerationRequest) -> UInt32 {
+        42 &+ UInt32(bitPattern: Int32(truncatingIfNeeded: request.variationIndex)) &* 1009
+            &+ UInt32(bitPattern: Int32(truncatingIfNeeded: request.attemptNumber)) &* 17
     }
 
     /// Fixed-structure proposal prompt (LLD 10.1 shape: fixed instruction
@@ -46,6 +58,7 @@ public final class ModelQuestionProposer: QuestionProposing, @unchecked Sendable
         You are a tutor for a grade \(request.grade) child. Propose ONE new practice problem as JSON only, with no other text.
 
         Rules:
+        - This is problem variation \(request.variationIndex), attempt \(request.attemptNumber). Use a fresh setting, names, and objects for this variation; do not repeat a problem from another variation.
         - Use skill "\(request.skill.rawValue)" and form "\(form)".
         - The form must be a real-world story or puzzle, never a plain textbook drill.
         - Write a short, kind question in "promptText" that matches the values exactly.

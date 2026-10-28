@@ -20,16 +20,22 @@ SSOT Section 5 form rule. Upstream: T0.2 `ModelRuntime` proposes, T0.3
    parseable; the proposal practises a different skill than requested;
    the proposal uses plain textbook form (`.direct`); the proposal has
    no question text. Any of these is one failed attempt.
-3. Solver gate: `SolverService.verify` computes the answer
+3. Presentation-text gate (Copilot round-1 F1): for computed skills
+   the loop discards the proposer's free-form `promptText` and renders
+   the displayed text with `QuestionPromptRenderer` from the same
+   structured values the solver computes from, so wording and answer
+   cannot diverge. For reading it requires the text to contain the
+   supporting passage verbatim (otherwise `.promptTextMismatch`).
+4. Solver gate: `SolverService.verify` computes the answer
    deterministically. Only on success is a `VerifiedQuestion` created,
    and only that question may be presented. The model's own stated
    answer is never read (the proposal parser has no answer field for
    the computed skills; the reading candidate is kept only after the
    solver's passage-support check).
-4. On failure the loop retries with a new proposal. Bound:
+5. On failure the loop retries with a new proposal. Bound:
    `maxAttempts = 3` proposals per question (`QuestionGenerator.
    defaultMaxAttempts`; configurable at construction, minimum 1).
-5. When the bound is exhausted, the loop serves a pre-verified
+6. When the bound is exhausted, the loop serves a pre-verified
    `FallbackQuestionBank` entry for the same skill, re-verified through
    the solver with the new question id. If the bank holds nothing
    verified for the skill, the loop throws
@@ -39,9 +45,20 @@ SSOT Section 5 form rule. Upstream: T0.2 `ModelRuntime` proposes, T0.3
 
 Every call returns a `QuestionGenerationResult`: the verified question,
 its source (`.modelVerified` / `.fallbackBank`), `attemptsUsed` (never
-above the bound), and the per-attempt verify log. Callers log these —
-the acceptance rule is that any presented item without a solver pass
-in the log fails.
+above the bound), the per-attempt verify log, the structured `proposal`
+the question was verified from (for independent re-solving), and a
+`finalVerification` record holding the delivered question's own solver
+pass and source — recorded separately from the bounded attempt log, so
+fallback items also carry a pass (F5). Callers log these — the
+acceptance rule is that any presented item without a solver pass in
+the log fails.
+
+Per-question variation (F4): each `generate` call takes a monotonic
+`variationIndex`; the model prompt names that variation and attempt,
+and `ModelQuestionProposer.samplingSeed(for:)` derives a deterministic
+per-request seed threaded to `ModelRuntime.generate(...seed:)`
+(default 42 for other callers). Same request sequence replays to the
+same prompts/seeds; successive questions never reuse identical inputs.
 
 ## Interface T1.1 / T1.8 will call
 

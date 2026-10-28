@@ -69,15 +69,27 @@ final class QuestionGenerationTests: XCTestCase {
             promptText: "A farmer packs \(a) eggs in each of \(b) cartons. How many eggs in all?")
     }
 
-    private func assertReallyVerified(_ question: VerifiedQuestion,
+    /// F6: independently re-solve the captured structured proposal and
+    /// compare with the delivered answer — never stored-answer-to-itself.
+    private func assertReallyVerified(_ result: QuestionGenerationResult,
                                       file: StaticString = #filePath, line: UInt = #line) {
+        let question = result.question
         XCTAssertNotEqual(question.formType, .direct, "plain textbook form must never be presented", file: file, line: line)
         XCTAssertFalse(question.promptText.trimmingCharacters(in: .whitespaces).isEmpty,
                        "presented question must have text", file: file, line: line)
+        XCTAssertEqual(solver.solve(result.proposal), .verified(verifiedAnswer: question.verifiedAnswer),
+                       "independent solve of captured proposal must match delivered answer", file: file, line: line)
         XCTAssertEqual(
-            solver.checkAnswer(question, proposedAnswer: question.verifiedAnswer), .correct,
-            "presented question must grade correct against its own verified answer",
+            solver.checkAnswer(result.proposal, proposedAnswer: question.verifiedAnswer), .correct,
+            "independent proposal-based grading must accept the delivered answer",
             file: file, line: line)
+        if result.proposal.skill != .readingComprehension {
+            XCTAssertEqual(question.promptText, QuestionPromptRenderer.render(result.proposal),
+                           "displayed text must be the rendered text for the computed values", file: file, line: line)
+        }
+        XCTAssertEqual(result.finalVerification.outcome, .verified, "delivered item needs a final solver pass", file: file, line: line)
+        XCTAssertEqual(result.finalVerification.source, result.source, file: file, line: line)
+        XCTAssertEqual(result.finalVerification.questionId, question.questionId, file: file, line: line)
     }
 
     // MARK: - Verification pass path
@@ -93,7 +105,7 @@ final class QuestionGenerationTests: XCTestCase {
         XCTAssertEqual(result.attempts.map(\.outcome), [.verified])
         XCTAssertEqual(result.question.verifiedAnswer, "56")
         XCTAssertEqual(result.question.skill, SolverSkill.multiplicationFacts.rawValue)
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     // MARK: - Verification failure -> retry path
@@ -114,7 +126,7 @@ final class QuestionGenerationTests: XCTestCase {
         }
         XCTAssertEqual(result.attempts[1].outcome, .verified)
         XCTAssertEqual(result.question.verifiedAnswer, "42")
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     func testThrowNilMismatchAndTextbookFormAllCountAsFailedAttempts() throws {
@@ -138,7 +150,7 @@ final class QuestionGenerationTests: XCTestCase {
         XCTAssertEqual(result.attempts[3].outcome, .plainTextbookForm)
         XCTAssertEqual(result.attempts[4].outcome, .verified)
         XCTAssertEqual(result.question.verifiedAnswer, "54")
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     // MARK: - Retry exhaustion -> fallback path
@@ -162,7 +174,7 @@ final class QuestionGenerationTests: XCTestCase {
             return false
         }, "every logged attempt must be the division-by-zero rejection: \(result.attempts)")
         XCTAssertEqual(result.question.skill, SolverSkill.division.rawValue)
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     func testRetryBoundOfOneIsRespected() throws {
@@ -173,7 +185,7 @@ final class QuestionGenerationTests: XCTestCase {
         XCTAssertEqual(stub.calls, 1)
         XCTAssertEqual(result.attemptsUsed, 1)
         XCTAssertTrue(result.usedFallback)
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     func testNoVerifiedFallbackThrowsInsteadOfPresentingAnything() {
@@ -194,6 +206,9 @@ final class QuestionGenerationTests: XCTestCase {
         var fallbackCount = 0
         var formsSeen: Set<SolverForm> = []
 
+        // F7: per-item verification record, retained as an attachment.
+        var records: [String] = []
+        var itemsWithoutPass: [Int] = []
         for index in 0..<100 {
             let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
             XCTAssertLessThanOrEqual(result.attemptsUsed, generator.maxAttempts,
@@ -202,10 +217,23 @@ final class QuestionGenerationTests: XCTestCase {
                            result.usedFallback ? generator.maxAttempts : result.attemptsUsed,
                            "item \(index) log must cover every attempt")
             // The acceptance rule: 0 unverified items reach the UI layer.
-            assertReallyVerified(result.question)
+            assertReallyVerified(result)
+            let solverPass = result.finalVerification.outcome == .verified
+                && solver.solve(result.proposal) == .verified(verifiedAnswer: result.question.verifiedAnswer)
+            if !solverPass { itemsWithoutPass.append(index) }
+            records.append("item=\(index) id=\(result.question.questionId) source=\(result.source) "
+                + "attempts=\(result.attemptsUsed) solverPass=\(solverPass)")
             formsSeen.insert(result.question.formType)
             if result.usedFallback { fallbackCount += 1 }
         }
+        let attachment = XCTAttachment(string: records.joined(separator: "\n"))
+        attachment.name = "100-problem verification log"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        print(records.joined(separator: "\n"))
+        XCTAssertEqual(records.count, 100)
+        XCTAssertTrue(itemsWithoutPass.isEmpty,
+                      "every delivered item needs a solver pass; missing: \(itemsWithoutPass)")
         XCTAssertEqual(fallbackCount + (100 - fallbackCount), 100)
         XCTAssertGreaterThan(fallbackCount, 0,
                              "30% fault injection over 100 items must exhaust retries sometimes")
@@ -224,7 +252,7 @@ final class QuestionGenerationTests: XCTestCase {
         for _ in 0..<10 {
             let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
             forms.append(result.question.formType)
-            assertReallyVerified(result.question)
+            assertReallyVerified(result)
         }
         XCTAssertFalse(forms.contains(.direct), "no plain textbook form may be generated: \(forms)")
         XCTAssertGreaterThanOrEqual(Set(forms).count, 3,
@@ -326,7 +354,7 @@ final class QuestionGenerationTests: XCTestCase {
         let generator = QuestionGenerator(proposer: proposer)
         let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
         XCTAssertEqual(result.question.verifiedAnswer, "42")
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
     }
 
     func testModelProposerUnparseableReplyCountsAsFailedAttemptThenFallsBack() throws {
@@ -335,6 +363,134 @@ final class QuestionGenerationTests: XCTestCase {
         let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.attempts.map(\.outcome), [.noProposal, .noProposal])
-        assertReallyVerified(result.question)
+        assertReallyVerified(result)
+    }
+
+    // MARK: - Copilot round-1 regressions (tests-first)
+
+    func testCopilotF1MismatchedPromptTextCannotReachUI() throws {
+        // Operands [6,7] (answer 42) but text asks six boxes of eight (48).
+        let mismatched = ProposedProblem(
+            skill: .multiplicationFacts, form: .story, operands: [6, 7],
+            promptText: "There are six boxes with eight pens in each box. How many pens in all?")
+        let stub = StubProposer(steps: [.proposal(mismatched)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
+        XCTAssertEqual(result.question.verifiedAnswer, "42")
+        XCTAssertFalse(result.question.promptText.lowercased().contains("eight"),
+                       "displayed text must be rendered from operands, got: \(result.question.promptText)")
+        XCTAssertTrue(result.question.promptText.contains("6"))
+        XCTAssertTrue(result.question.promptText.contains("7"))
+        XCTAssertEqual(solver.checkAnswer(result.question, proposedAnswer: "48"), .incorrect(expected: "42"))
+    }
+
+    func testCopilotF1ReverseFormTextMatchesOperands() throws {
+        let mismatched = ProposedProblem(
+            skill: .multiplicationFacts, form: .reverse, operands: [6, 7],
+            promptText: "Work backwards: six boxes hold eight pens each. How many pens?")
+        let stub = StubProposer(steps: [.proposal(mismatched)])
+        let generator = QuestionGenerator(proposer: stub)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
+        XCTAssertEqual(result.question.formType, .reverse)
+        XCTAssertEqual(result.question.verifiedAnswer, "42")
+        XCTAssertFalse(result.question.promptText.lowercased().contains("eight"))
+        XCTAssertTrue(result.question.promptText.lowercased().contains("backward"))
+    }
+
+    func testCopilotF2F3FallbackInstructionsDoNotRevealAnswer() {
+        // Format-instruction entries must not contain their own answer.
+        // (.whichIsWrong lists candidate answers by design; reading passages
+        // contain the supported span by design; both excluded.)
+        for entry in FallbackQuestionBank.demo.entries {
+            guard entry.form != .whichIsWrong,
+                  entry.skill != .readingComprehension,
+                  entry.skill != .fractionComparison else { continue }
+            guard case .verified(let answer) = solver.solve(entry) else {
+                return XCTFail("bank entry must verify: \(entry.promptText)")
+            }
+            XCTAssertFalse(entry.promptText.contains(answer),
+                           "\(entry.skill) fallback reveals its answer \(answer): \(entry.promptText)")
+        }
+    }
+
+    func testCopilotF4PromptVariesAcrossAttemptsForSameForm() {
+        let first = ModelQuestionProposer.prompt(
+            for: QuestionGenerationRequest(skill: .division, difficulty: 2).forAttempt(1, formHint: .reverse))
+        let second = ModelQuestionProposer.prompt(
+            for: QuestionGenerationRequest(skill: .division, difficulty: 2).forAttempt(2, formHint: .reverse))
+        XCTAssertNotEqual(first, second, "same skill/form/attempt inputs must not reuse identical prompt")
+    }
+
+    func testCopilotF5FallbackHasSolverPassRecord() throws {
+        let stub = StubProposer(steps: Array(repeating: .nothing, count: 10))
+        let generator = QuestionGenerator(proposer: stub, maxAttempts: 2)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .multiplicationFacts))
+        XCTAssertTrue(result.usedFallback)
+        // Bounded model-attempt log stays all-failures; the fallback pass
+        // is recorded separately in finalVerification.
+        XCTAssertEqual(result.attempts.count, 2)
+        XCTAssertFalse(result.attempts.map(\.outcome).contains(.verified))
+        XCTAssertEqual(result.finalVerification.source, .fallbackBank)
+        XCTAssertEqual(result.finalVerification.outcome, .verified)
+        XCTAssertNil(result.finalVerification.attemptNumber)
+        XCTAssertEqual(result.finalVerification.questionId, result.question.questionId)
+        XCTAssertEqual(solver.solve(result.proposal), .verified(verifiedAnswer: result.question.verifiedAnswer))
+    }
+
+    func testCopilotF1ReadingTextWithoutPassageIsRejected() throws {
+        let passage = "Maya planted twelve sunflower seeds in the garden."
+        let badReading = ProposedProblem(
+            skill: .readingComprehension, form: .story, passage: passage,
+            candidateAnswer: "twelve sunflower seeds",
+            promptText: "What did Maya plant?")
+        let stub = StubProposer(steps: [.proposal(badReading)])
+        let generator = QuestionGenerator(proposer: stub, maxAttempts: 1)
+        let result = try generator.generate(QuestionGenerationRequest(skill: .readingComprehension))
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.attempts.map(\.outcome), [.promptTextMismatch])
+        assertReallyVerified(result)
+    }
+
+    func testCopilotFallbackServesEverySkillIndependentlyVerified() throws {
+        for skill in SolverSkill.allCases {
+            let stub = StubProposer(steps: Array(repeating: .nothing, count: 5))
+            let generator = QuestionGenerator(proposer: stub, maxAttempts: 1)
+            let result = try generator.generate(QuestionGenerationRequest(skill: skill))
+            XCTAssertTrue(result.usedFallback, "\(skill) should fall back")
+            XCTAssertEqual(result.question.skill, skill.rawValue)
+            assertReallyVerified(result)
+        }
+    }
+
+    func testCopilotF4SamplingSeedVariesAndReplaysDeterministically() throws {
+        final class Capture: @unchecked Sendable {
+            var prompts: [String] = []
+            var seeds: [UInt32] = []
+        }
+        func makeGenerator(_ capture: Capture) -> QuestionGenerator {
+            let proposer = ModelQuestionProposer(generateWithSeed: { prompt, seed in
+                capture.prompts.append(prompt)
+                capture.seeds.append(seed)
+                return "{\"skill\":\"multiplicationFacts\",\"form\":\"story\",\"operands\":[6,7],\"promptText\":\"Six boxes hold 7 pens each. How many pens?\"}"
+            })
+            return QuestionGenerator(proposer: proposer)
+        }
+        let first = Capture()
+        let genA = makeGenerator(first)
+        for _ in 0..<10 { _ = try genA.generate(QuestionGenerationRequest(skill: .multiplicationFacts)) }
+        XCTAssertEqual(Set(first.prompts).count, first.prompts.count, "prompts must vary per question: \(first.prompts)")
+        XCTAssertEqual(Set(first.seeds).count, first.seeds.count, "sampling seeds must vary per question")
+        // Deterministic replay: a fresh generator reproduces the sequence.
+        let second = Capture()
+        let genB = makeGenerator(second)
+        for _ in 0..<10 { _ = try genB.generate(QuestionGenerationRequest(skill: .multiplicationFacts)) }
+        XCTAssertEqual(first.prompts, second.prompts)
+        XCTAssertEqual(first.seeds, second.seeds)
+        // Same request value replays to the same seed; different variation differs.
+        let base = QuestionGenerationRequest(skill: .division).forAttempt(1, formHint: .story, variationIndex: 3)
+        XCTAssertEqual(ModelQuestionProposer.samplingSeed(for: base), ModelQuestionProposer.samplingSeed(for: base))
+        XCTAssertNotEqual(ModelQuestionProposer.samplingSeed(for: base),
+                          ModelQuestionProposer.samplingSeed(
+                            for: QuestionGenerationRequest(skill: .division).forAttempt(1, formHint: .story, variationIndex: 4)))
     }
 }
