@@ -52,20 +52,27 @@ private struct PersistedRegistryState: Codable {
     /// Registry-owned snapshot paths (round 5 F4), stored relative
     /// to the registry directory like snapshot model paths (F8).
     var ownedSnapshotPaths: [String] = []
+    /// Round 7 item 2: snapshots pending retirement, persisted so
+    /// an interrupted cleanup survives process termination and is
+    /// swept on recovery. Stored like `ownedSnapshotPaths` (F8).
+    var pendingRetirementPaths: [String] = []
 
     private enum CodingKeys: String, CodingKey {
-        case bundles, activeBundleID, ownedSnapshotPaths
+        case bundles, activeBundleID, ownedSnapshotPaths, pendingRetirementPaths
     }
-    init(bundles: [VersionBundle], activeBundleID: String, ownedSnapshotPaths: [String] = []) {
+    init(bundles: [VersionBundle], activeBundleID: String, ownedSnapshotPaths: [String] = [],
+         pendingRetirementPaths: [String] = []) {
         self.bundles = bundles
         self.activeBundleID = activeBundleID
         self.ownedSnapshotPaths = ownedSnapshotPaths
+        self.pendingRetirementPaths = pendingRetirementPaths
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         bundles = try c.decode([VersionBundle].self, forKey: .bundles)
         activeBundleID = try c.decode(String.self, forKey: .activeBundleID)
         ownedSnapshotPaths = try c.decodeIfPresent([String].self, forKey: .ownedSnapshotPaths) ?? []
+        pendingRetirementPaths = try c.decodeIfPresent([String].self, forKey: .pendingRetirementPaths) ?? []
     }
 }
 
@@ -106,6 +113,11 @@ public final class VersionRegistry: @unchecked Sendable {
     private let storeURL: URL?
     /// Absolute paths of snapshots this registry created (F4).
     private var ownedSnapshotPaths: Set<String> = []
+    /// Round 7 item 2: standardized paths pending retirement for
+    /// this store, mirrored into `PersistedRegistryState` so the
+    /// cleanup survives termination (in-memory marker is static
+    /// `pendingRetirements`; this set is its persisted form).
+    private var pendingRetirementPaths: Set<String> = []
     /// Round 5 F9: optional load validation run against a
     /// candidate's artifacts before its selection is committed.
     /// The app layer installs a validator that loads the candidate
@@ -123,6 +135,15 @@ public final class VersionRegistry: @unchecked Sendable {
 
     private static func standardized(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    /// Test-only (@testable, internal): simulate process
+    /// termination by dropping all in-memory retention state.
+    /// Persisted registry state on disk is left untouched.
+    static func simulateProcessTerminationForTesting() {
+        retentionGuard.lock(); defer { retentionGuard.unlock() }
+        retentionCounts.removeAll()
+        pendingRetirements.removeAll()
     }
     private static func retainSnapshot(atPath path: String) {
         let key = standardized(path)
@@ -158,18 +179,28 @@ public final class VersionRegistry: @unchecked Sendable {
         Self.retentionGuard.unlock()
         guard count <= 1, isPending else { return }
         lock.lock(); defer { lock.unlock() }
-        try? reloadPersistedLocked()
+        // Round 7 item 1: a failed reload must not proceed to
+        // deletion or persist stale in-memory state over a corrupt
+        // or unreadable registry. Leave the retirement pending
+        // (in-memory + persisted) for a later successful reload.
+        do { try reloadPersistedLocked() } catch { return }
         Self.retentionGuard.lock()
         if bundlesByID.values.contains(where: {
             $0.modelFilePath.map { Self.standardized($0) == key } ?? false
         }) {
             Self.pendingRetirements.remove(key)
             Self.retentionGuard.unlock()
+            pendingRetirementPaths.remove(key)
+            try? persistLocked()
             return
         }
         Self.pendingRetirements.remove(key)
         Self.retentionGuard.unlock()
-        guard isRegistryOwnedSnapshot(key) else { return }
+        pendingRetirementPaths.remove(key)
+        guard isRegistryOwnedSnapshot(key) else {
+            try? persistLocked()
+            return
+        }
         try? FileManager.default.removeItem(at: URL(fileURLWithPath: key))
         ownedSnapshotPaths.remove(key)
         try? persistLocked()
@@ -282,8 +313,11 @@ public final class VersionRegistry: @unchecked Sendable {
                 bundles: state.bundles, activeBundleID: state.activeBundleID, storeURL: url
             )
             registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
+            registry.restorePendingRetirements(state.pendingRetirementPaths)
             try registry.refreshCurrentBundle(current)
             registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
+            registry.restorePendingRetirements(state.pendingRetirementPaths)
+            registry.sweepOrphanedOwnedSnapshotsOnRecovery()
             return registry
         }
         return try VersionRegistry(bundles: [current], activeBundleID: "current", storeURL: url)
@@ -323,6 +357,80 @@ public final class VersionRegistry: @unchecked Sendable {
                 URL(fileURLWithPath: resolvedPath(forStored: path)).standardizedFileURL.path)
         }
         try? persistLocked()
+    }
+
+    /// Restore persisted pending retirements (round 7 item 2,
+    /// used by `production`), then sweep any whose cleanup was
+    /// interrupted by termination.
+    func restorePendingRetirements(_ stored: [String]) {
+        guard !stored.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        for path in stored {
+            let key = URL(fileURLWithPath: resolvedPath(forStored: path)).standardizedFileURL.path
+            pendingRetirementPaths.insert(key)
+            Self.retentionGuard.lock()
+            Self.pendingRetirements.insert(key)
+            Self.retentionGuard.unlock()
+        }
+        try? persistLocked()
+        sweepPendingRetirementsLocked()
+    }
+
+    /// Round 7 item 2 recovery sweep. Caller must hold `lock`.
+    /// Deletes ONLY persisted-pending snapshots that are no
+    /// longer retained by a resolved session, not referenced by
+    /// any registered bundle, and registry-owned. A referenced
+    /// or retained snapshot is never swept.
+    private func sweepPendingRetirementsLocked() {
+        guard !pendingRetirementPaths.isEmpty else { return }
+        var changed = false
+        for key in pendingRetirementPaths.sorted() {
+            if Self.retentionCount(forPath: key) > 0 { continue }
+            let referenced = bundlesByID.values.contains(where: {
+                $0.modelFilePath.map { Self.standardized($0) == key } ?? false
+            })
+            if referenced || !isRegistryOwnedSnapshot(key) {
+                pendingRetirementPaths.remove(key)
+                Self.retentionGuard.lock()
+                Self.pendingRetirements.remove(key)
+                Self.retentionGuard.unlock()
+                changed = true
+                continue
+            }
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: key))
+            ownedSnapshotPaths.remove(key)
+            pendingRetirementPaths.remove(key)
+            Self.retentionGuard.lock()
+            Self.pendingRetirements.remove(key)
+            Self.retentionGuard.unlock()
+            changed = true
+        }
+        if changed { try? persistLocked() }
+    }
+
+    /// Recovery-only (production restore): also reclaim owned
+    /// snapshots no bundle references — e.g. orphans written by
+    /// a version whose pending marker was never persisted. Same
+    /// guards as the pending sweep: retained or referenced
+    /// snapshots are never touched.
+    func sweepOrphanedOwnedSnapshotsOnRecovery() {
+        lock.lock(); defer { lock.unlock() }
+        var changed = false
+        for key in ownedSnapshotPaths.sorted() {
+            if Self.retentionCount(forPath: key) > 0 { continue }
+            let referenced = bundlesByID.values.contains(where: {
+                $0.modelFilePath.map { Self.standardized($0) == key } ?? false
+            })
+            if referenced { continue }
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: key))
+            ownedSnapshotPaths.remove(key)
+            pendingRetirementPaths.remove(key)
+            Self.retentionGuard.lock()
+            Self.pendingRetirements.remove(key)
+            Self.retentionGuard.unlock()
+            changed = true
+        }
+        if changed { try? persistLocked() }
     }
 
     /// Lenient refresh of "current" without artifact validation, so a
@@ -516,7 +624,13 @@ public final class VersionRegistry: @unchecked Sendable {
             throw error
         }
         // Track ownership of the snapshot just published (F4).
-        ownedSnapshotPaths.insert(stable.standardizedFileURL.path)
+        let stableKey = stable.standardizedFileURL.path
+        ownedSnapshotPaths.insert(stableKey)
+        // A snapshot referenced again is no longer pending.
+        pendingRetirementPaths.remove(stableKey)
+        Self.retentionGuard.lock()
+        Self.pendingRetirements.remove(stableKey)
+        Self.retentionGuard.unlock()
         try? persistLocked()
         // Only after the new entry is persisted, retire a snapshot
         // no remaining bundle references — and only a file this
@@ -527,13 +641,27 @@ public final class VersionRegistry: @unchecked Sendable {
            previousSnapshotPath != stable.path,
            isRegistryOwnedSnapshot(previousSnapshotPath),
            !bundlesByID.values.contains(where: { $0.modelFilePath == previousSnapshotPath }) {
-            if Self.retentionCount(forPath: previousSnapshotPath) > 0 {
-                Self.retentionGuard.lock()
-                Self.pendingRetirements.insert(Self.standardized(previousSnapshotPath))
-                Self.retentionGuard.unlock()
+            let key = Self.standardized(previousSnapshotPath)
+            // Round 7 item 3: check the retention count and insert
+            // the pending retirement in ONE critical section. A
+            // release arriving after the check must still see the
+            // pending marker; splitting these let it slip between.
+            Self.retentionGuard.lock()
+            let isRetained = (Self.retentionCounts[key] ?? 0) > 0
+            if isRetained { Self.pendingRetirements.insert(key) }
+            Self.retentionGuard.unlock()
+            if isRetained {
+                // Round 7 item 2: persist the pending marker so
+                // it survives termination.
+                pendingRetirementPaths.insert(key)
+                try? persistLocked()
             } else {
-                try? FileManager.default.removeItem(at: URL(fileURLWithPath: previousSnapshotPath))
-                ownedSnapshotPaths.remove(URL(fileURLWithPath: previousSnapshotPath).standardizedFileURL.path)
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: key))
+                ownedSnapshotPaths.remove(key)
+                pendingRetirementPaths.remove(key)
+                Self.retentionGuard.lock()
+                Self.pendingRetirements.remove(key)
+                Self.retentionGuard.unlock()
                 try? persistLocked()
             }
         }
@@ -644,6 +772,17 @@ public final class VersionRegistry: @unchecked Sendable {
         bundlesByID = byID; orderedIDs = order; _activeBundleID = state.activeBundleID
         ownedSnapshotPaths = Set(state.ownedSnapshotPaths.map { resolvedPath(forStored: $0) }
             .map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        pendingRetirementPaths = Set(state.pendingRetirementPaths.map { resolvedPath(forStored: $0) }
+            .map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        if !pendingRetirementPaths.isEmpty {
+            Self.retentionGuard.lock()
+            Self.pendingRetirements.formUnion(pendingRetirementPaths)
+            Self.retentionGuard.unlock()
+            // Round 7 items 1+2: a successful reload retries any
+            // pending retirement interrupted earlier (the failed-
+            // reload path returns before ever reaching this).
+            sweepPendingRetirementsLocked()
+        }
     }
 
     private func persistLocked() throws {
@@ -659,7 +798,8 @@ public final class VersionRegistry: @unchecked Sendable {
         let state = PersistedRegistryState(
             bundles: storedBundles,
             activeBundleID: _activeBundleID,
-            ownedSnapshotPaths: ownedSnapshotPaths.sorted().map { storedPath(forAbsolute: $0) }
+            ownedSnapshotPaths: ownedSnapshotPaths.sorted().map { storedPath(forAbsolute: $0) },
+            pendingRetirementPaths: pendingRetirementPaths.sorted().map { storedPath(forAbsolute: $0) }
         )
         let data = try JSONEncoder().encode(state)
         try FileManager.default.createDirectory(

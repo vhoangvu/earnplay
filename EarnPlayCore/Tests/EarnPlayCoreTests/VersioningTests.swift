@@ -810,6 +810,112 @@ extension VersioningTests {
         XCTAssertEqual(try registry.activeBundle.modelVersion, "candidate-m")
     }
 
+    // Round 7 helper: snapshot A retained by a resolved session,
+    // then snapshot B replaces it as previous-known-good, leaving
+    // A pending retirement (retained, unreferenced, owned).
+    private func makePendingRetirementScenario() throws -> (
+        store: URL, registry: VersionRegistry, artifacts: InferenceArtifacts,
+        firstPath: String, secondPath: String, model: URL
+    ) {
+        let store = tempStoreURL()
+        let model = try tempGGUF(named: "Round7.gguf")
+        try Data("GGUF-round7-A".utf8).write(to: model)
+        let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try registry.registerActiveAsPreviousKnownGood()
+        let firstPath = try registry.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!.modelFilePath!
+        try registry.rollbackToPreviousKnownGood()
+        let artifacts = try registry.inferenceArtifacts(defaultModelURL: nil)
+        XCTAssertEqual(artifacts.modelURL?.path, firstPath)
+        try registry.select(bundleID: "current")
+        try Data("GGUF-round7-B".utf8).write(to: model)
+        let second = try VersionRegistry.production(storeURL: store, modelURL: model)
+        try second.registerActiveAsPreviousKnownGood()
+        let secondPath = try second.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!.modelFilePath!
+        XCTAssertNotEqual(secondPath, firstPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPath))
+        return (store, second, artifacts, firstPath, secondPath, model)
+    }
+
+    // Round 7 item 1: a failed registry reload during release
+    // must not delete the snapshot or persist stale state.
+    func testFailedReloadDuringReleaseLeavesSnapshotAndStoreUntouched() throws {
+        let s = try makePendingRetirementScenario()
+        let validStore = try Data(contentsOf: s.store)
+        try Data("{{{ corrupt".utf8).write(to: s.store)
+        s.registry.releaseInferenceArtifacts(s.artifacts)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.firstPath),
+                      "failed reload must leave the pending snapshot on disk")
+        XCTAssertEqual(try Data(contentsOf: s.store), Data("{{{ corrupt".utf8),
+                       "failed reload must not persist stale in-memory state")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.secondPath))
+        // A later successful reload retries the pending retirement.
+        try validStore.write(to: s.store)
+        _ = try s.registry.registeredBundles
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.firstPath),
+                       "pending retirement must be retried on a later successful reload")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.secondPath))
+    }
+
+    // Round 7 item 2: a pending retirement that survives process
+    // termination is cleaned up on recovery; a snapshot still
+    // referenced by the current previous bundle is never swept.
+    func testInterruptedPendingRetirementIsCleanedUpOnRecovery() throws {
+        let s = try makePendingRetirementScenario()
+        VersionRegistry.simulateProcessTerminationForTesting()
+        let recovered = try VersionRegistry.production(storeURL: s.store, modelURL: s.model)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.firstPath),
+                       "interrupted pending snapshot must be cleaned up on recovery")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.secondPath),
+                      "snapshot referenced by the current bundle must never be swept")
+        _ = try recovered.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!
+    }
+
+    // Round 7 item 3: retirement marking and artifact release
+    // race — whichever order they interleave, no snapshot is
+    // orphaned and the new snapshot stays on disk.
+    func testRetirementMarkingRacingReleaseDoesNotOrphanSnapshot() throws {
+        for _ in 0..<20 {
+            let store = tempStoreURL()
+            let model = try tempGGUF(named: "Round7Race.gguf")
+            try Data("GGUF-race-A".utf8).write(to: model)
+            let registry = try VersionRegistry.production(storeURL: store, modelURL: model)
+            try registry.registerActiveAsPreviousKnownGood()
+            let firstPath = try registry.registeredBundles.first {
+                $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+            }!.modelFilePath!
+            try registry.rollbackToPreviousKnownGood()
+            let artifacts = try registry.inferenceArtifacts(defaultModelURL: nil)
+            try registry.select(bundleID: "current")
+            try Data("GGUF-race-B".utf8).write(to: model)
+            let second = try VersionRegistry.production(storeURL: store, modelURL: model)
+            final class ErrBox: @unchecked Sendable {
+                let lock = NSLock(); var errors: [Error] = []
+            }
+            let box = ErrBox()
+            DispatchQueue.concurrentPerform(iterations: 2) { idx in
+                if idx == 0 {
+                    do { try second.registerActiveAsPreviousKnownGood() }
+                    catch { box.lock.lock(); box.errors.append(error); box.lock.unlock() }
+                } else {
+                    second.releaseInferenceArtifacts(artifacts)
+                }
+            }
+            XCTAssertTrue(box.errors.isEmpty, "marking must not fail: \(box.errors)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath),
+                           "raced retirement must not orphan the old snapshot")
+            let secondPath = try second.registeredBundles.first {
+                $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+            }!.modelFilePath!
+            XCTAssertTrue(FileManager.default.fileExists(atPath: secondPath))
+        }
+    }
+
     // Round 6 F4: a snapshot handed to a resolved session is
     // retained when a new previous snapshot replaces it, and is
     // retired only when that session releases its artifacts.
