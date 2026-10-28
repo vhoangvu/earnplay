@@ -916,6 +916,51 @@ extension VersioningTests {
         }
     }
 
+    // Round 8: initialization interrupted between construction
+    // and restore must NOT lose ownership or pending-retirement
+    // metadata. The restoring initializer installs the complete
+    // decoded state in memory before its single atomic persist,
+    // so stopping right after construction leaves the store with
+    // full metadata and the pending snapshot still recoverable.
+    // (Pre-fix, plain construction persisted empty sets — see
+    // STEP27 probe: ownedSnapshotPaths=[] pendingRetirementPaths=[].)
+    func testInterruptedRegistryInitPreservesOwnershipAndPendingMetadata() throws {
+        let s = try makePendingRetirementScenario()
+        let bundles = try s.registry.registeredBundles
+        let active = try s.registry.activeBundleID
+        let firstName = URL(fileURLWithPath: s.firstPath).lastPathComponent
+        let secondName = URL(fileURLWithPath: s.secondPath).lastPathComponent
+        VersionRegistry.simulateProcessTerminationForTesting()
+        // Interrupted init: construct from the decoded state, then
+        // stop — no sweep, no further restore step (the kill point).
+        _ = try VersionRegistry(
+            bundles: bundles, activeBundleID: active, storeURL: s.store,
+            restoredOwnedSnapshotPaths: [s.firstPath, s.secondPath],
+            restoredPendingRetirementPaths: [s.firstPath])
+        let raw = try Data(contentsOf: s.store)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        XCTAssertEqual(Set(object["ownedSnapshotPaths"] as? [String] ?? []),
+                       [firstName, secondName],
+                       "interrupted init must keep ownership metadata")
+        XCTAssertEqual(object["pendingRetirementPaths"] as? [String], [firstName],
+                       "interrupted init must keep pending-retirement metadata")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.firstPath),
+                      "unreferenced retained snapshot must still be recoverable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.secondPath))
+        // Recovery: the intact metadata drives cleanup of the
+        // unreferenced snapshot; the referenced one is preserved.
+        let recovered = try VersionRegistry.production(storeURL: s.store, modelURL: s.model)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.firstPath),
+                       "recovered pending snapshot must be cleaned up")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: s.secondPath),
+                      "referenced snapshot must never be swept")
+        let previous = try recovered.registeredBundles.first {
+            $0.bundleID == VersionRegistry.previousKnownGoodBundleID
+        }!
+        XCTAssertEqual(URL(fileURLWithPath: previous.modelFilePath!).lastPathComponent, secondName)
+    }
+
     // Round 6 F4: a snapshot handed to a resolved session is
     // retained when a new previous snapshot replaces it, and is
     // retired only when that session releases its artifacts.

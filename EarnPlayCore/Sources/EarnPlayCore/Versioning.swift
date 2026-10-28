@@ -264,7 +264,10 @@ public final class VersionRegistry: @unchecked Sendable {
         }
     }
 
-    public init(bundles: [VersionBundle], activeBundleID: String, storeURL: URL? = nil) throws {
+    public init(bundles: [VersionBundle], activeBundleID: String, storeURL: URL? = nil,
+                restoredOwnedSnapshotPaths: [String] = [],
+                restoredPendingRetirementPaths: [String] = [],
+                mergingCurrent currentToMerge: VersionBundle? = nil) throws {
         for bundle in bundles { try Self.validate(bundle) }
         let ids = bundles.map(\.bundleID)
         guard Set(ids).count == ids.count, ids.contains(activeBundleID) else {
@@ -278,10 +281,37 @@ public final class VersionRegistry: @unchecked Sendable {
             bundlesByID[bound.bundleID] = bound
             orderedIDs.append(bound.bundleID)
         }
+        // Round 8: restore the COMPLETE decoded state in memory
+        // before any write. Ownership and pending-retirement sets
+        // are installed here, and the current bundle is merged,
+        // so the single persist below already carries the full
+        // recovered state. The old construct-then-restore order
+        // persisted empty sets first; a kill in that window
+        // permanently lost the cleanup metadata.
+        ownedSnapshotPaths = Set(restoredOwnedSnapshotPaths.map {
+            URL(fileURLWithPath: resolvedPath(forStored: $0)).standardizedFileURL.path
+        })
+        pendingRetirementPaths = Set(restoredPendingRetirementPaths.map {
+            URL(fileURLWithPath: resolvedPath(forStored: $0)).standardizedFileURL.path
+        })
+        if !pendingRetirementPaths.isEmpty {
+            Self.retentionGuard.lock()
+            Self.pendingRetirements.formUnion(pendingRetirementPaths)
+            Self.retentionGuard.unlock()
+        }
+        if let currentToMerge { mergeCurrentBundleInMemory(currentToMerge) }
         if storeURL != nil {
             lock.lock(); defer { lock.unlock() }
             try persistLocked()
         }
+    }
+
+    /// Merge the live "current" bundle in memory only (no write);
+    /// the caller persists the combined state atomically.
+    private func mergeCurrentBundleInMemory(_ current: VersionBundle) {
+        let boundCurrent = Self.enriched(current, bindDefaultModel: true)
+        if bundlesByID[boundCurrent.bundleID] == nil { orderedIDs.append(boundCurrent.bundleID) }
+        bundlesByID[boundCurrent.bundleID] = boundCurrent
     }
 
     public static func defaultStoreURL(fileManager: FileManager = .default) -> URL {
@@ -309,15 +339,20 @@ public final class VersionRegistry: @unchecked Sendable {
             guard !state.bundles.isEmpty else {
                 throw VersioningError.unknownBundle(state.activeBundleID)
             }
+            // Round 8: the complete decoded state (bundles,
+            // ownership, pending retirements) plus the merged
+            // current bundle is restored in memory inside the
+            // initializer, which then persists it in ONE atomic
+            // write. No write of any kind happens before that
+            // persist, so a kill during initialization can no
+            // longer strand a store with erased cleanup metadata.
             let registry = try VersionRegistry(
-                bundles: state.bundles, activeBundleID: state.activeBundleID, storeURL: url
+                bundles: state.bundles, activeBundleID: state.activeBundleID, storeURL: url,
+                restoredOwnedSnapshotPaths: state.ownedSnapshotPaths,
+                restoredPendingRetirementPaths: state.pendingRetirementPaths,
+                mergingCurrent: current
             )
-            registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
-            registry.restorePendingRetirements(state.pendingRetirementPaths)
-            try registry.refreshCurrentBundle(current)
-            registry.restoreOwnedSnapshotPaths(state.ownedSnapshotPaths)
-            registry.restorePendingRetirements(state.pendingRetirementPaths)
-            registry.sweepOrphanedOwnedSnapshotsOnRecovery()
+            registry.sweepInterruptedCleanupsOnRecovery()
             return registry
         }
         return try VersionRegistry(bundles: [current], activeBundleID: "current", storeURL: url)
@@ -347,42 +382,15 @@ public final class VersionRegistry: @unchecked Sendable {
                              modelFilePath: modelURL.path, promptTexts: SpikePrompts.all)
     }
 
-    /// Restore ownership records decoded outside the registry
-    /// (used by `production`, whose init persist precedes this).
-    func restoreOwnedSnapshotPaths(_ stored: [String]) {
-        guard !stored.isEmpty else { return }
-        lock.lock(); defer { lock.unlock() }
-        for path in stored {
-            ownedSnapshotPaths.insert(
-                URL(fileURLWithPath: resolvedPath(forStored: path)).standardizedFileURL.path)
-        }
-        try? persistLocked()
-    }
-
-    /// Restore persisted pending retirements (round 7 item 2,
-    /// used by `production`), then sweep any whose cleanup was
-    /// interrupted by termination.
-    func restorePendingRetirements(_ stored: [String]) {
-        guard !stored.isEmpty else { return }
-        lock.lock(); defer { lock.unlock() }
-        for path in stored {
-            let key = URL(fileURLWithPath: resolvedPath(forStored: path)).standardizedFileURL.path
-            pendingRetirementPaths.insert(key)
-            Self.retentionGuard.lock()
-            Self.pendingRetirements.insert(key)
-            Self.retentionGuard.unlock()
-        }
-        try? persistLocked()
-        sweepPendingRetirementsLocked()
-    }
-
     /// Round 7 item 2 recovery sweep. Caller must hold `lock`.
     /// Deletes ONLY persisted-pending snapshots that are no
     /// longer retained by a resolved session, not referenced by
     /// any registered bundle, and registry-owned. A referenced
-    /// or retained snapshot is never swept.
-    private func sweepPendingRetirementsLocked() {
-        guard !pendingRetirementPaths.isEmpty else { return }
+    /// or retained snapshot is never swept. Returns whether the
+    /// in-memory sets changed; the caller persists atomically.
+    @discardableResult
+    private func sweepPendingRetirementsLocked() -> Bool {
+        guard !pendingRetirementPaths.isEmpty else { return false }
         var changed = false
         for key in pendingRetirementPaths.sorted() {
             if Self.retentionCount(forPath: key) > 0 { continue }
@@ -405,16 +413,16 @@ public final class VersionRegistry: @unchecked Sendable {
             Self.retentionGuard.unlock()
             changed = true
         }
-        if changed { try? persistLocked() }
+        return changed
     }
 
-    /// Recovery-only (production restore): also reclaim owned
+    /// Orphan sweep. Caller must hold `lock`. Also reclaims owned
     /// snapshots no bundle references — e.g. orphans written by
     /// a version whose pending marker was never persisted. Same
     /// guards as the pending sweep: retained or referenced
     /// snapshots are never touched.
-    func sweepOrphanedOwnedSnapshotsOnRecovery() {
-        lock.lock(); defer { lock.unlock() }
+    @discardableResult
+    private func sweepOrphanedOwnedSnapshotsLocked() -> Bool {
         var changed = false
         for key in ownedSnapshotPaths.sorted() {
             if Self.retentionCount(forPath: key) > 0 { continue }
@@ -430,20 +438,19 @@ public final class VersionRegistry: @unchecked Sendable {
             Self.retentionGuard.unlock()
             changed = true
         }
-        if changed { try? persistLocked() }
+        return changed
     }
 
-    /// Lenient refresh of "current" without artifact validation, so a
-    /// corrupt current model cannot block recovery (F1).
-    private func refreshCurrentBundle(_ current: VersionBundle) throws {
+    /// Recovery cleanup (production restore, round 8): sweep
+    /// interrupted pending retirements and orphaned owned
+    /// snapshots, then persist the cleaned state in one atomic
+    /// write. Runs only after the recovered state itself has
+    /// already been persisted atomically by the initializer.
+    func sweepInterruptedCleanupsOnRecovery() {
         lock.lock(); defer { lock.unlock() }
-        let savedByID = bundlesByID; let savedOrder = orderedIDs; let savedActive = _activeBundleID
-        let boundCurrent = Self.enriched(current, bindDefaultModel: true)
-        if bundlesByID[boundCurrent.bundleID] == nil { orderedIDs.append(boundCurrent.bundleID) }
-        bundlesByID[boundCurrent.bundleID] = boundCurrent
-        do { try persistLocked() } catch {
-            bundlesByID = savedByID; orderedIDs = savedOrder; _activeBundleID = savedActive; throw error
-        }
+        let pendingChanged = sweepPendingRetirementsLocked()
+        let orphanChanged = sweepOrphanedOwnedSnapshotsLocked()
+        if pendingChanged || orphanChanged { try? persistLocked() }
     }
 
     public var activeBundle: VersionBundle {
@@ -781,7 +788,7 @@ public final class VersionRegistry: @unchecked Sendable {
             // Round 7 items 1+2: a successful reload retries any
             // pending retirement interrupted earlier (the failed-
             // reload path returns before ever reaching this).
-            sweepPendingRetirementsLocked()
+            if sweepPendingRetirementsLocked() { try? persistLocked() }
         }
     }
 
