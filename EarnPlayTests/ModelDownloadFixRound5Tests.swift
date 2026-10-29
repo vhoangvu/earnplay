@@ -290,50 +290,31 @@ final class ModelDownloadFixRound5Tests: XCTestCase {
     /// `tearDown` performs, and the sentinel must survive
     /// byte-identical. Afterwards the prior state — file or absence —
     /// is restored exactly.
+    ///
+    /// Fix round 7: the shelter runs through `ShelteredFileGuard` —
+    /// the backup lives outside the temp roots being cleaned, and
+    /// restoration is established before the sentinel write — so
+    /// neither the cleanup below nor a sentinel-write failure can
+    /// lose a pre-existing real model.
     @MainActor
     func testRealDefaultDestinationSurvivesIsolatedSuite() throws {
         let real = ModelDownloader.defaultDestinationURL()
-        let parentDir = real.deletingLastPathComponent()
-        let parentExisted = FileManager.default.fileExists(atPath: parentDir.path)
         let sentinel = Data("round6-no-touch-sentinel".utf8)
 
-        // Shelter a pre-existing real model aside so the suite can
-        // never harm it; refuse to proceed rather than risk it.
-        var shelter: URL?
-        if FileManager.default.fileExists(atPath: real.path) {
-            let backup = makeTempRoot().appendingPathComponent("sheltered-real-model.gguf")
-            do {
-                try FileManager.default.moveItem(at: real, to: backup)
-            } catch {
-                throw XCTSkip("cannot shelter the pre-existing model at \(real.path); refusing to risk it: \(error)")
-            }
-            print("round6: sheltered pre-existing \(real.path) at \(backup.path)")
-            shelter = backup
-        }
-        try writeFile(at: real, data: sentinel)
-        defer {
-            try? FileManager.default.removeItem(at: real)
-            if !parentExisted {
-                try? FileManager.default.removeItem(at: parentDir)
-            }
-            if let shelter {
-                do {
-                    try FileManager.default.moveItem(at: shelter, to: real)
-                } catch {
-                    XCTFail("FAILED to restore sheltered model from \(shelter.path) to \(real.path): \(error)")
-                }
-            }
-        }
+        let shelter = ShelteredFileGuard()
+        try shelter.run(real: real, sentinel: sentinel,
+            write: { url, data in try self.writeFile(at: url, data: data) },
+            body: { _ in
+                // Every flow in this suite, plus the exact cleanup
+                // tearDown performs — then the real location must
+                // still hold the untouched sentinel.
+                try self.runReadyGuardFlow()
+                try self.runCheckingGuardFlow()
+                self.removeTempRoots()
 
-        // Every flow in this suite, plus the exact cleanup tearDown
-        // performs — then the real location must still hold the
-        // untouched sentinel.
-        try runReadyGuardFlow()
-        try runCheckingGuardFlow()
-        removeTempRoots()
-
-        XCTAssertEqual(try? Data(contentsOf: real), sentinel,
-            "no test may write to or delete the real default destination; the sentinel must survive the suite byte-identical")
+                XCTAssertEqual(try? Data(contentsOf: real), sentinel,
+                    "no test may write to or delete the real default destination; the sentinel must survive the suite byte-identical")
+            })
     }
 
     /// The round-6 seam must leave the production lookup unchanged: a
