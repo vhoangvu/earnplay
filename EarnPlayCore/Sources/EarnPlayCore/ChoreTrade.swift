@@ -379,6 +379,58 @@ public enum DemoChorePool {
     }
 }
 
+// MARK: - Pool source resolution (fix round 3, finding 1)
+
+/// Resolves which chore pool the trade UI offers from.
+///
+/// Demo mode is the ABSENCE of a parent-authored policy: the cached
+/// policy is still `Policy.defaultPolicy` (version 0, before the first
+/// sync). A cached parent-authored policy (version > default) is always
+/// respected as-is — including an EMPTY pool (a parent can remove every
+/// chore), which yields no offers, never the demo seed. Gating demo mode
+/// on an empty pool instead would offer demo chores against a parent's
+/// explicit empty pool and route the grant through the demo fixture.
+public enum ChoreTradePoolSource {
+    /// Resolved pool, caption, and demo flag for the trade UI.
+    public struct Resolution: Equatable, Sendable {
+        public var pool: [ChorePoolEntry]
+        public var poolSourceCaption: String
+        public var isDemo: Bool
+
+        public init(
+            pool: [ChorePoolEntry],
+            poolSourceCaption: String,
+            isDemo: Bool
+        ) {
+            self.pool = pool
+            self.poolSourceCaption = poolSourceCaption
+            self.isDemo = isDemo
+        }
+    }
+
+    /// True when `policy` is parent-authored (a real sync/admin write),
+    /// as opposed to the built-in default before the first sync.
+    public static func isParentAuthored(_ policy: Policy) -> Bool {
+        policy.version > Policy.defaultPolicy.version
+    }
+
+    /// Resolves the pool, caption, and demo flag for a cached policy.
+    public static func resolve(policy: Policy) -> Resolution {
+        if isParentAuthored(policy) {
+            return Resolution(
+                pool: policy.chorePool,
+                poolSourceCaption: "Parent's chores (policy v\(policy.version))",
+                isDemo: false
+            )
+        }
+        return Resolution(
+            pool: DemoChorePool.seeded(),
+            poolSourceCaption: "Demo chores",
+            isDemo: true
+        )
+    }
+}
+
 // MARK: - Demo shield fixture (fix round 2)
 
 /// Configured policy/enumeration pairs behind the chore-trade demo UI.

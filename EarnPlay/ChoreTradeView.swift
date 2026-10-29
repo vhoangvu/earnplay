@@ -15,16 +15,21 @@ import SwiftUI
 /// movement vs chore, weekly caps) and will replace this button.
 struct ChoreTradeView: View {
     @StateObject private var viewModel: ChoreTradeViewModel
+    /// Granted-screen status ticker: fires only while the granted branch
+    /// is rendered (via `onReceive` there), driving the view model's
+    /// periodic status refresh. Owned by the view so its subscription
+    /// lifetime is the granted screen's lifetime.
+    private let statusTicker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init() {
         let policyStore = PolicyStore()
-        let policyPool = policyStore.currentPolicy.chorePool
-        // Demo seed only when the policy pool is empty (no sync in the
-        // demo); a synced parent-stocked pool always wins.
-        let pool = policyPool.isEmpty ? DemoChorePool.seeded() : policyPool
-        let caption = policyPool.isEmpty
-            ? "Demo chores"
-            : "Parent's chores (policy v\(policyStore.currentPolicy.version))"
+        // Demo mode is the ABSENCE of a parent-authored policy (fix round
+        // 3): a cached parent policy with an EMPTY pool is respected
+        // (no offers, real policy path), never replaced by the demo seed.
+        let resolution = ChoreTradePoolSource.resolve(
+            policy: policyStore.currentPolicy)
+        let pool = resolution.pool
+        let caption = resolution.poolSourceCaption
         // Configured policy/enumeration pair (fix round 2): the grant
         // path only unlocks enumerated challenge-unlockable apps, so
         // `.empty` enumeration could never grant. Demo mode (no sync)
@@ -32,7 +37,7 @@ struct ChoreTradeView: View {
         // the default-deny policy untouched; a synced policy derives
         // its enumeration from its own app lists.
         let manager: ShieldManager
-        if policyPool.isEmpty {
+        if resolution.isDemo {
             let demoDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("EarnPlayChoreTradeDemo", isDirectory: true)
             let demoStore = PolicyStore(directory: demoDirectory)
@@ -78,6 +83,9 @@ struct ChoreTradeView: View {
                 awaitingConfirmView(offer)
             case .granted(let record):
                 grantedView(record)
+                    .onAppear { viewModel.startStatusUpdates() }
+                    .onDisappear { viewModel.stopStatusUpdates() }
+                    .onReceive(statusTicker) { _ in viewModel.refreshGrantedStatus() }
             }
             Text(viewModel.poolSourceCaption)
                 .font(.caption)
@@ -144,6 +152,16 @@ struct ChoreTradeView: View {
                 .font(.subheadline.bold())
             Text("Done: \(offer.entry.chore). No unlock yet — your parent must confirm in person.")
                 .font(.subheadline)
+            // Grant failure feedback (fix round 3): a failed grant leaves
+            // the session here, so the failure must show here — otherwise
+            // Confirm appears to do nothing. The button stays tappable:
+            // the same tap retries the grant.
+            if let failure = viewModel.confirmationFailureText {
+                Text(failure)
+                    .font(.subheadline)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("grantFailureText")
+            }
             Button("Parent: Confirm completion") { viewModel.parentConfirm() }
                 .accessibilityIdentifier("parentConfirmButton")
         }
@@ -157,92 +175,6 @@ struct ChoreTradeView: View {
             Text(viewModel.shieldStatus)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        }
-    }
-}
-
-/// View model behind `ChoreTradeView`: owns the `ChoreTradeSession`
-/// state machine and calls `ShieldManager` exactly once, on parent
-/// confirm. Done never touches the shield manager.
-@MainActor
-final class ChoreTradeViewModel: ObservableObject {
-    @Published private(set) var session: ChoreTradeSession
-    @Published private(set) var lastTriggerFoundNone = false
-    @Published private(set) var shieldStatus = ""
-    @Published private(set) var grantSucceeded: Bool?
-    let poolSourceCaption: String
-
-    private let shieldManager: ShieldManager
-    private let effortRecorder: EffortSessionRecorder?
-
-    init(
-        pool: [ChorePoolEntry],
-        poolSourceCaption: String,
-        shieldManager: ShieldManager,
-        effortRecorder: EffortSessionRecorder? = nil
-    ) {
-        self.session = ChoreTradeSession(pool: pool)
-        self.poolSourceCaption = poolSourceCaption
-        self.shieldManager = shieldManager
-        self.effortRecorder = effortRecorder
-    }
-
-    var declinedCount: Int { session.declinedChores.count }
-
-    func triggerOffer() {
-        let offer = session.makeOffer(at: Date())
-        lastTriggerFoundNone = (offer == nil && session.currentOffer == nil && !session.hasGrantedUnlock)
-        effortRecorder?.recordInteraction()
-    }
-
-    func accept() {
-        session.acceptOffer(at: Date())
-        effortRecorder?.recordInteraction()
-    }
-
-    func decline() {
-        session.declineOffer()
-        effortRecorder?.recordInteraction()
-    }
-
-    func markDone() {
-        session.markDone(at: Date())
-        effortRecorder?.recordInteraction()
-    }
-
-    func parentConfirm() {
-        // Commit-on-success (fix round 2): the session replaces itself
-        // with the confirmed copy only when the shield grant succeeds,
-        // so a failed grant leaves confirmation retryable instead of
-        // stranding the session in .granted with no unlock.
-        var grantAttempted: Bool?
-        let record = session.parentConfirmWithGrant(at: Date()) { record in
-            let ok = shieldManager.grantChoreTradeUnlock(
-                minutes: record.grantedUnlockMinutes)
-            grantAttempted = ok
-            return ok
-        }
-        guard record != nil else {
-            if grantAttempted == false {
-                grantSucceeded = false
-                effortRecorder?.recordInteraction()
-                refreshShieldStatus()
-            }
-            return
-        }
-        grantSucceeded = true
-        effortRecorder?.recordInteraction()
-        refreshShieldStatus()
-    }
-
-    private func refreshShieldStatus() {
-        if shieldManager.isUnlockActive {
-            let remaining = Int(shieldManager.remainingUnlockTime.rounded(.down))
-            shieldStatus = "Device unlock active, \(remaining) seconds left."
-        } else if grantSucceeded == false {
-            shieldStatus = "Device shields unchanged (unlock not granted)."
-        } else {
-            shieldStatus = ""
         }
     }
 }

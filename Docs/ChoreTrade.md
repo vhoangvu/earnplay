@@ -48,13 +48,23 @@ The record's `grantedUnlockMinutes` drive
 `ShieldManager.grantChoreTradeUnlock(minutes:)`, which opens every
 challenge-unlockable app for the chore's stated minutes. The view model
 calls the shield manager exactly once, on parent confirm — Done never
-touches it.
+touches it. A failed grant (persistence failure, or a policy with no
+unlockable apps) leaves the session awaiting confirmation and surfaces
+failure text there, so the same Confirm tap retries. After a grant the
+view model starts expiry monitoring and the granted screen refreshes
+its status line periodically, showing the live countdown and then an
+expired state once the window ends.
 
 ## Demo inputs
 
-- Pool: the synced policy pool when present, else `DemoChorePool`
-  (three parent-confirm chores, far-future expiry). The view captions
-  which source is shown.
+- Pool: the synced parent-authored policy's pool (version > default),
+  even when EMPTY — a parent-cleared pool yields no offers, never the
+  demo seed. `DemoChorePool` (three parent-confirm chores, far-future
+  expiry) applies only before the first sync, when the cached policy is
+  still the default (version 0). The view captions which source is
+  shown. Demo mode also routes the grant through an isolated fixture
+  policy store; a synced policy uses the real cache and an enumeration
+  derived from its own app lists.
 - Parent confirmation is in person on the same device (the demo "Parent:
   Confirm completion" button). No photo-proof pipeline is built here.
 - The "Take a chore break" trigger is the demo stand-in for offer
