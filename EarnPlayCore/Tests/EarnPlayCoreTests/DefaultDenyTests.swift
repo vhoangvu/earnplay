@@ -9,11 +9,15 @@ import XCTest
 /// Two enforcement layers: an install observed via `noteInstalledApp`
 /// (the host-side simulated install transition, driven after shields
 /// apply) is shielded individually in the APPLIED configuration, so the
-/// backend itself — the launch gate in the simulated scope — reports
-/// blocked; an app never observed stays open only when allowlisted or
-/// unlocked, so an unknown token or category resolves to locked rather
-/// than to allowed. T2.2 semantics for classified apps and the
-/// always-allowed/unlocked exemptions are unchanged.
+/// backend reports blocked; an app never observed stays open only when
+/// allowlisted or unlocked, so an unknown token or category resolves to
+/// locked rather than to allowed. The launch gate is
+/// `ShieldManager.isShielded` — backend state plus the default-deny
+/// backstop — never `ShieldBackend.isShielded` alone: the backend
+/// cannot name an app it has never observed, so only the gate blocks a
+/// fresh install before its first observation. T2.2 semantics for
+/// classified apps and the always-allowed/unlocked exemptions are
+/// unchanged.
 ///
 /// Demo verification runs against a simulated backend. Real shield
 /// enforcement (ManagedSettings, v1) is NOT verified here.
@@ -119,18 +123,17 @@ final class DefaultDenyTests: XCTestCase {
         let freshC = AppRef(id: "com.example.fresh-install-\(UUID().uuidString)")
         let unknownCategory = AppCategoryRef(id: "unknown-\(UUID().uuidString)")
 
-        // Pre-install layer boundary: the query already reports locked,
-        // and the backend enforces where the category backstop reaches
-        // (`games` remains; `social` is withheld for allowlisted B) — but
-        // the applied configuration cannot shield an app it has never
-        // observed, so the backend leaves C open everywhere else.
+        // Pre-observation gate boundary: the launch gate
+        // (`manager.isShielded`) denies the fresh install in every
+        // category — `social` (withheld for allowlisted B), nil, and
+        // unknown — before its first launch. The applied configuration
+        // cannot name an app it has never observed, so backend
+        // enforcement reaches only the category backstop (`games`
+        // remains and shields C there); the gate closes the rest.
         XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.games))
         XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.social))
         XCTAssertTrue(backend.isShielded(app: freshC, category: Self.games))
         XCTAssertFalse(manager.currentConfiguration.shieldedApplications.contains(freshC))
-        XCTAssertFalse(backend.isShielded(app: freshC, category: Self.social))
-        XCTAssertFalse(backend.isShielded(app: freshC, category: nil))
-        XCTAssertFalse(backend.isShielded(app: freshC, category: unknownCategory))
         XCTAssertTrue(manager.isShielded(app: freshC, category: Self.social))
         XCTAssertTrue(manager.isShielded(app: freshC, category: nil))
         XCTAssertTrue(manager.isShielded(app: freshC, category: unknownCategory))

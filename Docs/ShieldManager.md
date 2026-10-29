@@ -41,15 +41,26 @@ tests run without any entitlement.
 - Two enforcement layers. An install observed via `noteInstalledApp`
   (the host-side simulated install transition, driven after shields
   apply) is shielded individually in the applied configuration, so the
-  backend itself — the launch gate in the simulated scope — reports
-  blocked until a policy sync classifies the app. An app never observed
-  stays open only when allowlisted or unlocked, so an unknown token or
-  category resolves to locked rather than to allowed.
+  backend reports blocked until a policy sync classifies the app. An
+  app never observed stays open only when allowlisted or unlocked, so
+  an unknown token or category resolves to locked rather than to
+  allowed. The launch gate is `ShieldManager.isShielded` — backend
+  state plus the default-deny backstop — never the backend query
+  alone: the backend cannot name an app it has never observed, so only
+  the gate blocks a fresh install before its first observation.
 - Observations are install facts, not picker state: replacing the
-  enumeration never clears them, so an installed-but-unpicked app stays
-  shielded (including with an empty enumeration). An allowlisted install
-  withholds its category like a picked app, and an unlocked install
-  stays open; category knowledge is sticky and never regresses.
+  enumeration never clears observations for apps the replacement does
+  not name, so an installed-but-unpicked app stays shielded (including
+  with an empty enumeration). When the enumeration names an app, its
+  mapping wins and the superseded observed entry for that app is
+  dropped, so a stale category can neither widen allowlist coverage
+  nor linger in an unlock; coverage for genuinely unenumerated
+  observed apps never regresses. An allowlisted install withholds its
+  category like a picked app, and an unlocked install stays open;
+  category knowledge is sticky and never regresses.
+- Observations persist via `FileObservedInstallStore` and are restored
+  before the initial configuration is applied, so a recreated manager
+  keeps every observed shield.
 - T2.2 semantics for classified apps are unchanged, and there is still
   no per-app exemption over a category shield. Demo scope is the
   simulated backend; no real device shields.
