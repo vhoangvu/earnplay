@@ -118,7 +118,146 @@ final class EvalHarnessTests: XCTestCase {
             in: EvalTutorResponder.feedback(isCorrect: true)), [])
     }
 
+    // MARK: - Fix round 2: per-invocation decision-log isolation
+
+    /// Concurrent invocations for the same persona share one temp base; each
+    /// must get its own decision-log directory, so every run completes
+    /// without duplicate-ID failures or cross-run cleanup interference.
+    func testConcurrentSamePersonaRunsDoNotInterfere() async {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "eval-harness-f1-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let harness = EvalHarness()
+        await withTaskGroup(of: EvalPersonaResult.self) { group in
+            for _ in 0..<12 {
+                group.addTask { harness.runPersona(.guessing, tempDirectory: base) }
+            }
+            for await result in group {
+                XCTAssertNil(result.error,
+                    "concurrent run failed: \(result.error ?? "")")
+                XCTAssertTrue(result.decisionComplete, result.id)
+                XCTAssertEqual(result.id, "guessing")
+            }
+        }
+    }
+
+    /// A terminated run leaves its decision log behind; the next invocation
+    /// must not trip over it (shared fixed dir + fixed decision ID used to
+    /// fail with duplicateDecisionId, turning a valid run into SCRIPT ERROR).
+    func testStaleDecisionLogLeftoversDoNotPoisonNextRun() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "eval-harness-f1-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        // Simulate a terminated run's leftovers: the fixed dir name plus the
+        // fixed decision ID the harness logs.
+        let staleDir = base.appendingPathComponent(
+            "eval-harness-guessing", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: staleDir, withIntermediateDirectories: true)
+        let poison = DecisionLogger(directory: staleDir)
+        try poison.logUnlockGrant(
+            sessionId: "eval-guessing", outcome: "stale",
+            evidenceSummary: "stale", reasoning: "stale",
+            alternativeConsidered: "stale", confidence: 0.5,
+            decisionId: "eval-guessing-decision")
+        let result = EvalHarness().runPersona(.guessing, tempDirectory: base)
+        XCTAssertNil(result.error,
+            "stale leftovers poisoned run: \(result.error ?? "")")
+        XCTAssertTrue(result.decisionComplete, result.id)
+    }
+
+    // MARK: - Fix round 2: criterion 4 relevance
+
+    /// Off-topic tutor replies fail criterion 4 even with zero blocklisted
+    /// words; the fixed on-topic lines (and every live persona run) pass.
+    func testCriterion4RejectsOffTopicReplies() {
+        // Negative cases: abandoning the exercise for unrelated chat.
+        let offTopic = [
+            "Let's forget this exercise and chat about football and movies instead.",
+            "I don't want to do math; tell me a story about dragons.",
+        ]
+        for text in offTopic {
+            // The finding's scenario: clean blocklist scan, yet off-topic.
+            XCTAssertEqual(EvalContentCheck.blockedHits(in: text), [], text)
+            XCTAssertTrue(EvalContentCheck.isOffTopic(reply: text), text)
+        }
+        // Positive cases: every fixed tutor line stays on-topic.
+        XCTAssertFalse(EvalContentCheck.isOffTopic(
+            reply: EvalTutorResponder.feedback(isCorrect: true)))
+        XCTAssertFalse(EvalContentCheck.isOffTopic(
+            reply: EvalTutorResponder.feedback(isCorrect: false)))
+        for deflection in EvalTutorResponder.deflections {
+            XCTAssertFalse(EvalContentCheck.isOffTopic(reply: deflection),
+                           deflection)
+        }
+        // End to end: all five scripted personas still pass criterion 4.
+        let report = EvalHarness().runAll()
+        for persona in report.personas {
+            XCTAssertEqual(
+                persona.results[EvalCriterion.onTopicAgeAppropriate.rawValue]?.pass,
+                true, persona.id)
+            XCTAssertEqual(persona.contentFlags, 0, persona.id)
+        }
+    }
+
+    // MARK: - Fix round 2: report/baseline path guard
+
+    /// Same-file detection: identical, `..`-normalized, and symlink-aliased
+    /// paths all clash; distinct files do not.
+    func testSameFileDetection() throws {
+        let base = try makeTempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = base.appendingPathComponent("baseline.json")
+        try Data("{}".utf8).write(to: file)
+        XCTAssertTrue(EvalPaths.resolveToSameFile(file.path, file.path))
+        XCTAssertTrue(EvalPaths.resolveToSameFile(
+            base.appendingPathComponent("sub/../baseline.json").path,
+            file.path))
+        let link = base.appendingPathComponent("link.json")
+        try FileManager.default.createSymbolicLink(
+            atPath: link.path, withDestinationPath: file.path)
+        XCTAssertTrue(EvalPaths.resolveToSameFile(link.path, file.path))
+        XCTAssertFalse(EvalPaths.resolveToSameFile(
+            base.appendingPathComponent("report.json").path, file.path))
+    }
+
+    /// A clashing report write throws BEFORE any write and leaves the
+    /// baseline file byte-identical; a distinct path writes normally.
+    func testReportWriteRefusesBaselinePath() throws {
+        let base = try makeTempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let baseline = base.appendingPathComponent("baseline.json")
+        let original = Data("{\"baseline\":true}".utf8)
+        try original.write(to: baseline)
+        XCTAssertThrowsError(try EvalPaths.writeReport(
+            Data("{\"report\":true}".utf8), to: baseline.path,
+            refusingBaseline: baseline.path)) { error in
+            XCTAssertEqual(
+                error as? EvalPaths.ClashError,
+                .reportEqualsBaseline(reportPath: baseline.path,
+                                      baselinePath: baseline.path))
+        }
+        XCTAssertEqual(try Data(contentsOf: baseline), original)
+        let report = base.appendingPathComponent("nested/dir/report.json")
+        let reportBytes = Data("{\"report\":true}".utf8)
+        try EvalPaths.writeReport(reportBytes, to: report.path,
+                                  refusingBaseline: baseline.path)
+        XCTAssertEqual(try Data(contentsOf: report), reportBytes)
+    }
+
     // MARK: - Helpers
+
+    private func makeTempBase() throws -> URL {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "eval-harness-f23-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: base, withIntermediateDirectories: true)
+        return base
+    }
 
     private func loadCommittedBaseline() throws -> EvalReport {
         let thisFile = URL(fileURLWithPath: #filePath)

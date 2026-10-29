@@ -450,6 +450,24 @@ enum EvalContentCheck: Sendable {
     static func blockedHits(in text: String) -> [String] {
         Array(Set(tokens(text)).intersection(blockedWords)).sorted()
     }
+
+    /// Vetted on-topic tutor replies for these deterministic scripts: the
+    /// fixed grading feedback lines plus the fixed manipulation deflections.
+    static let vettedReplies: Set<String> = Set(
+        [EvalTutorResponder.feedback(isCorrect: true),
+         EvalTutorResponder.feedback(isCorrect: false)]
+            + EvalTutorResponder.deflections)
+
+    /// True when a harness-authored tutor reply is off-topic: neither a
+    /// vetted script line nor redirecting to practice (no redirect
+    /// vocabulary). Fail-closed: an unrecognized reply (e.g. abandoning the
+    /// exercise for unrelated chat) fails criterion 4 even with zero
+    /// blocklisted words.
+    static func isOffTopic(reply: String) -> Bool {
+        if vettedReplies.contains(reply) { return false }
+        let words = Set(tokens(reply))
+        return words.intersection(EvalTutorResponder.redirectTokens).isEmpty
+    }
 }
 
 // MARK: - Scripted session engine
@@ -874,21 +892,30 @@ public struct EvalHarness: Sendable {
             }
         }
 
-        // Criterion 4 evidence: whole corpus blocklist scan.
+        // Criterion 4 evidence: whole-corpus blocklist scan plus an explicit
+        // relevance check over the harness-authored tutor replies.
         var flagHits: [String] = []
         for text in session.presentedTexts + session.responses.map(\.text) {
             flagHits += EvalContentCheck.blockedHits(in: text)
+        }
+        let offTopicReplies = session.responses.map(\.text).filter {
+            EvalContentCheck.isOffTopic(reply: $0)
         }
 
         let rulesUnchanged = scorer.threshold == Self.harnessThreshold
             && scorer.floorSettings == EffortFloorSettings.default
 
         // The unlock decision is logged through the merged T1.6 logger in
-        // an isolated temp directory (removed afterwards); the report keeps
-        // the decision type and its completeness proof.
+        // a per-invocation isolated temp directory (UUID suffix, removed
+        // afterwards); the report keeps the decision type and its
+        // completeness proof. The suffix never enters the report, so reports
+        // stay deterministic. A fixed shared name would collide across
+        // concurrent runs (duplicateDecisionId) or poison later runs with a
+        // terminated run's leftovers.
         let base = tempDirectory ?? FileManager.default.temporaryDirectory
         let runDir = base.appendingPathComponent(
-            "eval-harness-\(persona.rawValue)", isDirectory: true)
+            "eval-harness-\(persona.rawValue)-\(UUID().uuidString)",
+            isDirectory: true)
         let decision: Decision
         do {
             try FileManager.default.createDirectory(
@@ -954,10 +981,22 @@ public struct EvalHarness: Sendable {
 
         // Criterion 4: stays on-topic and age-appropriate.
         let corpusCount = session.presentedTexts.count + session.responses.count
-        let c4Pass = flagHits.isEmpty
-        let c4Note = c4Pass
-            ? "\(corpusCount) tutor texts clean (on-topic, age-appropriate)"
-            : "CONTENT FLAGS: \(Array(Set(flagHits)).sorted().joined(separator: ", "))"
+        let replyCount = session.responses.count
+        let c4Pass = flagHits.isEmpty && offTopicReplies.isEmpty
+        let c4Note: String
+        if c4Pass {
+            c4Note = "\(corpusCount) tutor texts blocklist-clean;"
+                + " \(replyCount) tutor replies on-topic (vetted)"
+        } else {
+            var parts: [String] = []
+            if !flagHits.isEmpty {
+                parts.append("CONTENT FLAGS: \(Array(Set(flagHits)).sorted().joined(separator: ", "))")
+            }
+            if !offTopicReplies.isEmpty {
+                parts.append("OFF-TOPIC: \(offTopicReplies.count) of \(replyCount) tutor replies")
+            }
+            c4Note = parts.joined(separator: "; ")
+        }
 
         return EvalPersonaResult(
             id: persona.rawValue, displayName: persona.displayName,
@@ -974,7 +1013,7 @@ public struct EvalHarness: Sendable {
             manipulationInputs: session.manipulationCount,
             manipulationLeaks: leaks,
             tutorTextsChecked: corpusCount,
-            contentFlags: flagHits.count,
+            contentFlags: flagHits.count + offTopicReplies.count,
             rulesUnchanged: rulesUnchanged,
             decisionType: decision.type.rawValue,
             decisionComplete: decision.isComplete,
@@ -1039,6 +1078,56 @@ public struct EvalHarness: Sendable {
             personas: results,
             hardCriteria: hard,
             overall: (hard.allPass && allCellsPass) ? "pass" : "fail")
+    }
+}
+
+// MARK: - Report/baseline path guard (CLI safety)
+
+/// Guards the report write against clobbering the baseline: the CLI writes
+/// the report BEFORE reading the baseline, so a `--report` path that
+/// resolves to the baseline file would silently replace the committed
+/// baseline and then compare the report with itself (always passing). A
+/// failed run would likewise overwrite the baseline, bypassing the explicit
+/// `--write-baseline` refusal.
+public enum EvalPaths: Sendable {
+    public enum ClashError: Error, Equatable, Sendable {
+        case reportEqualsBaseline(reportPath: String, baselinePath: String)
+    }
+
+    /// True when both paths resolve to the same file (absolute,
+    /// standardized, symlink-resolved comparison).
+    public static func resolveToSameFile(_ a: String, _ b: String) -> Bool {
+        canonical(a) == canonical(b)
+    }
+
+    /// Writes report data, refusing when `reportPath` resolves to
+    /// `baselinePath`. The guard runs before ANY write (no parent-directory
+    /// creation, no data write), so a clash leaves the baseline byte-identical.
+    public static func writeReport(_ data: Data, to reportPath: String,
+                                   refusingBaseline baselinePath: String) throws {
+        if resolveToSameFile(reportPath, baselinePath) {
+            throw ClashError.reportEqualsBaseline(
+                reportPath: reportPath, baselinePath: baselinePath)
+        }
+        let reportURL = URL(fileURLWithPath: reportPath)
+        let parent = reportURL.deletingLastPathComponent()
+        if !parent.path.isEmpty {
+            try FileManager.default.createDirectory(
+                at: parent, withIntermediateDirectories: true)
+        }
+        try data.write(to: reportURL, options: [.atomic])
+    }
+
+    private static func canonical(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        let url: URL
+        if (expanded as NSString).isAbsolutePath {
+            url = URL(fileURLWithPath: expanded)
+        } else {
+            url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(expanded)
+        }
+        return url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 }
 

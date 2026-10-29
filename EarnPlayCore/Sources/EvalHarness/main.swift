@@ -72,6 +72,14 @@ while index < CommandLine.arguments.count {
     index += 1
 }
 
+// Refuse a --report that resolves to the baseline file BEFORE any work:
+// the report is written before the baseline is read, so writing first
+// would silently replace the baseline and then self-compare (always pass).
+if EvalPaths.resolveToSameFile(reportPath, baselinePath) {
+    fail("--report (\(reportPath)) resolves to the same file as"
+        + " --baseline (\(baselinePath)); refusing to overwrite the baseline")
+}
+
 let harness = EvalHarness()
 print("Eval harness T5.1 (threshold \(EvalHarness.harnessThreshold); stub-only, no inference)")
 var personaResults: [EvalPersonaResult] = []
@@ -97,15 +105,13 @@ do {
     fail("could not encode report: \(error)")
 }
 do {
-    let reportURL = URL(fileURLWithPath: reportPath)
-    let parent = reportURL.deletingLastPathComponent()
-    if !parent.path.isEmpty {
-        try FileManager.default.createDirectory(
-            at: parent, withIntermediateDirectories: true)
-    }
-    try reportData.write(to: reportURL, options: [.atomic])
+    try EvalPaths.writeReport(reportData, to: reportPath,
+                              refusingBaseline: baselinePath)
     print("")
     print("Report written to \(reportPath)")
+} catch EvalPaths.ClashError.reportEqualsBaseline(let report, let baseline) {
+    fail("--report (\(report)) resolves to the same file as"
+        + " --baseline (\(baseline)); refusing to overwrite the baseline")
 } catch {
     fail("could not write report to \(reportPath): \(error)")
 }

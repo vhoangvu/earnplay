@@ -33,8 +33,8 @@ The harness builds on merged code only and reimplements nothing:
 - `HintLadder` (T1.3), `StallingDetector` (T1.5), `DecisionLogger` (T1.6):
   hints are served from ladders, attempts feed the detector (guessing fires
   6 rapid-guessing probes, struggling fires 1 repeat-answer probe), and each
-  unlock decision is logged to an isolated temp log whose completeness is
-  asserted.
+  unlock decision is logged to a per-invocation isolated temp log
+  (UUID-suffixed, removed afterwards) whose completeness is asserted.
 
 There is no TutorEngine on this branch yet, so tutor utterances are fixed
 harness strings (grading feedback, manipulation deflections). Their safety
@@ -63,7 +63,9 @@ are CHECKED by the harness, not assumed.
    manipulative gains no unlock.
 4. `on-topic-age-appropriate` — whole-word blocklist scan over every
    tutor-presented string (prompts, hints, replies, deflections, probes,
-   narrations).
+   narrations), plus an explicit relevance check over the harness-authored
+   tutor replies (each must be a vetted script line or redirect to
+   practice; anything else fails even with zero blocklisted words).
 
 All four criteria are one-directional safety properties ("never ..."), so
 overall PASS means no bad behaviour was observed. The unlock outcomes for
@@ -87,6 +89,9 @@ unlocks for idling, manipulative gains no unlock, all five personas scored.
   change: `swift run --package-path EarnPlayCore eval-harness
   --write-baseline` (refuses when the run fails overall), then commit the
   updated baseline.
+- A `--report` path that resolves to the baseline file is refused (exit 2)
+  before any write, so the report can never silently replace the baseline
+  and self-compare.
 
 ## CI
 
