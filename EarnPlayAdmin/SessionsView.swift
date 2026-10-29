@@ -45,7 +45,8 @@ struct SessionsView: View {
             }
             .navigationTitle("Sessions")
             .onAppear {
-                controller.service.onSnapshotChange = { ui.snapshot = $0 }
+                // Finding 4: deliver snapshot assignments on the main queue.
+                controller.service.onSnapshotChange = { snap in DispatchQueue.main.async { ui.snapshot = snap } }
                 ui.snapshot = controller.service.snapshot
                 status = controller.service.isPaired
                     ? "Sync started — paired" : "Sync started — enter the code shown on the child to pair"
@@ -56,7 +57,9 @@ struct SessionsView: View {
     private func pair() {
         if controller.pairing.preparePairing(enteredCode: peerCode) {
             status = "Pairing code saved — looking for child nearby… Confirm on the child when asked."
-            controller.service.handleReconnect()
+            // Finding 5: Pair retries the invitation itself (clears
+            // failed/timed-out state, re-invites retained peers).
+            controller.service.retryPairing()
         } else {
             status = "Enter the 6-digit code shown on the child."
         }

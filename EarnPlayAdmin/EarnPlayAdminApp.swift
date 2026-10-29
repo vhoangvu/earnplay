@@ -6,7 +6,7 @@ import EarnPlayCore
 final class AdminSyncController {
     let sessionStore = SessionLogStore()
     let policyQueue = PolicyUpdateQueue()
-    let pairing = SyncPairingGate()
+    let pairing = SyncPairingGate(identity: PeerIdentity.generate(displayName: "EarnPlay-Admin"))
     let transport: MultipeerSyncTransport
     let service: AdminSyncService
     private var started = false

@@ -8,14 +8,15 @@ import EarnPlayCore
 struct SyncDebugView: View {
     @State private var policyStore = PolicyStore()
     @State private var sessionQueue = SessionLogQueue()
-    @State private var pairing = SyncPairingGate()
+    @State private var pairing = SyncPairingGate(identity: PeerIdentity.generate(displayName: "EarnPlay-Child"))
     @State private var transport: MultipeerSyncTransport?
     @State private var service: ChildSyncService?
     @StateObject private var ui = ChildSyncUIState(snapshot: ChildSyncSnapshot(
         policyVersion: 0, practiceMinutes: 0, pendingUploads: 0, isPaired: false))
     @State private var logger = DecisionLogger()
     @State private var status = "Sync not started"
-    @State private var pendingPeer: String?
+    @State private var pendingPeer: PeerIdentity?
+    @State private var peerCode = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -29,15 +30,22 @@ struct SyncDebugView: View {
             Text("Paired: \(ui.snapshot.isPaired ? "yes" : "no") · Pairing code (show to admin): \(pairing.localCode)")
                 .font(.caption.monospaced())
             if let pendingPeer {
-                Text("Pairing request from \(pendingPeer) — codes must match on both devices.")
+                Text("Pairing request from \(pendingPeer.displayName) — compare codes out-of-band: this device shows \(pairing.localCode); enter the code shown on the admin device, then Accept. Acceptance alone proves nothing; both devices verify by challenge-response before any data flows.")
                     .font(.caption)
                 HStack {
+                    TextField("Code shown on admin", text: $peerCode)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     Button("Accept pairing") {
+                        // Out-of-band confirmation: record the admin's
+                        // code as shown on the admin screen (F2).
+                        _ = pairing.preparePairing(enteredCode: peerCode)
                         if transport?.acceptPendingInvitation() == true {
-                            status = "Paired with \(pendingPeer)"
+                            status = "Verifying with \(pendingPeer.displayName)…"
                         }
                         self.pendingPeer = nil
                     }
+                    .disabled(peerCode.trimmingCharacters(in: .whitespaces).isEmpty)
                     Button("Reject", role: .destructive) {
                         transport?.rejectPendingInvitation()
                         self.pendingPeer = nil
@@ -55,10 +63,14 @@ struct SyncDebugView: View {
     private func startSync() {
         guard service == nil else { return }
         let t = MultipeerSyncTransport(role: .advertiser, displayName: "EarnPlay-Child", pairing: pairing)
-        t.onPairingRequest = { peer in pendingPeer = peer; status = "Pairing request — confirm the code matches, then Accept" }
+        // Finding 3: transport callbacks arrive off the main thread;
+        // dispatch SwiftUI state updates to the main queue.
+        t.onPairingRequest = { peer in
+            DispatchQueue.main.async { pendingPeer = peer; status = "Pairing request — compare codes out-of-band, enter the admin code, then Accept" }
+        }
         let s = ChildSyncService(policyStore: policyStore, sessionQueue: sessionQueue,
                                  transport: t, pairing: pairing)
-        s.onSnapshotChange = { ui.snapshot = $0 }
+        s.onSnapshotChange = { snap in DispatchQueue.main.async { ui.snapshot = snap } }
         transport = t; service = s; s.start()
         ui.snapshot = s.snapshot
         status = "Sync started — waiting for admin nearby…"

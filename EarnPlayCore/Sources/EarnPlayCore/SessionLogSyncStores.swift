@@ -5,9 +5,11 @@ import Foundation
 public final class SessionLogQueue: @unchecked Sendable {
     public static let fileName = "pending-session-logs.json"
     private let directory: URL; private let lock = NSLock()
+    private let dataWriter: (Data, URL) throws -> Void
     private var items: [SessionLog]
-    public init(directory: URL) {
+    public init(directory: URL, dataWriter: ((Data, URL) throws -> Void)? = nil) {
         self.directory = directory
+        self.dataWriter = dataWriter ?? { data, url in try data.write(to: url, options: [.atomic]) }
         self.items = Self.load(directory: directory) ?? []
     }
     public convenience init() { self.init(directory: PolicyStore.defaultDirectory()) }
@@ -31,8 +33,8 @@ public final class SessionLogQueue: @unchecked Sendable {
     }
     private func persist() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try SessionLogCodec.encode(items).write(
-            to: directory.appendingPathComponent(Self.fileName), options: [.atomic])
+        try dataWriter(SessionLogCodec.encode(items),
+                       directory.appendingPathComponent(Self.fileName))
     }
     private static func load(directory: URL) -> [SessionLog]? {
         guard let d = try? Data(contentsOf: directory.appendingPathComponent(fileName))

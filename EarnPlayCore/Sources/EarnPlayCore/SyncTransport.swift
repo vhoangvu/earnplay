@@ -34,6 +34,11 @@ public protocol SyncTransport: AnyObject {
     func start()
     func stop()
     func send(_ data: Data) throws
+    /// Round 3 finding 5: retry deferred/failed pairing invitations.
+    func retryPairing()
+}
+public extension SyncTransport {
+    func retryPairing() {}
 }
 
 /// Shared link state for a stub pair; set `isUp = false` to kill the

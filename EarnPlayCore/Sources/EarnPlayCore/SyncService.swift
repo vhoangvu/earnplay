@@ -45,16 +45,21 @@ final class AckRetryEngine: @unchecked Sendable {
     func schedule(id: String, action: @escaping () -> Bool) {
         lock.lock()
         if work[id] != nil { lock.unlock(); return }
+        // Finding 7 (round 3): never stop permanently at maxRetries.
+        // The delay is capped (see delay(forAttempt:)); the attempt
+        // counter cycles so another retry cycle is always scheduled
+        // while the action reports the item still pending.
         let attempt = attempts[id] ?? 0
-        guard attempt <= config.maxRetries else { lock.unlock(); return }
         lock.unlock()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.lock.lock(); self.work[id] = nil; self.attempts[id] = attempt + 1; self.lock.unlock()
+            let cycle = self.config.maxRetries > 0 ? (attempt + 1) % (self.config.maxRetries + 1) : attempt + 1
+            self.lock.lock(); self.work[id] = nil; self.attempts[id] = cycle; self.lock.unlock()
             if action() { self.schedule(id: id, action: action) }
         }
         lock.lock(); work[id] = item; lock.unlock()
-        queue.asyncAfter(deadline: .now() + config.delay(forAttempt: attempt), execute: item)
+        let cycleAttempt = config.maxRetries > 0 ? attempt % (config.maxRetries + 1) : attempt
+        queue.asyncAfter(deadline: .now() + config.delay(forAttempt: cycleAttempt), execute: item)
     }
     func cancel(id: String) {
         lock.lock(); defer { lock.unlock() }
@@ -97,8 +102,8 @@ public final class AdminSyncService: @unchecked Sendable {
         onSnapshotChange?(s)
     }
     @discardableResult
-    public func confirmPairing(enteredCode: String, peerID: String) -> Bool {
-        guard pairing?.confirmPairing(enteredCode: enteredCode, peerID: peerID) ?? false else { return false }
+    public func confirmPairing(enteredCode: String, peer: PeerIdentity) -> Bool {
+        guard pairing?.confirmPairing(enteredCode: enteredCode, peer: peer) ?? false else { return false }
         publishSnapshot(); flushPending(); return true
     }
     public func start() {
@@ -109,17 +114,21 @@ public final class AdminSyncService: @unchecked Sendable {
     public func stop() { retryEngine.cancelAll(); transport.stop() }
     /// Called after a successful policy enqueue (finding 7).
     public func notifyPolicyEnqueued() { flushPending() }
+    /// Pair retry (round 3 finding 5): retry deferred/failed invitations.
+    public func retryPairing() { transport.retryPairing(); flushPending() }
     public func flushPending() {
         guard isPaired, transport.isConnected else { publishSnapshot(); return }
         for update in policyQueue.pendingUpdates() {
-            guard let data = try? SyncMessageCodec.encode(.policyUpdate(update)),
-                  (try? transport.send(data)) != nil else { return }
+            // Finding 8: a transient send failure must not end delivery;
+            // schedule the retry whether or not this attempt threw.
+            if let data = try? SyncMessageCodec.encode(.policyUpdate(update)) {
+                _ = try? transport.send(data)
+            }
             let version = update.version
             retryEngine.schedule(id: "policy-\(version)") { [weak self] in
-                guard let self, self.isPaired, self.transport.isConnected,
-                      self.policyQueue.pendingUpdates().contains(where: { $0.version == version }),
-                      let d = try? SyncMessageCodec.encode(.policyUpdate(update)) else { return false }
-                return (try? self.transport.send(d)) != nil
+                guard let self, self.isPaired, self.transport.isConnected else { return false }
+                if let d = try? SyncMessageCodec.encode(.policyUpdate(update)) { _ = try? self.transport.send(d) }
+                return self.policyQueue.pendingUpdates().contains(where: { $0.version == version })
             }
         }
         publishSnapshot()
@@ -139,8 +148,11 @@ public final class AdminSyncService: @unchecked Sendable {
             case .failed: break // no ack: child retains outbox and retries (F3)
             }
         case .ackPolicy(let version):
-            retryEngine.cancel(id: "policy-\(version)")
-            try? policyQueue.removeDelivered(upToVersion: version)
+            // Finding 9: cancel the retry only after removal persists.
+            do {
+                try policyQueue.removeDelivered(upToVersion: version)
+                retryEngine.cancel(id: "policy-\(version)")
+            } catch { /* removal failed: retry stays, child will re-ack */ }
             publishSnapshot()
         case .policyUpdate, .ackSession: break
         }
@@ -177,8 +189,8 @@ public final class ChildSyncService: @unchecked Sendable {
         onSnapshotChange?(s)
     }
     @discardableResult
-    public func confirmPairing(enteredCode: String, peerID: String) -> Bool {
-        guard pairing?.confirmPairing(enteredCode: enteredCode, peerID: peerID) ?? false else { return false }
+    public func confirmPairing(enteredCode: String, peer: PeerIdentity) -> Bool {
+        guard pairing?.confirmPairing(enteredCode: enteredCode, peer: peer) ?? false else { return false }
         publishSnapshot(); flushPending(); return true
     }
     public func start() {
@@ -187,20 +199,21 @@ public final class ChildSyncService: @unchecked Sendable {
         transport.start(); flushPending(); publishSnapshot()
     }
     public func stop() { retryEngine.cancelAll(); transport.stop() }
+    public func retryPairing() { transport.retryPairing(); flushPending() }
     public func sendSessionLog(_ log: SessionLog) throws {
         try sessionQueue.enqueue(log); publishSnapshot(); flushPending()
     }
     public func flushPending() {
         guard isPaired, transport.isConnected else { publishSnapshot(); return }
         for log in sessionQueue.pending() {
-            guard let data = try? SyncMessageCodec.encode(.sessionLog(log)),
-                  (try? transport.send(data)) != nil else { return }
+            if let data = try? SyncMessageCodec.encode(.sessionLog(log)) {
+                _ = try? transport.send(data)
+            }
             let sid = log.sessionId
             retryEngine.schedule(id: "session-\(sid)") { [weak self] in
-                guard let self, self.isPaired, self.transport.isConnected,
-                      self.sessionQueue.pending().contains(where: { $0.sessionId == sid }),
-                      let d = try? SyncMessageCodec.encode(.sessionLog(log)) else { return false }
-                return (try? self.transport.send(d)) != nil
+                guard let self, self.isPaired, self.transport.isConnected else { return false }
+                if let d = try? SyncMessageCodec.encode(.sessionLog(log)) { _ = try? self.transport.send(d) }
+                return self.sessionQueue.pending().contains(where: { $0.sessionId == sid })
             }
         }
         publishSnapshot()
@@ -220,8 +233,11 @@ public final class ChildSyncService: @unchecked Sendable {
             case .persistenceFailed: break
             }
         case .ackSession(let sessionId):
-            retryEngine.cancel(id: "session-\(sessionId)")
-            try? sessionQueue.removeDelivered(sessionIds: [sessionId])
+            // Finding 9: cancel the retry only after removal persists.
+            do {
+                try sessionQueue.removeDelivered(sessionIds: [sessionId])
+                retryEngine.cancel(id: "session-\(sessionId)")
+            } catch { /* removal failed: retry stays, admin will re-ack */ }
             publishSnapshot()
         case .sessionLog, .ackPolicy: break
         }

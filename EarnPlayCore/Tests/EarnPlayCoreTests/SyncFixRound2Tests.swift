@@ -78,10 +78,12 @@ final class SyncFixRound2Tests: XCTestCase {
         XCTAssertEqual(child.policyStore.storedVersion, 0, "unpaired: no policy data may flow")
         try child.sendSessionLog(log("s-unpaired"))
         XCTAssertTrue(admin.sessionStore.allLogs.isEmpty, "unpaired: no session data may flow")
-        XCTAssertFalse(adminGate.confirmPairing(enteredCode: "000000", peerID: "child-1"))
+        let childID = PeerIdentity(stableID: "child-1", displayName: "EarnPlay-Child")
+        let adminID = PeerIdentity(stableID: "admin-1", displayName: "EarnPlay-Admin")
+        XCTAssertFalse(adminGate.confirmPairing(enteredCode: "000000", peer: childID))
         XCTAssertFalse(adminGate.isPaired)
-        XCTAssertTrue(adminGate.confirmPairing(enteredCode: "123456", peerID: "child-1"))
-        XCTAssertTrue(childGate.confirmPairing(enteredCode: "123456", peerID: "admin-1"))
+        XCTAssertTrue(adminGate.confirmPairing(enteredCode: "123456", peer: childID))
+        XCTAssertTrue(childGate.confirmPairing(enteredCode: "123456", peer: adminID))
         admin.flushPending(); child.flushPending()
         XCTAssertEqual(child.policyStore.storedVersion, 1)
         XCTAssertEqual(admin.sessionStore.allLogs.map(\.sessionId), ["s-unpaired"])
@@ -89,15 +91,17 @@ final class SyncFixRound2Tests: XCTestCase {
 
     // F2: second peer cannot pair/invite while paired; first child unaffected.
     func testF2_SinglePeerEnforced() throws {
+        let childA = PeerIdentity(stableID: "child-A", displayName: "EarnPlay-Child")
+        let childB = PeerIdentity(stableID: "child-B", displayName: "EarnPlay-Child")
         let gate = SyncPairingGate(code: "123456")
-        XCTAssertTrue(gate.confirmPairing(enteredCode: "123456", peerID: "child-A"))
-        XCTAssertFalse(gate.confirmPairing(enteredCode: "123456", peerID: "child-B"),
+        XCTAssertTrue(gate.confirmPairing(enteredCode: "123456", peer: childA))
+        XCTAssertFalse(gate.confirmPairing(enteredCode: "123456", peer: childB),
                        "second peer must be refused while paired")
-        XCTAssertEqual(gate.pairedPeerID, "child-A")
-        XCTAssertFalse(PeerAdmission.shouldInvite(activePeerID: "child-A", pendingPeerID: nil, candidatePeerID: "child-B"))
-        XCTAssertFalse(PeerAdmission.shouldAccept(activePeerID: "child-A", candidatePeerID: "child-B"))
-        XCTAssertTrue(PeerAdmission.shouldAccept(activePeerID: "child-A", candidatePeerID: "child-A"))
-        XCTAssertTrue(PeerAdmission.shouldInvite(activePeerID: nil, pendingPeerID: nil, candidatePeerID: "child-B"))
+        XCTAssertEqual(gate.pairedPeer, childA)
+        XCTAssertFalse(PeerAdmission.shouldInvite(livePeer: childA, pendingPeer: nil, candidate: childB, trustedPairedPeer: childA))
+        XCTAssertFalse(PeerAdmission.shouldAccept(livePeer: childA, candidate: childB, trustedPairedPeer: childA))
+        XCTAssertTrue(PeerAdmission.shouldAccept(livePeer: childA, candidate: childA, trustedPairedPeer: childA))
+        XCTAssertTrue(PeerAdmission.shouldInvite(livePeer: nil, pendingPeer: nil, candidate: childB, trustedPairedPeer: nil))
     }
 
     // F3: persist failure -> no ack, outbox retained, redelivery stores once.
