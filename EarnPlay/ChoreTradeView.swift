@@ -15,10 +15,11 @@ import SwiftUI
 /// movement vs chore, weekly caps) and will replace this button.
 struct ChoreTradeView: View {
     @StateObject private var viewModel: ChoreTradeViewModel
-    /// Granted-screen status ticker: fires only while the granted branch
-    /// is rendered (via `onReceive` there), driving the view model's
-    /// periodic status refresh. Owned by the view so its subscription
-    /// lifetime is the granted screen's lifetime.
+    /// Unlock-status ticker: fires while this view is rendered (via
+    /// `onReceive` on the outer container), driving the view model's
+    /// periodic status refresh independently of the chore session's phase
+    /// (fix round 5). The granted countdown and the restored-window
+    /// banner both refresh from this single subscription.
     private let statusTicker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init() {
@@ -85,7 +86,18 @@ struct ChoreTradeView: View {
                 grantedView(record)
                     .onAppear { viewModel.startStatusUpdates() }
                     .onDisappear { viewModel.stopStatusUpdates() }
-                    .onReceive(statusTicker) { _ in viewModel.refreshGrantedStatus() }
+            }
+            // Restored-window status (fix round 5): a same-boot relaunch
+            // during an active unlock restores the window but starts a
+            // fresh session that never reaches `.granted`. The countdown
+            // and expiry message live in `shieldStatus`, so render them
+            // here whenever non-empty outside the granted screen — the
+            // status is independent of the chore session's phase.
+            if !viewModel.shieldStatus.isEmpty && !viewModel.session.hasGrantedUnlock {
+                Text(viewModel.shieldStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("restoredUnlockStatus")
             }
             Text(viewModel.poolSourceCaption)
                 .font(.caption)
@@ -94,6 +106,11 @@ struct ChoreTradeView: View {
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(12)
+        .onReceive(statusTicker) { _ in
+            if !viewModel.shieldStatus.isEmpty || viewModel.session.hasGrantedUnlock {
+                viewModel.refreshGrantedStatus()
+            }
+        }
     }
 
     private var idleView: some View {

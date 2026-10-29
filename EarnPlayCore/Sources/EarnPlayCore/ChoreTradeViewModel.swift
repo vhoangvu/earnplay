@@ -110,12 +110,20 @@ public final class ChoreTradeViewModel: ObservableObject {
 
     /// Re-reads the shield manager and republishes `shieldStatus`: the
     /// live countdown while the window is open, the expired state once it
-    /// ends. Safe to call in any phase; a no-op textually outside the
-    /// granted flow. The granted screen calls this on appear and on every
-    /// status tick (and tests call it after advancing a fake clock).
+    /// ends. Safe to call in any phase; the restored-window banner calls
+    /// this on every status tick even when the session never reaches
+    /// `.granted` (fix round 5). When the window is still active,
+    /// monitoring is ensured (idempotent restart); once it has ended,
+    /// monitoring stops so the polling task does not leak past the
+    /// deadline. Tests call this after advancing a fake clock.
     public func refreshGrantedStatus() {
         shieldManager.refresh()
         refreshShieldStatus()
+        if shieldManager.isUnlockActive {
+            shieldManager.startExpiryMonitoring()
+        } else {
+            shieldManager.stopExpiryMonitoring()
+        }
     }
 
     /// Starts expiry monitoring plus the status baseline: the shield
@@ -124,15 +132,23 @@ public final class ChoreTradeViewModel: ObservableObject {
     /// and from `init` when relaunching into an already-active window
     /// (all are idempotent). The view's status ticker drives the periodic
     /// `refreshGrantedStatus()` calls; `stopStatusUpdates()` ends
-    /// monitoring when the granted screen disappears.
+    /// monitoring only once the window is no longer active.
     public func startStatusUpdates(pollInterval: TimeInterval = 1) {
         shieldManager.startExpiryMonitoring(pollInterval: pollInterval)
         refreshShieldStatus()
     }
 
-    /// Stops expiry monitoring when the granted screen disappears.
+    /// Stops expiry monitoring when the granted screen disappears — but
+    /// only when the window is no longer active (fix round 5). Hiding the
+    /// granted screen mid-window must NOT cancel re-lock polling:
+    /// monitoring lives as long as the window does. When the window has
+    /// ended, stops polling and republishes the expired status.
     public func stopStatusUpdates() {
+        if shieldManager.isUnlockActive {
+            return
+        }
         shieldManager.stopExpiryMonitoring()
+        refreshShieldStatus()
     }
 
     private func refreshShieldStatus() {
