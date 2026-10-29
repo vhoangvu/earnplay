@@ -92,11 +92,14 @@ public struct HintEvent: Codable, Equatable, Sendable {
 /// (upsert by `questionId` + `level`), so a persistent log observes
 /// the changed-answer outcome, not just the showing.
 ///
-/// Delivery is asynchronous but ordered: notifications are queued under
-/// the state lock in state-change order and drained serially on a
-/// private queue, so an older unresolved event can never overwrite its
-/// own resolution and callbacks never overlap. Delivery holds no ladder
-/// lock, so a sink may safely read ladder state back from its callback.
+/// Delivery is asynchronous but ordered per ladder and serialized across
+/// all ladders: notifications are queued under each ladder's state lock
+/// in state-change order and drained serially on one shared queue, so an
+/// older unresolved event can never overwrite its own resolution and
+/// callbacks never overlap — even when successive questions share one
+/// session log sink. A sink need not be thread-safe. Delivery holds no
+/// ladder lock, so a sink may safely read ladder state back from its
+/// callback.
 public protocol HintEventSink: AnyObject {
     func recordHintEvent(_ event: HintEvent)
 }
@@ -116,12 +119,15 @@ public final class HintLadder: @unchecked Sendable {
     private var lastSubmittedAnswer: String?
     /// Sink notifications queued under `lock` in state-change order.
     private var _pendingSinkEvents: [HintEvent] = []
-    /// Serial drain for sink delivery: every mutation schedules one async
-    /// drain, which takes its batch under `lock` and delivers it with no
-    /// lock held. The async boundary keeps lock order flat (the drain
-    /// never blocks a state change), so re-entrant sink reads cannot
-    /// deadlock while deliveries stay serial and ordered.
-    private let sinkQueue = DispatchQueue(label: "com.earnplay.HintLadder.sink")
+    /// Serial drain for sink delivery, shared by all ladders: every
+    /// mutation schedules one async drain, which takes its ladder's batch
+    /// under that ladder's `lock` and delivers it with no lock held. The
+    /// async boundary keeps lock order flat (the drain never blocks a
+    /// state change), so re-entrant sink reads cannot deadlock while
+    /// deliveries stay serial and ordered per ladder. One shared queue —
+    /// not one per ladder — so two ladders for successive questions that
+    /// share a session log sink can never call it concurrently.
+    private static let sharedSinkQueue = DispatchQueue(label: "com.earnplay.HintLadder.sink")
 
     public init(question: VerifiedQuestion, proposal: ProposedProblem,
                 solver: SolverService = SolverService(),
@@ -237,12 +243,13 @@ public final class HintLadder: @unchecked Sendable {
     /// are never dropped when the caller releases the ladder first.
     private func scheduleSinkDrain() {
         guard eventSink != nil else { return }
-        sinkQueue.async { [self] in self.drainSinkEvents() }
+        Self.sharedSinkQueue.async { [self] in self.drainSinkEvents() }
     }
 
     /// Delivers one queued batch, in queue order, with no ladder lock held
-    /// (a synchronous sink may read ladder state back). Runs only on
-    /// `sinkQueue`, so deliveries are serial across all caller threads.
+    /// (a synchronous sink may read ladder state back). Runs only on the
+    /// shared queue, so deliveries are serial across all caller threads
+    /// and across all ladders sharing a sink.
     private func drainSinkEvents() {
         lock.lock()
         guard !_pendingSinkEvents.isEmpty else {
@@ -260,7 +267,7 @@ public final class HintLadder: @unchecked Sendable {
     /// only — production code treats delivery as fire-and-forget ordered.
     /// Must not be called from inside a sink callback (same-queue sync).
     func waitForSinkDelivery() {
-        sinkQueue.sync {}
+        Self.sharedSinkQueue.sync {}
     }
 
     /// Answer equivalence for the changed-answer comparison, mirroring
@@ -330,10 +337,20 @@ public final class HintLadder: @unchecked Sendable {
     private static func multiplicationText(level: HintLevel, a: Int, b: Int, answer: String) -> String {
         switch level {
         case .nudge:
-            return "Look again at \(a) × \(b): that means \(b) equal groups of \(a). Picture the groups before you answer."
+            // No operand orientation asserted: the rendered story uses
+            // a-groups-of-b for word problems but b-groups-of-a for
+            // multiplication facts, so naming either direction reverses
+            // one of them ([6,7] renders as six rows of seven).
+            return "Look again at \(a) × \(b): picture the equal groups in the problem before you answer."
         case .strategy:
             return "Strategy: split the second number into two easier parts, multiply \(a) by each part, then add the two parts together."
         case .workedStep:
+            // Zero product: the near-complete template would show
+            // 0 × 7 = 0 × 6 + 0 = 0 + 0, whose partial already equals
+            // the answer. Use a conceptual step instead.
+            if a == 0, b >= 2 {
+                return "Worked step: \(a) × \(b) means \(b) groups with nothing in each group — every group is empty. How many is that altogether?"
+            }
             // One step short of the answer: the near-complete product,
             // leaving the final addition to the child. The completion
             // must equal the solver's answer or nothing is shown.
@@ -371,6 +388,12 @@ public final class HintLadder: @unchecked Sendable {
                 guard used + divisor == dividend, "\(quotient)" == answer else {
                     return genericText(level)
                 }
+                // Quotient one: shown is zero, so stating "exactly one
+                // more fits" gives 0 + 1 = 1 away. Leave the remaining
+                // groups for the child to determine.
+                if quotient == 1 {
+                    return "Worked step: \(divisor) × 0 = 0, and \(dividend) − 0 = \(dividend). How many more groups of \(divisor) fit, and how many groups is that altogether?"
+                }
                 return "Worked step: \(divisor) × \(shown) = \(used), and \(dividend) − \(used) = \(divisor), so exactly one more group of \(divisor) fits. How many groups is that altogether?"
             }
             if remainder != 0, quotient >= 1 {
@@ -404,6 +427,13 @@ public final class HintLadder: @unchecked Sendable {
             case .strategy:
                 return "Strategy: rewrite both fractions with the same bottom number (\(common)), then compare just the top numbers."
             case .workedStep:
+                // Same denominator: conversion would merely repeat the
+                // originals (1/5 and 2/5 with bottom number 5). Name that
+                // no rewriting is needed and leave the verdict to the
+                // child. No comparison symbol appears anywhere here.
+                if f1.denominator == f2.denominator, f1.denominator == common {
+                    return "Worked step: both fractions already have bottom number \(common), so the pieces are the same size. Compare just the top numbers, \(c1) and \(c2): which is bigger — or are they the same?"
+                }
                 // Converted but not compared: the child makes the final
                 // call. No comparison symbol appears anywhere here.
                 return "Worked step: \(f1) with bottom number \(common) is \(c1)/\(common), and \(f2) with bottom number \(common) is \(c2)/\(common). Now compare just the top numbers, \(c1) and \(c2): which is bigger — or are they the same?"
@@ -437,6 +467,12 @@ public final class HintLadder: @unchecked Sendable {
         case .strategy:
             return "Strategy: rewrite both fractions with the same bottom number (\(common)) first, then add the top numbers and keep that bottom number."
         case .workedStep:
+            // Same denominator: conversion would merely repeat the
+            // originals (1/5 + 2/5 = 1/5 + 2/5). Name that no rewriting
+            // is needed and leave the sum to the child.
+            if f1.denominator == f2.denominator, f1.denominator == common {
+                return "Worked step: both fractions already have bottom number \(common), so no rewriting is needed. Add the top numbers (\(c1) + \(c2)) yourself and keep the bottom number \(common) — what is the total?"
+            }
             // Converted but not summed: the child adds the top numbers.
             return "Worked step: \(f1) + \(f2) = \(c1)/\(common) + \(c2)/\(common). Now add the top numbers (\(c1) + \(c2)) and keep the bottom number \(common)."
         }
@@ -583,9 +619,17 @@ public final class HintLadder: @unchecked Sendable {
 
     /// Picks the passage sentence to quote. The solver's support verdict
     /// stays the gate (T1.2 owns support); when exactly one sentence holds
-    /// the answer span, that sentence is quoted. When several do, the one
-    /// sharing the most content words with the question is quoted — the
-    /// first answer-containing sentence may answer a different question
+    /// the answer span, that sentence is quoted. When several do, the
+    /// verified question–answer relationship decides first: the single
+    /// candidate that alone satisfies the generation verifier
+    /// (`ReadingPresentationVerifier`) is quoted, and ambiguity (several
+    /// verify) abstains. Word overlap alone can pick a sentence that
+    /// merely mentions the questioned words ("The large fox chased a red
+    /// hen." for "What color was the large fox?", where the verifier
+    /// passes via "The fox was red."). When no candidate verifies (a
+    /// shape the verifier does not support), the one sharing the most
+    /// content words with the question is quoted — the first
+    /// answer-containing sentence may answer a different question
     /// ("Maya wore a red hat. A red fox ran past." / "What color was the
     /// fox?"). Returns nil when the choice is ambiguous (a tie for best,
     /// or no question-word overlap at all), so the caller points at the
@@ -603,6 +647,17 @@ public final class HintLadder: @unchecked Sendable {
             " \(SolverService.normalizeForSupport($0)) ".contains(answerSpan)
         }
         guard candidates.count > 1 else { return firstEvidence }
+        if let question = questionText(in: promptText, passage: passage) {
+            let verifying = candidates.filter { candidate in
+                let single = ProposedProblem(
+                    skill: .readingComprehension, form: .story,
+                    passage: candidate, candidateAnswer: answer,
+                    promptText: "Read: \(candidate) \(question)")
+                return ReadingPresentationVerifier.isVerified(single)
+            }
+            if verifying.count == 1 { return verifying[0] }
+            if verifying.count > 1 { return nil }
+        }
         let answerTokens = Set(normalizedAnswer.split(separator: " ").map(String.init))
         let questionWords = contentWords(questionText(in: promptText, passage: passage) ?? "",
                                          excluding: answerTokens)

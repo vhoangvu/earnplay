@@ -80,7 +80,7 @@ final class HintLadderTests: XCTestCase {
                             SolverFraction(numerator: 2, denominator: 4)!],
                 promptText: "Compare 1/2 and 2/4."),
                     expectedAnswer: "=",
-                    workedFragment: "1/2 with bottom number 2 is 1/2, and 1/2 with bottom number 2 is 1/2"),
+                    workedFragment: "both fractions already have bottom number 2"),
             Fixture(proposal: ProposedProblem(
                 skill: .fractionComparison, form: .story,
                 fractions: [SolverFraction(numerator: 1, denominator: 4_000_000_000)!,
@@ -757,5 +757,148 @@ final class HintLadderTests: XCTestCase {
                        "first answer with no baseline resolves as unchanged, not a revision")
         XCTAssertEqual(delivered.map(\.nextAnswer),
                        [nil, nil, nil, "7", "7", "7"])
+    }
+
+    // MARK: - Fix round 3
+
+    func testSharedSinkConcurrentDeliveryIsSerialized() {
+        guard case .success(let q1) = solver.verify(fixtures[0].proposal, questionId: "q-shared-1"),
+              case .success(let q2) = solver.verify(fixtures[1].proposal, questionId: "q-shared-2") else {
+            return XCTFail("fixtures must verify")
+        }
+        let sink = ConcurrencyProbingSink()
+        let ladder1 = HintLadder(question: q1, proposal: fixtures[0].proposal,
+                                 now: { self.baseDate }, eventSink: sink)
+        let ladder2 = HintLadder(question: q2, proposal: fixtures[1].proposal,
+                                 now: { self.baseDate }, eventSink: sink)
+        DispatchQueue.concurrentPerform(iterations: 8) { i in
+            if i % 2 == 0 {
+                _ = ladder1.requestHint()
+            } else {
+                _ = ladder2.requestHint()
+            }
+        }
+        ladder1.waitForSinkDelivery()
+        ladder2.waitForSinkDelivery()
+        XCTAssertEqual(sink.delivered.count, 6, "three showings per ladder sharing one sink")
+        XCTAssertEqual(sink.maxActive, 1, "shared sink deliveries must never overlap")
+        XCTAssertEqual(sink.delivered.filter { $0.questionId == "q-shared-1" }.count, 3)
+        XCTAssertEqual(sink.delivered.filter { $0.questionId == "q-shared-2" }.count, 3)
+    }
+
+    func testMultiplicationNudgeDoesNotAssertOperandOrientation() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [6, 7], operation: .multiply,
+                                       promptText: "6 rows of 7 tulips. How many tulips?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "42"))
+        let ladder = makeLadder(proposal, questionId: "q-orient")
+        let nudge = ladder.requestHint()
+        XCTAssertEqual(nudge?.level, .nudge)
+        // Rendered form is six rows with seven flowers each (6 groups of 7);
+        // the nudge must not reverse it to seven groups of six.
+        XCTAssertFalse(nudge?.text.contains("7 equal groups of 6") == true,
+                       "nudge reverses the rendered groups: \(nudge?.text ?? "")")
+        XCTAssertFalse(nudge?.text.contains("groups of 6") == true,
+                       "nudge must not assert an operand orientation: \(nudge?.text ?? "")")
+        XCTAssertFalse(nudge?.text.contains("groups of 7") == true,
+                       "nudge must not assert an operand orientation: \(nudge?.text ?? "")")
+        XCTAssertTrue(nudge?.text.contains("6 × 7") == true,
+                      "nudge must name the problem: \(nudge?.text ?? "")")
+        XCTAssertTrue(nudge?.text.contains("equal groups") == true,
+                      "nudge must still point at the groups: \(nudge?.text ?? "")")
+    }
+
+    func testZeroProductWorkedStepDoesNotRevealAnswer() {
+        let proposal = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                       operands: [0, 7], promptText: "0 bags of 7 marbles. How many?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"))
+        let ladder = makeLadder(proposal, questionId: "q-zero")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        // Old template showed 0 × 7 = 0 × 6 + 0 = 0 + 0, whose partial is the answer.
+        XCTAssertFalse(worked?.text.contains("0 + 0") == true,
+                       "zero-product partial already equals the answer: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("0 × 6") == true,
+                       "must not use the near-complete-product template: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("= 0 + ") == true,
+                       "must not show a computed zero partial: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("How many") == true || worked?.text.contains("altogether") == true,
+                      "child must still finish the step: \(worked?.text ?? "")")
+    }
+
+    func testQuotientOneDivisionDoesNotRevealRemainingGroups() {
+        let proposal = ProposedProblem(skill: .division, form: .story,
+                                       operands: [5, 5], promptText: "5 cookies shared among 5 friends.")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "1"))
+        let ladder = makeLadder(proposal, questionId: "q-quot1")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        // Old wording stated exactly one more group fits, giving 0 + 1 = 1.
+        XCTAssertFalse(worked?.text.contains("exactly one more") == true,
+                       "must not state the remaining groups: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("How many more groups") == true,
+                      "child must determine the remaining groups: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("how many groups is that altogether") == true,
+                      "child must still count the total: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("1") == true,
+                       "worked step must not reveal the quotient: \(worked?.text ?? "")")
+    }
+
+    func testSameDenominatorAdditionHasWorkedStep() {
+        let f1 = SolverFraction(numerator: 1, denominator: 5)!
+        let f2 = SolverFraction(numerator: 2, denominator: 5)!
+        let proposal = ProposedProblem(skill: .fractionAddition, form: .story,
+                                       fractions: [f1, f2], promptText: "1/5 cup plus 2/5 cup. How much?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "3/5"))
+        let ladder = makeLadder(proposal, questionId: "q-sameden-add")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("1/5 + 2/5 = 1/5 + 2/5") == true,
+                       "must not merely repeat the original values: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("already have bottom number 5") == true,
+                      "must make same-denominator progress: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("3/5") == true,
+                       "must not reveal the sum: \(worked?.text ?? "")")
+    }
+
+    func testSameDenominatorComparisonHasWorkedStep() {
+        let f1 = SolverFraction(numerator: 1, denominator: 5)!
+        let f2 = SolverFraction(numerator: 2, denominator: 5)!
+        let proposal = ProposedProblem(skill: .fractionComparison, form: .story,
+                                       fractions: [f1, f2], promptText: "Compare 1/5 and 2/5.")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "<"))
+        let ladder = makeLadder(proposal, questionId: "q-sameden-cmp")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("with bottom number 5 is 1/5") == true,
+                       "must not merely repeat the conversion: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("already have bottom number 5") == true,
+                      "must make same-denominator progress: \(worked?.text ?? "")")
+        for symbol in ["<", ">", "="] {
+            XCTAssertFalse(worked?.text.contains(symbol) == true,
+                           "must not state the verdict: \(worked?.text ?? "")")
+        }
+    }
+
+    func testFoxHenEvidenceSelectsVerifiedSentence() {
+        let passage = "The large fox chased a red hen. The fox was red."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "red",
+                                       promptText: "Read: \(passage) What color was the large fox?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "red"))
+        let ladder = makeLadder(proposal, questionId: "q-foxhen")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        // Overlap picks the first sentence (large+fox) and blanks the hen;
+        // the verified relationship (fox was red) is the second sentence.
+        XCTAssertTrue(worked?.text.contains("The fox was ___") == true,
+                      "must quote the fox sentence with the answer blanked: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("hen") == true,
+                       "must not quote the hen sentence: \(worked?.text ?? "")")
     }
 }

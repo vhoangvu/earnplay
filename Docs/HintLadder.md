@@ -56,11 +56,13 @@ revision); `nextAnswer` keeps the resolving answer. Hints still
 awaiting an answer keep `followedByChangedAnswer == nil`. An
 optional `HintEventSink` receives each event on showing and again
 on resolution (upsert by question + level), mirroring
-`HintListenEventSink`; notifications are queued under the lock in
-state-change order and drained asynchronously and serially on a
-private queue, so callbacks never overlap, an older unresolved
-event can never overwrite its own resolution, and a synchronous
-sink that reads ladder state back cannot deadlock the Hint tap.
+`HintListenEventSink`; notifications are queued under each
+ladder's lock in state-change order and drained asynchronously
+and serially on one shared queue, so callbacks never overlap
+even when successive questions share a session log sink, an
+older unresolved event can never overwrite its own resolution,
+and a synchronous sink that reads ladder state back cannot
+deadlock the Hint tap.
 
 The mismatch check binds values, not just text: `VerifiedQuestion`
 carries the source operands, fractions, and operation it was
@@ -69,11 +71,18 @@ different values (6×6 vs 9×4) is still rejected. Degenerate
 addition (all single-digit or all multiples of ten) splits one
 addend instead of showing a partial sum that equals the answer;
 zero take-aways are ignored before choosing the subtraction step.
-Reading evidence is the unique answer-containing sentence, or —
-when several contain the answer — the one sharing the most
-content words with the question; on a tie no sentence is quoted.
-Blanking follows the reading grader's normalization, so every
-accepted spelling of the answer is blanked.
+Multiplication nudges name no operand orientation (rendered
+stories use opposite orientations per skill); zero products use a
+conceptual step instead of the near-complete-product template.
+Quotient-one division leaves the remaining groups for the child.
+Same-denominator fractions name that no rewriting is needed and
+work from the numerators. Reading evidence is the unique
+answer-containing sentence, or — when several contain the answer
+— the single candidate that alone satisfies the generation
+verifier, falling back to question-word overlap only for shapes
+the verifier does not support; on ambiguity no sentence is
+quoted. Blanking follows the reading grader's normalization, so
+every accepted spelling of the answer is blanked.
 
 ## Tests
 
@@ -97,4 +106,8 @@ binding collisions, concurrent-tap sink serialization and
 ordering, degenerate-addition and zero-subtraction stop-short
 steps, normalized blanking of every accepted spelling,
 division-strategy nonnegative-leftover wording, and
-question-relevant (or abstaining) reading evidence.
+question-relevant (or abstaining) reading evidence. Fix round 3
+adds: shared-sink serialization across ladders, orientation-free
+multiplication nudges, zero-product and quotient-one stop-short
+steps, same-denominator fraction worked steps, and
+verifier-based reading evidence (fox/hen).
