@@ -174,11 +174,16 @@ public final class HintLadder: @unchecked Sendable {
     ///
     /// Returns nil — logging nothing — when the ladder is already
     /// exhausted (fourth and later taps), when the solver cannot
-    /// verify the proposal's values, or when the proposal does not
+    /// verify the proposal's values, when the proposal does not
     /// re-verify to exactly the supplied question (no hint may teach
     /// from values the solver rejects, or hint one problem under
     /// another question's id; such a question should never have been
-    /// presented, and the ladder fails closed rather than guessing).
+    /// presented, and the ladder fails closed rather than guessing),
+    /// or — for reading — when the proposal fails T1.2's presentation
+    /// gate (prompt must contain the trimmed passage and the
+    /// question/answer pair must satisfy `ReadingPresentationVerifier`,
+    /// since solver containment alone does not mean the answer
+    /// addresses the question).
     @discardableResult
     public func requestHint() -> Hint? {
         lock.lock()
@@ -196,6 +201,19 @@ public final class HintLadder: @unchecked Sendable {
               rechecked == question else {
             lock.unlock()
             return nil
+        }
+        if proposal.skill == .readingComprehension {
+            guard let passage = proposal.passage else {
+                lock.unlock()
+                return nil
+            }
+            let trimmed = passage.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  proposal.promptText.contains(trimmed),
+                  ReadingPresentationVerifier.isVerified(proposal) else {
+                lock.unlock()
+                return nil
+            }
         }
         let text = Self.hintText(level: level, proposal: proposal,
                                  verifiedAnswer: rechecked.verifiedAnswer, solver: solver)
@@ -347,9 +365,12 @@ public final class HintLadder: @unchecked Sendable {
         case .workedStep:
             // Zero product: the near-complete template would show
             // 0 × 7 = 0 × 6 + 0 = 0 + 0, whose partial already equals
-            // the answer. Use a conceptual step instead.
+            // the answer. Use a conceptual step instead, with no group
+            // count or size: word problems render a-groups-of-b while
+            // multiplication facts render b-groups-of-a, so naming
+            // either direction reverses one of them.
             if a == 0, b >= 2 {
-                return "Worked step: \(a) × \(b) means \(b) groups with nothing in each group — every group is empty. How many is that altogether?"
+                return "Worked step: \(a) × \(b) means every part is empty — there is nothing to count in any part. How many is that altogether?"
             }
             // One step short of the answer: the near-complete product,
             // leaving the final addition to the child. The completion
@@ -361,10 +382,10 @@ public final class HintLadder: @unchecked Sendable {
                 return "Worked step: \(a) × \(b) = \(a) × \(b - 1) + \(a) = \(partial) + \(a). Now add \(partial) + \(a) yourself to finish."
             }
             if b == 1 {
-                return "Worked step: \(a) × 1 means a single group of \(a). How many is in that one group?"
+                return "Worked step: \(a) × 1 means the amount appears just once. How many is that altogether?"
             }
             if b == 0 {
-                return "Worked step: \(a) × 0 means no groups of \(a) at all. How many is that altogether?"
+                return "Worked step: \(a) × 0 means every part is empty — there is nothing to count in any part. How many is that altogether?"
             }
             return genericText(level)
         }
@@ -408,7 +429,7 @@ public final class HintLadder: @unchecked Sendable {
             guard quotient == 0 else { return genericText(level) }
             let expected = remainder == 0 ? "\(quotient)" : "\(quotient) r \(remainder)"
             guard expected == answer else { return genericText(level) }
-            return "Worked step: \(divisor) × 1 = \(divisor), which is already bigger than \(dividend), so not even one full group fits. What is the quotient, and what is left over?"
+            return "Worked step: \(divisor) × 1 = \(divisor). Compare that with \(dividend) to decide how many full groups fit, then find any remainder."
         }
     }
 
@@ -574,12 +595,43 @@ public final class HintLadder: @unchecked Sendable {
     }
 
     /// Worked step for degenerate additions (all single-digit or all
-    /// multiples of ten): split one addend into two positive parts, work
-    /// the sum of everything except the second part, and leave the final
-    /// addition to the child. The shown partial is below the solver's
-    /// total by construction; when no safe split exists (tiny sums whose
-    /// every number is the answer), a number-free step is shown instead.
+    /// multiples of ten). Prefers a problem-specific partial that stops
+    /// short of the solver's total, failing closed to a generic step only
+    /// when every numeric partial would restate the answer:
+    /// - all zeros: a number-free step (any digit would be the answer);
+    /// - three or more addends: work the sum of all but one addend and
+    ///   leave that addend unfinished (1+1+1 works 1+1=2);
+    /// - a zero among the addends: adding zero changes nothing, so the
+    ///   total is the other amount — without naming that amount, which
+    ///   already equals the total ([0,7]);
+    /// - two ones: count on from 1 (1+1=2 would be the answer);
+    /// - otherwise: split one addend into two positive parts, work the
+    ///   sum of everything except the second part, and leave the final
+    ///   addition to the child.
     private static func additionSplitStep(operands: [Int], total: Int, answer: String) -> String {
+        if total == 0 {
+            return "Worked step: adding nothing to nothing still leaves nothing — how many is that?"
+        }
+        if operands.count >= 3 {
+            for index in operands.indices.reversed() where operands[index] > 0 {
+                let remaining = operands[index]
+                let (partial, overflow) = total.subtractingReportingOverflow(remaining)
+                guard !overflow, partial >= 0, partial != total else { continue }
+                var others = operands
+                others.remove(at: index)
+                let list = others.map { "\($0)" }.joined(separator: " + ")
+                let step = "Worked step: add all but one amount first: \(list) = \(partial). Now add \(remaining) more to \(partial) yourself to finish."
+                if !step.contains(answer) {
+                    return step
+                }
+            }
+        }
+        if total > 0, operands.contains(0) {
+            return "Worked step: adding 0 changes nothing — the total is the other amount. Which amount did you start with besides zero?"
+        }
+        if operands.count == 2, operands.allSatisfy({ $0 == 1 }) {
+            return "Worked step: start at 1 and count one more — what comes next?"
+        }
         if let value = operands.first(where: { $0 >= 2 }) {
             let firstPart = value / 2
             let secondPart = value - firstPart
@@ -587,7 +639,7 @@ public final class HintLadder: @unchecked Sendable {
             if !overflow {
                 let step = "Worked step: split \(value) into \(firstPart) + \(secondPart). Add everything except \(secondPart) first: you get \(partial). Now add \(secondPart) more to \(partial) yourself to finish."
                 // Fail closed: restating an operand that already equals the
-                // total ([0,7]) would show the answer.
+                // total would show the answer.
                 if !step.contains(answer) {
                     return step
                 }
@@ -620,10 +672,11 @@ public final class HintLadder: @unchecked Sendable {
     /// Picks the passage sentence to quote. The solver's support verdict
     /// stays the gate (T1.2 owns support); when exactly one sentence holds
     /// the answer span, that sentence is quoted. When several do, the
-    /// verified question–answer relationship decides first: the single
-    /// candidate that alone satisfies the generation verifier
-    /// (`ReadingPresentationVerifier`) is quoted, and ambiguity (several
-    /// verify) abstains. Word overlap alone can pick a sentence that
+    /// verified question–answer relationship decides first: the first
+    /// candidate (in passage order) satisfying the generation verifier
+    /// (`ReadingPresentationVerifier`) is quoted — every verifying
+    /// sentence independently supports the answer, so any is valid
+    /// evidence. Word overlap alone can pick a sentence that
     /// merely mentions the questioned words ("The large fox chased a red
     /// hen." for "What color was the large fox?", where the verifier
     /// passes via "The fox was red."). When no candidate verifies (a
@@ -655,8 +708,7 @@ public final class HintLadder: @unchecked Sendable {
                     promptText: "Read: \(candidate) \(question)")
                 return ReadingPresentationVerifier.isVerified(single)
             }
-            if verifying.count == 1 { return verifying[0] }
-            if verifying.count > 1 { return nil }
+            if let evidence = verifying.first { return evidence }
         }
         let answerTokens = Set(normalizedAnswer.split(separator: " ").map(String.init))
         let questionWords = contentWords(questionText(in: promptText, passage: passage) ?? "",
@@ -682,9 +734,13 @@ public final class HintLadder: @unchecked Sendable {
     }
 
     /// The question part of a reading prompt: everything after the passage
-    /// (prompts render as "Read: <passage> <question>").
+    /// (prompts render as "Read: <passage> <question>"). Matches the
+    /// trimmed passage, as the generation verifier does: T1.2 accepts a
+    /// trimmed passage in the prompt while retaining the original in the
+    /// proposal, so an untrimmed lookup fails on surrounding whitespace.
     private static func questionText(in promptText: String, passage: String) -> String? {
-        guard let range = promptText.range(of: passage) else { return nil }
+        let trimmed = passage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let range = promptText.range(of: trimmed) else { return nil }
         let rest = promptText[range.upperBound...]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return rest.isEmpty ? nil : rest

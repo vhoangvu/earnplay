@@ -31,7 +31,8 @@ SSOT-canonical-facts-questions-and-hints, APP-how-it-works.
   against `SolverService`'s answer for the same values and stops
   short of the solution. If the solver rejects the proposal's
   values — or the proposal does not re-verify to exactly the
-  supplied question (a mismatched pair) — no hint is shown and no
+  supplied question (a mismatched pair), or a reading proposal
+  fails T1.2's presentation gate — no hint is shown and no
   event is logged (fail closed).
 - Fraction hints use checked arithmetic: when the common
   denominator overflows `Int` on a pair the solver still verifies,
@@ -71,18 +72,27 @@ different values (6×6 vs 9×4) is still rejected. Degenerate
 addition (all single-digit or all multiples of ten) splits one
 addend instead of showing a partial sum that equals the answer;
 zero take-aways are ignored before choosing the subtraction step.
-Multiplication nudges name no operand orientation (rendered
-stories use opposite orientations per skill); zero products use a
-conceptual step instead of the near-complete-product template.
-Quotient-one division leaves the remaining groups for the child.
+Multiplication nudges and worked steps name no operand
+orientation (rendered stories use opposite orientations per
+skill); zero products use a conceptual step instead of the
+near-complete-product template. Quotient-one division leaves the
+remaining groups for the child; quotient-zero division shows the
+trial multiplication without stating the comparison.
 Same-denominator fractions name that no rewriting is needed and
-work from the numerators. Reading evidence is the unique
+work from the numerators. Reading requests fail closed unless the
+proposal also passes T1.2's presentation gate (prompt contains
+the trimmed passage and the question/answer pair satisfies the
+generation verifier). Reading evidence is the unique
 answer-containing sentence, or — when several contain the answer
-— the single candidate that alone satisfies the generation
-verifier, falling back to question-word overlap only for shapes
-the verifier does not support; on ambiguity no sentence is
-quoted. Blanking follows the reading grader's normalization, so
-every accepted spelling of the answer is blanked.
+— the first candidate (in passage order) satisfying the
+generation verifier, falling back to question-word overlap only
+for shapes the verifier does not support; on overlap ambiguity
+no sentence is quoted, and sentence lookup matches the trimmed
+passage. Blanking follows the reading grader's normalization, so
+every accepted spelling of the answer is blanked. Degenerate
+addition prefers a problem-specific partial (progressive sum,
+adding-zero-is-nothing, or count-on from 1) over the generic
+step.
 
 ## Tests
 
@@ -110,4 +120,8 @@ question-relevant (or abstaining) reading evidence. Fix round 3
 adds: shared-sink serialization across ladders, orientation-free
 multiplication nudges, zero-product and quotient-one stop-short
 steps, same-denominator fraction worked steps, and
-verifier-based reading evidence (fox/hen).
+verifier-based reading evidence (fox/hen). Fix round 4
+adds: containment-only reading rejection, orientation-neutral
+multiplication worked steps, quotient-zero stop-short wording,
+problem-specific degenerate addition, deterministic multi-verify
+selection, and trimmed-passage lookup.

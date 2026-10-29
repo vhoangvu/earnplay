@@ -613,11 +613,12 @@ final class HintLadderTests: XCTestCase {
 
     func testReadingWorkedStepBlanksEverySpellingOfTheAnswer() {
         // Evidence holds both "blue box" and "blue-box": both normalize to the
-        // accepted answer, so both must be blanked.
-        let passage = "The blue box sat by the blue-box shed."
+        // accepted answer, so both must be blanked. What-did shape so the
+        // presentation verifier accepts it (fix round 4 gates on that).
+        let passage = "Maya saw the blue box by the blue-box shed."
         let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
                                        passage: passage, candidateAnswer: "blue box",
-                                       promptText: "Read: \(passage) Where did the box sit?")
+                                       promptText: "Read: \(passage) What did Maya see?")
         XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue box"))
         let ladder = makeLadder(proposal, questionId: "q-blank2")
         _ = ladder.requestHint(); _ = ladder.requestHint()
@@ -633,10 +634,11 @@ final class HintLadderTests: XCTestCase {
     func testReadingWorkedStepBlanksAnswerWithTrailingPunctuation() {
         // Verified answer "blue box!": normalization strips the "!", so the
         // evidence span must still be found and blanked (old code fell back).
-        let passage = "The blue box is by the bed."
+        // What-did shape so the presentation verifier accepts it.
+        let passage = "Maya saw the blue box by the bed."
         let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
                                        passage: passage, candidateAnswer: "blue box!",
-                                       promptText: "Read: \(passage) What is by the bed?")
+                                       promptText: "Read: \(passage) What did Maya see?")
         XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue box!"))
         let ladder = makeLadder(proposal, questionId: "q-blankbang")
         _ = ladder.requestHint(); _ = ladder.requestHint()
@@ -685,19 +687,20 @@ final class HintLadderTests: XCTestCase {
     }
 
     func testReadingWorkedStepAvoidsQuotingWhenEvidenceIsAmbiguous() {
-        // Both sentences match the question equally: quote neither.
+        // Containment-only ("red" contained, but "What sat?" is not a
+        // verifier-supported shape): fix round 4 fails closed with no hint
+        // rather than quoting. Deterministic multi-support selection is
+        // covered by testMultipleVerifyingSentencesSelectFirstDeterministically.
         let passage = "A red hat sat here. A red mat sat there."
         let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
                                        passage: passage, candidateAnswer: "red",
                                        promptText: "Read: \(passage) What sat?")
         XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "red"))
+        XCTAssertFalse(ReadingPresentationVerifier.isVerified(proposal))
         let ladder = makeLadder(proposal, questionId: "q-ambig")
-        _ = ladder.requestHint(); _ = ladder.requestHint()
-        let worked = ladder.requestHint()
-        XCTAssertFalse(worked?.text.contains("___") == true,
-                       "must not quote ambiguous evidence: \(worked?.text ?? "")")
-        XCTAssertTrue(worked?.text.contains("point to the exact sentence") == true,
-                      "must fall back to pointing at the passage: \(worked?.text ?? "")")
+        XCTAssertNil(ladder.requestHint(), "containment-only reading must show no hint")
+        XCTAssertTrue(ladder.events.isEmpty)
+        XCTAssertTrue(ladder.tutorMessages.isEmpty)
     }
 
     // MARK: - Fix round 2 (b): notification ordering and serialization
@@ -900,5 +903,211 @@ final class HintLadderTests: XCTestCase {
                       "must quote the fox sentence with the answer blanked: \(worked?.text ?? "")")
         XCTAssertFalse(worked?.text.contains("hen") == true,
                        "must not quote the hen sentence: \(worked?.text ?? "")")
+    }
+
+    // MARK: - Fix round 4
+
+    func testContainmentOnlyReadingAnswerIsRejected() {
+        // Finding 1: "blue box" is contained but does not answer "Where?".
+        let passage = "The blue box sat by the blue-box shed."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "blue box",
+                                       promptText: "Read: \(passage) Where did the box sit?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue box"),
+                       "solver checks containment only")
+        XCTAssertFalse(ReadingPresentationVerifier.isVerified(proposal),
+                       "presentation verifier must reject a where-question answered by a thing")
+        let ladder = makeLadder(proposal, questionId: "q-contain")
+        XCTAssertNil(ladder.requestHint(), "containment-only reading must show no hint (fail closed)")
+        XCTAssertTrue(ladder.events.isEmpty)
+        XCTAssertTrue(ladder.tutorMessages.isEmpty)
+    }
+
+    func testZeroRowWordProblemWorkedStepIsOrientationNeutral() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [0, 7], operation: .multiply,
+                                       promptText: "A gardener plants 0 rows with 7 flowers in each row. How many flowers are there in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"))
+        let ladder = makeLadder(proposal, questionId: "q-zerorow")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("7 groups") == true,
+                       "must not reverse 0 rows into seven groups: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("groups of") == true,
+                       "must not assert an operand orientation: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("0 + 0") == true,
+                       "zero partial already equals the answer: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("0 × 7") == true,
+                      "must name the problem: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("How many") == true || worked?.text.contains("altogether") == true,
+                      "child must still finish: \(worked?.text ?? "")")
+    }
+
+    func testWordProblemTimesOneWorkedStepIsOrientationNeutral() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [6, 1], operation: .multiply,
+                                       promptText: "A gardener plants 6 rows with 1 flower in each row. How many flowers are there in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "6"))
+        let ladder = makeLadder(proposal, questionId: "q-times1")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("single group of 6") == true,
+                       "must not reverse 6 rows of 1 into one group of 6: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("groups of") == true,
+                       "must not assert an operand orientation: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("6 × 1") == true,
+                      "must name the problem: \(worked?.text ?? "")")
+    }
+
+    func testWordProblemTimesZeroWorkedStepIsOrientationNeutral() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [6, 0], operation: .multiply,
+                                       promptText: "A gardener plants 6 rows with 0 flowers in each row. How many flowers are there in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"))
+        let ladder = makeLadder(proposal, questionId: "q-times0")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("no groups of 6") == true,
+                       "must not reverse 6 empty rows into no groups: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("groups of") == true,
+                       "must not assert an operand orientation: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("6 × 0") == true,
+                      "must name the problem: \(worked?.text ?? "")")
+    }
+
+    func testZeroDividendDivisionDoesNotStateComparison() {
+        let proposal = ProposedProblem(skill: .division, form: .story,
+                                       operands: [0, 5],
+                                       promptText: "0 cookies are shared equally among 5 friends. How many cookies does each friend get?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"))
+        let ladder = makeLadder(proposal, questionId: "q-div0")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("already bigger than") == true,
+                       "must not state the comparison: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("not even one") == true,
+                       "must not give the quotient away: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("5 × 1 = 5") == true,
+                      "must show the trial multiplication: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("Compare that with 0") == true,
+                      "child must make the comparison: \(worked?.text ?? "")")
+    }
+
+    func testDivisionByLargerDoesNotRevealQuotient() {
+        let proposal = ProposedProblem(skill: .division, form: .story,
+                                       operands: [3, 5],
+                                       promptText: "3 cookies are shared equally among 5 friends. How many cookies does each friend get, and how many are left over?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0 r 3"))
+        let ladder = makeLadder(proposal, questionId: "q-divbig")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("0 r 3") == true,
+                       "must not reveal the answer: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("already bigger than") == true,
+                       "must not state the comparison: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("not even one") == true,
+                       "must not give the quotient away: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("5 × 1 = 5") == true,
+                      "must show the trial multiplication: \(worked?.text ?? "")")
+    }
+
+    func testThreeOnesAdditionWorksFirstPair() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [1, 1, 1], operation: .add,
+                                       promptText: "Mia collects shells in rounds of 1, 1, 1. How many shells does she collect in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "3"))
+        let ladder = makeLadder(proposal, questionId: "q-add111")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("add the amounts together one at a time") == true,
+                       "must not be the generic fallback: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("1 + 1 = 2") == true,
+                      "must work the first pair: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("add 1 more") == true,
+                      "must leave the last addend unfinished: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("3") == true,
+                       "must not reveal the total: \(worked?.text ?? "")")
+    }
+
+    func testZeroPlusSevenAdditionIsProblemSpecific() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [0, 7], operation: .add,
+                                       promptText: "Mia collects shells in rounds of 0, 7. How many shells does she collect in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "7"))
+        let ladder = makeLadder(proposal, questionId: "q-add07")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("add the amounts together one at a time") == true,
+                       "must not be the generic fallback: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("7") == true,
+                       "must not reveal the total: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("adding 0") == true || worked?.text.contains("other amount") == true,
+                      "must name the zero situation: \(worked?.text ?? "")")
+    }
+
+    func testOnePlusOneAdditionIsProblemSpecific() {
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [1, 1], operation: .add,
+                                       promptText: "Mia collects shells in rounds of 1, 1. How many shells does she collect in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "2"))
+        let ladder = makeLadder(proposal, questionId: "q-add11")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("add the amounts together one at a time") == true,
+                       "must not be the generic fallback: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("2") == true,
+                       "must not reveal the total: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("start at 1") == true || worked?.text.contains("count one more") == true,
+                      "must name the counting step: \(worked?.text ?? "")")
+    }
+
+    func testMultipleVerifyingSentencesSelectFirstDeterministically() {
+        let passage = "The box was blue. The box was dark blue."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "blue",
+                                       promptText: "Read: \(passage) What color was the box?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue"))
+        XCTAssertTrue(ReadingPresentationVerifier.isVerified(proposal),
+                      "both sentences support the color answer")
+        let ladder = makeLadder(proposal, questionId: "q-multiverify")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertTrue(worked?.text.contains("The box was ___") == true,
+                      "must quote the first verifying sentence blanked: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("dark") == true,
+                       "must select deterministically, not the second sentence: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("point to the exact sentence") == true,
+                       "must not fall back to generic instructions: \(worked?.text ?? "")")
+    }
+
+    func testTrimmedPassageLookupFindsEvidence() {
+        let trimmed = "Maya wore a red hat. A red fox ran past."
+        let passage = "  \(trimmed)  "
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "red",
+                                       promptText: "Read: \(trimmed) What color was the fox?")
+        XCTAssertTrue(proposal.promptText.contains(trimmed))
+        XCTAssertFalse(proposal.promptText.contains(passage),
+                       "prompt carries the trimmed passage, as T1.2 allows")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "red"))
+        XCTAssertTrue(ReadingPresentationVerifier.isVerified(proposal),
+                      "generation verifier matches the trimmed passage")
+        let ladder = makeLadder(proposal, questionId: "q-trim")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertTrue(worked?.text.contains("A ___ fox ran past.") == true,
+                      "must quote the fox sentence despite surrounding whitespace: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("point to the exact sentence") == true,
+                       "must not fall back to generic instructions: \(worked?.text ?? "")")
     }
 }
