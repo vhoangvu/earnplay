@@ -30,7 +30,10 @@ public enum TradeInitiation: String, Equatable, Sendable {
 // MARK: - Offer decision
 
 /// Inputs to the offer decision. Session/weekly counts are read from
-/// `MovementTradeHistory`; `sessionsSinceLastMovementOffer` comes from the
+/// `MovementTradeHistory` (`offersInSession` and
+/// `weeklyUsageInTrailingWeek`, which counts granted trades plus
+/// outstanding `.offered` reservations so overlapping sessions cannot
+/// exceed the cap); `sessionsSinceLastMovementOffer` comes from the
 /// session owner (nil when no movement trade was ever offered).
 public struct MovementOfferContext: Equatable, Sendable {
     public var initiation: TradeInitiation
@@ -68,6 +71,7 @@ public struct MovementOfferContext: Equatable, Sendable {
 public enum MovementOfferRefusal: String, Equatable, Sendable {
     case notAIInitiated
     case floorNotMet
+    case invalidTradeDuration
     case sessionCapReached
     case weeklyCapReached
     case taperedCooldown
@@ -147,11 +151,20 @@ public enum MovementTradeManager {
         canonicalActivityOrder.first(where: { allowed.contains($0) })
     }
 
-    /// Gate order: initiation → floor → session cap → weekly cap → taper →
-    /// activity availability. Caps fail closed on degenerate policy values.
+    /// Gate order: initiation → durations → floor → session cap →
+    /// weekly cap → taper → activity availability. Caps fail closed on
+    /// degenerate policy values.
     public static func decide(context: MovementOfferContext, policy: Policy) -> MovementOfferDecision {
         guard context.initiation == .aiLowMotivation else {
             return .refuse(.notAIInitiated)
+        }
+        // The trade unlock must be a positive duration strictly shorter
+        // than the practice-earned unlock; an inconsistent policy offers
+        // nothing rather than a trade that outlasts practice.
+        let movementMinutes = policy.movementSettings.tradeUnlockDurationMinutes
+        guard movementMinutes > 0
+            && movementMinutes < policy.unlockDurations.practiceMinutes else {
+            return .refuse(.invalidTradeDuration)
         }
         // Threshold is irrelevant here; only the T1.4 floor rule is read,
         // with the POLICY's floor settings — never the context's.
@@ -281,6 +294,23 @@ public struct MovementTradeHistory: Codable, Equatable, Sendable {
         completions(since: now.addingTimeInterval(-Self.weekSeconds))
     }
 
+    /// Outstanding (not yet terminal) offers made within the trailing week.
+    /// Each holds one weekly slot until it finalizes to a terminal outcome.
+    public func outstandingOffersInTrailingWeek(now: Date = Date()) -> Int {
+        let weekAgo = now.addingTimeInterval(-Self.weekSeconds)
+        return entries.filter {
+            $0.outcome == .offered && $0.offeredAt >= weekAgo
+        }.count
+    }
+
+    /// Weekly-cap numerator: trailing-week grants plus outstanding offers.
+    /// Offer callers must pass this (not `completionsInTrailingWeek`) as
+    /// `MovementOfferContext.weeklyCompletions` so a reservation fills the
+    /// cap before the trade completes.
+    public func weeklyUsageInTrailingWeek(now: Date = Date()) -> Int {
+        completionsInTrailingWeek(now: now) + outstandingOffersInTrailingWeek(now: now)
+    }
+
     /// Offers already made in `sessionId` (session-cap numerator).
     public func offersInSession(_ sessionId: String) -> Int {
         entries.filter { $0.sessionId == sessionId }.count
@@ -334,11 +364,40 @@ public struct MovementTradeHistory: Codable, Equatable, Sendable {
     }
 }
 
+/// Outcome of reserving one weekly slot for a presented offer.
+public enum OfferReservationResult: Equatable, Sendable {
+    /// The `.offered` reservation was persisted and holds a weekly slot.
+    case reserved
+    /// No weekly slot was free; nothing was recorded.
+    case weeklyCapReached
+    /// The reservation could not be persisted; nothing was recorded and
+    /// the in-memory cache is unchanged — the caller must fail closed.
+    case persistenceFailed
+}
+
+/// Outcome of finalizing a reservation to its terminal outcome.
+public enum TradeFinalizeResult: Equatable, Sendable {
+    /// The terminal entry was persisted.
+    case finalized
+    /// A grant was refused: another session filled the weekly cap first.
+    /// The reservation was finalized as `.abandoned` (releasing its slot)
+    /// and persisted; the caller must report no grant.
+    case weeklyCapExceeded
+    /// The terminal entry could not be persisted; the cache is unchanged
+    /// (still the outstanding reservation) — the caller must fail closed
+    /// and report no grant.
+    case persistenceFailed
+}
+
 /// File-backed `MovementTradeHistory` on the child device, following the
 /// `PolicyStore` precedent (JSON file in Application Support, atomic
 /// writes). A missing or corrupt file yields empty history — caps then
 /// fail open to "no usage yet", which is correct for a fresh install and
 /// safe because the session cap still bounds any single session.
+///
+/// Every mutation persists before advancing the cache and reports the
+/// persistence result: quota usage backed only by this instance's cache
+/// is never reported as success.
 public final class MovementTradeHistoryStore: @unchecked Sendable {
     public static let fileName = "movement-trades.json"
     /// Cross-instance lock file serializing read-modify-write in
@@ -347,12 +406,21 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
 
     private let directory: URL
     private let fileManager: FileManager
+    private let dataWriter: (Data, URL) throws -> Void
     private let lock = NSLock()
     private var cached: MovementTradeHistory
 
-    public init(directory: URL, fileManager: FileManager = .default) {
+    /// `dataWriter` is the persistence seam (the `PolicyStore` precedent):
+    /// it writes encoded history data to a file URL and must throw on
+    /// failure. Production uses the default atomic `Data.write`; tests
+    /// inject a throwing writer to exercise the failure path.
+    public init(directory: URL, fileManager: FileManager = .default,
+                dataWriter: ((Data, URL) throws -> Void)? = nil) {
         self.directory = directory
         self.fileManager = fileManager
+        self.dataWriter = dataWriter ?? { data, url in
+            try data.write(to: url, options: [.atomic])
+        }
         self.cached = Self.load(directory: directory, fileManager: fileManager)
             ?? MovementTradeHistory()
     }
@@ -369,26 +437,121 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
     }
 
     /// Appends one entry (a reservation or a terminal trade) and persists.
-    public func record(_ entry: MovementTradeHistoryEntry) {
+    /// Returns false when the entry could not be persisted; the cache is
+    /// then unchanged. Uncapped — cap-checked callers use `tryRecordOffer`.
+    @discardableResult
+    public func record(_ entry: MovementTradeHistoryEntry) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        mutate { $0.entries.append(entry) }
+        return mutate { $0.entries.append(entry) }
     }
 
     /// Replaces the entry with the same `tradeId` (finalizing a
     /// reservation to its terminal outcome) and persists. Appends when no
     /// reservation with that ID is on disk, so a terminal trade is never
-    /// lost when its reservation write was missed.
-    public func update(_ entry: MovementTradeHistoryEntry) {
+    /// lost when its reservation write was missed. Returns false when the
+    /// entry could not be persisted; the cache is then unchanged.
+    /// Uncapped — cap-checked callers use `tryFinalize`.
+    @discardableResult
+    public func update(_ entry: MovementTradeHistoryEntry) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        mutate {
+        return mutate {
             if let index = $0.entries.firstIndex(where: { $0.tradeId == entry.tradeId }) {
                 $0.entries[index] = entry
             } else {
                 $0.entries.append(entry)
             }
         }
+    }
+
+    /// Atomically reserves one weekly slot for a presented offer: inside
+    /// the cross-instance lock, refuses when trailing-week grants plus
+    /// outstanding offers already fill `weeklyCap`, otherwise appends the
+    /// `.offered` reservation and persists. Overlapping sessions therefore
+    /// cannot both take the last slot. Fails closed when the lock or the
+    /// write is unavailable.
+    public func tryRecordOffer(_ entry: MovementTradeHistoryEntry,
+                               weeklyCap: Int, now: Date = Date()) -> OfferReservationResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let fd = try? acquireDirectoryLock() else {
+            return .persistenceFailed
+        }
+        defer { releaseDirectoryLock(fd) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+            cached = persisted
+        }
+        guard cached.weeklyUsageInTrailingWeek(now: now) < max(0, weeklyCap) else {
+            return .weeklyCapReached
+        }
+        var next = cached
+        next.entries.append(entry)
+        do {
+            try persist(next)
+        } catch {
+            return .persistenceFailed
+        }
+        cached = next
+        return .reserved
+    }
+
+    /// Atomically finalizes a reservation to its terminal outcome. A grant
+    /// revalidates the weekly cap against the persisted truth (excluding
+    /// its own reservation): when another session filled the cap first,
+    /// the reservation is finalized as `.abandoned` instead and
+    /// `.weeklyCapExceeded` is returned, so overlapping completions cannot
+    /// exceed the limit. Declined/abandoned outcomes finalize without a
+    /// cap check. Fails closed when the lock or the write is unavailable.
+    public func tryFinalize(_ entry: MovementTradeHistoryEntry,
+                            weeklyCap: Int, now: Date = Date()) -> TradeFinalizeResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let fd = try? acquireDirectoryLock() else {
+            return .persistenceFailed
+        }
+        defer { releaseDirectoryLock(fd) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+            cached = persisted
+        }
+        if entry.outcome == .granted {
+            let weekAgo = now.addingTimeInterval(-MovementTradeHistory.weekSeconds)
+            let otherGrants = cached.entries.filter {
+                $0.tradeId != entry.tradeId && $0.outcome == .granted
+                    && ($0.completedAt ?? $0.offeredAt) >= weekAgo
+            }.count
+            if otherGrants >= max(0, weeklyCap) {
+                var abandoned = entry
+                abandoned.outcome = .abandoned
+                abandoned.completedAt = nil
+                var next = cached
+                if let index = next.entries.firstIndex(where: { $0.tradeId == entry.tradeId }) {
+                    next.entries[index] = abandoned
+                } else {
+                    next.entries.append(abandoned)
+                }
+                do {
+                    try persist(next)
+                } catch {
+                    return .persistenceFailed
+                }
+                cached = next
+                return .weeklyCapExceeded
+            }
+        }
+        var next = cached
+        if let index = next.entries.firstIndex(where: { $0.tradeId == entry.tradeId }) {
+            next.entries[index] = entry
+        } else {
+            next.entries.append(entry)
+        }
+        do {
+            try persist(next)
+        } catch {
+            return .persistenceFailed
+        }
+        cached = next
+        return .finalized
     }
 
     @discardableResult
@@ -403,20 +566,37 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
     /// Runs `change` against the persisted truth inside a cross-instance
     /// file lock, then persists: two stores over one directory can no
     /// longer erase each other's entries (or undercount the weekly cap).
-    /// When the lock file itself cannot be acquired, falls back to a
-    /// best-effort unsynchronized write; caps fail open by design.
-    private func mutate(_ change: (inout MovementTradeHistory) -> Void) {
+    /// Persists before advancing the cache and returns false without
+    /// touching the cache when the write fails. When the lock file itself
+    /// cannot be acquired, falls back to a best-effort unsynchronized
+    /// write and still reports its result (the cap-checked
+    /// `tryRecordOffer`/`tryFinalize` instead fail closed without the lock).
+    @discardableResult
+    private func mutate(_ change: (inout MovementTradeHistory) -> Void) -> Bool {
         guard let fd = try? acquireDirectoryLock() else {
-            change(&cached)
-            try? persist(cached)
-            return
+            var next = cached
+            change(&next)
+            do {
+                try persist(next)
+            } catch {
+                return false
+            }
+            cached = next
+            return true
         }
         defer { releaseDirectoryLock(fd) }
         if let persisted = Self.load(directory: directory, fileManager: fileManager) {
             cached = persisted
         }
-        change(&cached)
-        try? persist(cached)
+        var next = cached
+        change(&next)
+        do {
+            try persist(next)
+        } catch {
+            return false
+        }
+        cached = next
+        return true
     }
 
     private func acquireDirectoryLock() throws -> Int32 {
@@ -460,7 +640,7 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         encoder.dateEncodingStrategy = .deferredToDate
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(history)
-        try data.write(to: directory.appendingPathComponent(Self.fileName), options: [.atomic])
+        try dataWriter(data, directory.appendingPathComponent(Self.fileName))
     }
 
     private static func load(directory: URL, fileManager: FileManager) -> MovementTradeHistory? {

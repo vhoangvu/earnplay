@@ -155,11 +155,17 @@ struct MovementTradePreviewView: View {
                 signals: EffortSignals(activeSeconds: 120, genuineAttempts: 2,
                                        hintInteractions: 1),
                 sessionOffersUsed: history.offersInSession(previewSession.id),
-                weeklyCompletions: history.completionsInTrailingWeek(),
+                weeklyCompletions: history.weeklyUsageInTrailingWeek(),
                 recentSessionCompletions: history.recentSessionCompletions())
             switch MovementTradeManager.decide(context: context, policy: .defaultPolicy) {
             case .offer(let offer):
-                model.presentOffer(offer, sessionId: previewSession.id)
+                let presented = model.presentOffer(
+                    offer, sessionId: previewSession.id,
+                    weeklyCap: Policy.defaultPolicy.tradeCaps.weeklyMaxMovementTrades)
+                if !presented {
+                    refusalText = "Offer could not be presented "
+                        + "(weekly limit reached or save failed)."
+                }
             case .refuse(let reason):
                 refusalText = "Offer refused by gate: \(reason)."
             }

@@ -13,8 +13,8 @@ import Combine
 /// bind to, with all counting, gating, and recording done by the
 /// deterministic types in `MovementTrade.swift`.
 ///
-/// The ONLY production entry point is `presentOffer(_:sessionId:)`, called
-/// by the tutor when the AI initiates a trade moment (future
+/// The ONLY production entry point is `presentOffer(_:sessionId:weeklyCap:)`,
+/// called by the tutor when the AI initiates a trade moment (future
 /// TutorEngine/T3.3 — the app's DEBUG preview simulates that event). No
 /// menu, button, or child action presents an offer; the offer gate itself
 /// (`MovementTradeManager.decide`) additionally refuses anything not
@@ -44,6 +44,9 @@ public final class MovementTradeViewModel: ObservableObject {
     private let historyStore: MovementTradeHistoryStore
     /// Device carry confidence from the app (iPad has no pocket carry).
     private let verificationConfidence: MovementVerificationConfidence
+    /// Weekly cap the presented offer reserved against; reused to
+    /// revalidate the cap atomically before granting.
+    private var weeklyCap: Int = TradeCaps.default.weeklyMaxMovementTrades
 
     public init(historyStore: MovementTradeHistoryStore = MovementTradeHistoryStore(),
                 verificationConfidence: MovementVerificationConfidence = .full) {
@@ -53,19 +56,28 @@ public final class MovementTradeViewModel: ObservableObject {
 
     /// Presents an AI-initiated offer. Returns false unless idle — one
     /// offer per trade moment; the session cap is enforced by the offer
-    /// gate. Presenting reserves the session quota immediately, so a
-    /// recreated UI for the same session sees the pending offer and the
-    /// gate refuses a second one; completion finalizes the reservation
-    /// to its terminal outcome instead of appending a second entry.
+    /// gate. Presenting atomically reserves one weekly slot, so a
+    /// recreated UI for the same session sees the pending offer, the gate
+    /// refuses a second one, and overlapping sessions cannot exceed the
+    /// weekly cap; completion finalizes the reservation to its terminal
+    /// outcome instead of appending a second entry. Returns false without
+    /// changing state when no weekly slot is free or the reservation
+    /// cannot be persisted — no offer is ever backed only by this
+    /// instance's cache.
     @discardableResult
-    public func presentOffer(_ offer: MovementTradeOffer, sessionId: String) -> Bool {
+    public func presentOffer(_ offer: MovementTradeOffer, sessionId: String,
+                             weeklyCap: Int = TradeCaps.default.weeklyMaxMovementTrades) -> Bool {
         guard screen == .none else { return false }
         let session = MovementTradeSession(sessionId: sessionId, offer: offer)
+        let reserved = historyStore.tryRecordOffer(
+            MovementTradeHistoryEntry(
+                tradeId: session.tradeId, sessionId: sessionId,
+                activity: offer.activity, offeredAt: session.offeredAt,
+                outcome: .offered, verifiedReps: 0, targetReps: offer.targetReps),
+            weeklyCap: weeklyCap)
+        guard reserved == .reserved else { return false }
+        self.weeklyCap = weeklyCap
         tradeSession = session
-        historyStore.record(MovementTradeHistoryEntry(
-            tradeId: session.tradeId, sessionId: sessionId,
-            activity: offer.activity, offeredAt: session.offeredAt,
-            outcome: .offered, verifiedReps: 0, targetReps: offer.targetReps))
         activityName = Self.displayName(offer.activity)
         targetReps = offer.targetReps
         unlockMinutes = offer.unlockMinutes
@@ -78,8 +90,24 @@ public final class MovementTradeViewModel: ObservableObject {
 
     /// Accepts the offer and starts counting from `provider` (production:
     /// the app's CoreMotion provider; simulator preview: fixture replay).
+    /// When motion is unavailable the trade never goes `.active`: the
+    /// weekly reservation is released as a declined offer and a recovery
+    /// message is shown instead of a permanently zero counter.
     public func accept(with provider: MotionSampleProvider) {
-        guard var session = tradeSession, session.accept() else { return }
+        guard var session = tradeSession else { return }
+        guard provider.isAvailable else {
+            _ = session.decline()
+            tradeSession = session
+            if let entry = session.makeHistoryEntry() {
+                _ = historyStore.tryFinalize(entry, weeklyCap: weeklyCap)
+            }
+            lastRecord = session.makeRecord(verificationConfidence: verificationConfidence)
+            statusText = "Motion unavailable on this device — back to practice. "
+                + "No reps were counted and no unlock was granted."
+            screen = .finished
+            return
+        }
+        guard session.accept() else { return }
         tradeSession = session
         self.provider = provider
         screen = .active
@@ -118,10 +146,31 @@ public final class MovementTradeViewModel: ObservableObject {
     private func finish(_ session: MovementTradeSession) {
         provider?.stopUpdates()
         provider = nil
-        lastRecord = session.makeRecord(verificationConfidence: verificationConfidence)
         if let entry = session.makeHistoryEntry() {
-            historyStore.update(entry)
+            let finalized = historyStore.tryFinalize(entry, weeklyCap: weeklyCap)
+            // Grants fail closed: the cap is revalidated atomically before
+            // granting, and a grant that cannot be persisted is reported as
+            // a failure — never as a success backed only by this cache.
+            // (Declined/abandoned outcomes finalize without a cap check;
+            // a missed write there only leaves the reservation held, which
+            // still blocks further offers and grants nothing.)
+            if session.outcome == .granted, finalized != .finalized {
+                lastRecord = nil
+                switch finalized {
+                case .weeklyCapExceeded:
+                    statusText = "Weekly trade limit reached — no unlock this time. "
+                        + "Practice still counts!"
+                case .persistenceFailed:
+                    statusText = "Couldn't save the trade — no unlock this time. "
+                        + "Please try again."
+                case .finalized:
+                    statusText = ""
+                }
+                screen = .finished
+                return
+            }
         }
+        lastRecord = session.makeRecord(verificationConfidence: verificationConfidence)
         switch session.outcome {
         case .granted:
             statusText = "Unlock granted: \(session.offer.unlockMinutes) minutes. Nice work!"
