@@ -42,8 +42,8 @@ public final class SimulatedShieldFlow: ObservableObject {
 
     private let manager: ShieldManager
     private let backend: SimulatedShieldBackend
-    private let scorer: EffortScorer
-    private let recorder: EffortSessionRecorder
+    private var scorer: EffortScorer
+    private var recorder: EffortSessionRecorder
 
     /// The demo app this flow guards.
     public let app: AppRef
@@ -65,6 +65,25 @@ public final class SimulatedShieldFlow: ObservableObject {
     @Published public private(set) var remainingUnlockTime: TimeInterval = 0
     /// The most recent challenge score, if the challenge was finished.
     @Published public private(set) var lastScore: EffortScore?
+    /// Decision lines rendered by the shield screen.
+    public nonisolated static let unlockGrantedText = "Granted — unlock window open (simulated)."
+    public nonisolated static let unlockGrantFailedText = "Effort passed but the unlock failed — try again."
+    public nonisolated static let unlockDeniedText = "Denied — keep practicing to earn the unlock."
+
+    /// The decision line for the shield screen, or nil before the first
+    /// finish. A granted score reports an open window only when the
+    /// shield actually dismissed; a granted score with the shield still
+    /// up (the manager refused the grant) reports a retryable failure
+    /// instead of claiming an open window.
+    public var challengeDecisionText: String? {
+        guard let score = lastScore else { return nil }
+        switch score.decision {
+        case .granted:
+            return isShieldPresented ? Self.unlockGrantFailedText : Self.unlockGrantedText
+        case .denied:
+            return Self.unlockDeniedText
+        }
+    }
     /// Presentation transitions in order (see `SimulatedShieldPresentationEvent`).
     public private(set) var presentationEvents: [SimulatedShieldPresentationEvent] = []
 
@@ -117,9 +136,16 @@ public final class SimulatedShieldFlow: ObservableObject {
     /// `EffortScorer` and, only on a granted score, opens the timed
     /// unlock window through `ShieldManager`, dismissing the shield. A
     /// denied score — or a grant the manager refuses — leaves the shield
-    /// presented. Returns the score for the result narration.
+    /// presented with the recorded effort kept for a retry. When a
+    /// previous unlock has ended since the last tick, the shield
+    /// re-presents and a fresh session starts BEFORE scoring, so stale
+    /// passing effort can never grant a free window. Returns the score
+    /// for the result narration.
     @discardableResult
     public func finishChallenge() -> EffortScore {
+        manager.refresh()
+        remainingUnlockTime = manager.remainingUnlockTime
+        updatePresentation()
         let score = scorer.evaluate(recorder.signals())
         lastScore = score
         if score.decision == .granted {
@@ -144,6 +170,18 @@ public final class SimulatedShieldFlow: ObservableObject {
         guard shouldPresent != isShieldPresented else { return }
         isShieldPresented = shouldPresent
         presentationEvents.append(shouldPresent ? .presented : .dismissed)
+        if shouldPresent { resetChallengeSession() }
+    }
+
+    /// Starts a fresh challenge session — a new recorder, a new
+    /// per-session scorer draw, and the previous result cleared. Runs
+    /// only when the shield re-presents after an unlock ends (expiry or
+    /// a replaced window), so a denied challenge or a refused grant
+    /// keeps its recorded effort for a retry.
+    private func resetChallengeSession() {
+        recorder = EffortSessionRecorder(startedAt: Date())
+        scorer = EffortScorer(floorSettings: scorer.floorSettings, weights: scorer.weights)
+        lastScore = nil
     }
 
     private static let fallbackPrompt =

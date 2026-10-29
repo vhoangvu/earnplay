@@ -28,6 +28,31 @@ final class SimulatedShieldFlowTests: XCTestCase {
         }
     }
 
+    /// File store wrapper that can fail saves on demand (grant-refused path).
+    private final class FailableUnlockWindowStore: UnlockWindowStore, @unchecked Sendable {
+        private let wrapped: FileUnlockWindowStore
+        var failNextSave = false
+
+        init(directory: URL) {
+            wrapped = FileUnlockWindowStore(directory: directory)
+        }
+
+        func loadUnlockWindow() -> UnlockWindow? {
+            wrapped.loadUnlockWindow()
+        }
+
+        func saveUnlockWindow(_ window: UnlockWindow) throws {
+            if failNextSave {
+                throw NSError(domain: "SimulatedShieldFlowTests", code: 1)
+            }
+            try wrapped.saveUnlockWindow(window)
+        }
+
+        func clearUnlockWindow() throws {
+            try wrapped.clearUnlockWindow()
+        }
+    }
+
     private static let games = AppCategoryRef(id: "games")
     private static let game = AppRef(id: "earnplay.demo.game")
 
@@ -42,7 +67,11 @@ final class SimulatedShieldFlowTests: XCTestCase {
         directory = nil
     }
 
-    private func makeManager(clock: FakeMonotonicClock, backend: SimulatedShieldBackend) -> ShieldManager {
+    private func makeManager(
+        clock: FakeMonotonicClock,
+        backend: SimulatedShieldBackend,
+        unlockStore: (any UnlockWindowStore)? = nil
+    ) -> ShieldManager {
         let policyStore = PolicyStore(directory: directory)
         XCTAssertEqual(policyStore.apply(Policy(
             version: 1,
@@ -63,7 +92,7 @@ final class SimulatedShieldFlowTests: XCTestCase {
             ),
             backend: backend,
             clock: clock,
-            unlockStore: FileUnlockWindowStore(directory: directory)
+            unlockStore: unlockStore ?? FileUnlockWindowStore(directory: directory)
         )
     }
 
@@ -72,10 +101,11 @@ final class SimulatedShieldFlowTests: XCTestCase {
         clock: FakeMonotonicClock,
         backend: SimulatedShieldBackend,
         isSimulatedMode: Bool = true,
-        unlockDuration: TimeInterval = 2
+        unlockDuration: TimeInterval = 2,
+        unlockStore: (any UnlockWindowStore)? = nil
     ) -> SimulatedShieldFlow {
         SimulatedShieldFlow(
-            manager: makeManager(clock: clock, backend: backend),
+            manager: makeManager(clock: clock, backend: backend, unlockStore: unlockStore),
             backend: backend,
             app: Self.game,
             category: Self.games,
@@ -114,16 +144,20 @@ final class SimulatedShieldFlowTests: XCTestCase {
         let score = flow.finishChallenge()
         XCTAssertEqual(score.decision, .granted)
         XCTAssertFalse(flow.isShieldPresented)
+        XCTAssertEqual(flow.challengeDecisionText, SimulatedShieldFlow.unlockGrantedText)
         XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed])
         XCTAssertEqual(flow.remainingUnlockTime, 2, accuracy: 0.001)
         XCTAssertEqual(flow.managedSettingsCallCount, 0)
 
-        // Re-presented: the short timer expires and the app re-locks.
+        // Re-presented: the short timer expires and the app re-locks,
+        // clearing the previous result for the next locked challenge.
         clock.advance(by: 3)
         flow.tick()
         XCTAssertTrue(flow.isShieldPresented)
         XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed, .presented])
         XCTAssertEqual(flow.remainingUnlockTime, 0)
+        XCTAssertNil(flow.lastScore)
+        XCTAssertNil(flow.challengeDecisionText)
         XCTAssertEqual(flow.managedSettingsCallCount, 0)
     }
 
@@ -137,6 +171,7 @@ final class SimulatedShieldFlowTests: XCTestCase {
         let score = flow.finishChallenge()
         XCTAssertEqual(score.decision, .denied)
         XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertEqual(flow.challengeDecisionText, SimulatedShieldFlow.unlockDeniedText)
         XCTAssertEqual(flow.presentationEvents, [.presented])
         XCTAssertEqual(flow.managedSettingsCallCount, 0)
     }
@@ -235,5 +270,89 @@ final class SimulatedShieldFlowTests: XCTestCase {
     func testSimulatedBadgeTextMarksDemoOnly() {
         XCTAssertTrue(SimulatedShieldFlow.simulatedBadgeText.contains("SIMULATED"))
         XCTAssertTrue(SimulatedShieldFlow.simulatedBadgeText.contains("NOT REAL ENFORCEMENT"))
+    }
+
+    // MARK: - Fix round 2
+
+    @MainActor
+    func testSecondCycleWithoutNewEffortStaysLockedAfterExpiry() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let flow = makeFlow(clock: clock, backend: backend)
+
+        // First cycle: pass and unlock.
+        recordPassingEffort(on: flow)
+        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertFalse(flow.isShieldPresented)
+
+        // Expire: the shield re-presents.
+        clock.advance(by: 3)
+        flow.tick()
+        XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed, .presented])
+
+        // Second cycle WITHOUT new effort: no free re-unlock.
+        let second = flow.finishChallenge()
+        XCTAssertEqual(second.decision, .denied)
+        XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed, .presented])
+        XCTAssertEqual(flow.managedSettingsCallCount, 0)
+
+        // Fresh effort on the new challenge can still grant: 5 attempts
+        // (10 pts) + 3 hints (6 pts) = 16 clears any per-session
+        // threshold draw (8...14).
+        for _ in 0..<5 { flow.submitAttempt(answer: "fresh try") }
+        for _ in 0..<3 { flow.useHint() }
+        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertFalse(flow.isShieldPresented)
+    }
+
+    @MainActor
+    func testDeniedEffortPreservedForRetry() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let flow = makeFlow(clock: clock, backend: backend)
+
+        // Partial effort: 1 attempt, no hint — below the floor, denied.
+        flow.submitAttempt(answer: "56")
+        XCTAssertEqual(flow.finishChallenge().decision, .denied)
+        XCTAssertTrue(flow.isShieldPresented)
+
+        // Topping up the SAME session reaches granted: 2 attempts
+        // (4 pts) + 2 hints (4 pts) = 8 against threshold 8.
+        flow.submitAttempt(answer: "56 again")
+        flow.useHint()
+        flow.useHint()
+        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertFalse(flow.isShieldPresented)
+    }
+
+    @MainActor
+    func testGrantedScoreWithFailedGrantShowsRetryableFailure() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let store = FailableUnlockWindowStore(directory: directory)
+        store.failNextSave = true
+        let flow = makeFlow(clock: clock, backend: backend, unlockStore: store)
+        XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertNil(flow.challengeDecisionText)
+
+        // A passing score whose grant the manager refuses (persist
+        // fails): failure message shown, shield stays presented.
+        recordPassingEffort(on: flow)
+        let score = flow.finishChallenge()
+        XCTAssertEqual(score.decision, .granted)
+        XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertEqual(flow.challengeDecisionText, SimulatedShieldFlow.unlockGrantFailedText)
+        XCTAssertEqual(flow.presentationEvents, [.presented])
+        XCTAssertEqual(flow.managedSettingsCallCount, 0)
+
+        // Retry with the store fixed and NO new effort (preserved): the
+        // same passing session unlocks and reports an open window.
+        store.failNextSave = false
+        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertFalse(flow.isShieldPresented)
+        XCTAssertEqual(flow.challengeDecisionText, SimulatedShieldFlow.unlockGrantedText)
+        XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed])
     }
 }

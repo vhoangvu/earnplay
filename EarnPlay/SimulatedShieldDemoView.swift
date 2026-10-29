@@ -68,9 +68,12 @@ final class SimulatedShieldDemoState: ObservableObject {
         )
     }
 
-    /// Selects a demo app, creating its challenge flow on first tap.
+    /// Selects a demo app, creating its challenge flow on first tap and
+    /// refreshing a cached flow so re-selecting never shows stale unlock
+    /// state (the flows share one manager, so another app's unlock ends
+    /// this app's window without ticking this flow).
     func select(_ id: String, isSimulatedMode: Bool) {
-        _ = flow(for: id, isSimulatedMode: isSimulatedMode)
+        flow(for: id, isSimulatedMode: isSimulatedMode)?.tick()
         activeAppID = id
     }
 
