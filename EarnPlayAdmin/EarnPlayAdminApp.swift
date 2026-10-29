@@ -5,7 +5,12 @@ import EarnPlayCore
 struct EarnPlayAdminApp: App {
     var body: some Scene {
         WindowGroup {
-            AdminVersionView()
+            TabView {
+                PolicyEditorView()
+                    .tabItem { Label("Policy", systemImage: "lock.shield") }
+                AdminVersionView()
+                    .tabItem { Label("Version", systemImage: "info.circle") }
+            }
         }
     }
 }
