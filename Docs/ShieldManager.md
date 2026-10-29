@@ -45,12 +45,15 @@ tests run without any entitlement.
   cannot extend an unlock, and sleeping past the real-time deadline
   expires it.
 - Each window is bound to its grant-time boot session
-  (`BootSessionProvider`; production uses `kern.bootsessionuuid`,
-  falling back to `kern.boottime`). A reloaded window fails closed to
-  shielded when its identifier is missing (pre-change format), differs
-  from the current boot, or cannot be verified — even when the new
-  boot's uptime falls inside the old grant-expiry interval. An
-  uptime regression likewise re-locks fail-closed.
+  (`BootSessionProvider`; production uses `kern.bootsessionuuid`, or
+  reports unverifiable when it is unavailable — there is no
+  wall-clock-derived `kern.boottime` fallback, since a clock adjustment
+  would shift it and wrongly revoke unexpired unlocks). A reloaded
+  window fails closed to shielded when its identifier is missing
+  (pre-change format), differs from the current boot, or cannot be
+  verified — even when the new boot's uptime falls inside the old
+  grant-expiry interval. An uptime regression likewise re-locks
+  fail-closed.
 - On expiry, shields are re-applied automatically by expiry
   monitoring (`startExpiryMonitoring`), or on the next `refresh()` /
   accessor call.
@@ -72,8 +75,11 @@ tests run without any entitlement.
   preserved). When re-enumeration loses an unlocked app's category,
   its suppression is dropped and the backstop is disabled instead, so
   the app stays open until expiry rather than re-locking mid-window.
-  Narrowed windows are re-persisted best-effort; relaunch
-  re-reconciles to the same state.
+  Narrowed windows are stamped with the current policy version and
+  re-persisted, with failed writes retried on later refreshes; a
+  reloaded window whose version is missing or has drifted fails closed,
+  so a stale record can never resurrect a removed app after the policy
+  changes again.
 
 ## Backend abstraction and verification status
 

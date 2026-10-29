@@ -10,6 +10,11 @@ import Foundation
 /// differs from the current boot, or cannot be verified fails closed to
 /// shielded and never unlocks. `explicitCategories` preserves
 /// caller-supplied grant categories across enumeration reconciliation.
+/// `policyVersion` is the policy version the window's app set was last
+/// reconciled against; a reloaded window whose version is missing or
+/// differs from the current policy fails closed, so a persisted record
+/// that missed a narrowing (its re-persist failed) cannot resurrect a
+/// removed app after the policy changes again.
 public struct UnlockWindow: Codable, Equatable, Sendable {
     /// Apps opened by this window.
     public var unlockedApps: Set<AppRef>
@@ -29,6 +34,9 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
     /// Caller-supplied categories at grant, preserved across
     /// enumeration reconciliation.
     public var explicitCategories: Set<AppCategoryRef>
+    /// Policy version the window's app set was last reconciled
+    /// against; nil means unknown (pre-change format).
+    public var policyVersion: Int?
 
     public init(
         unlockedApps: Set<AppRef>,
@@ -37,7 +45,8 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
         duration: TimeInterval,
         grantedWallDate: Date,
         bootSessionID: String? = nil,
-        explicitCategories: Set<AppCategoryRef> = []
+        explicitCategories: Set<AppCategoryRef> = [],
+        policyVersion: Int? = nil
     ) {
         self.unlockedApps = unlockedApps
         self.unlockedCategories = unlockedCategories
@@ -46,6 +55,7 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
         self.grantedWallDate = grantedWallDate
         self.bootSessionID = bootSessionID
         self.explicitCategories = explicitCategories
+        self.policyVersion = policyVersion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -56,6 +66,7 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
         case grantedWallDate
         case bootSessionID
         case explicitCategories
+        case policyVersion
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,6 +80,7 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
         explicitCategories = try container.decodeIfPresent(
             Set<AppCategoryRef>.self, forKey: .explicitCategories
         ) ?? []
+        policyVersion = try container.decodeIfPresent(Int.self, forKey: .policyVersion)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -80,6 +92,7 @@ public struct UnlockWindow: Codable, Equatable, Sendable {
         try container.encode(grantedWallDate, forKey: .grantedWallDate)
         try container.encodeIfPresent(bootSessionID, forKey: .bootSessionID)
         try container.encode(explicitCategories, forKey: .explicitCategories)
+        try container.encodeIfPresent(policyVersion, forKey: .policyVersion)
     }
 
     /// Monotonic time at which the window expires.
@@ -230,6 +243,12 @@ public final class ShieldManager: @unchecked Sendable {
     private var window: UnlockWindow?
     private var lastConfiguration: ShieldConfiguration = .none
     private var monitorTask: Task<Void, Never>?
+    /// True when a reconciliation narrowed or revoked the in-memory
+    /// window but persisting that change failed, so the on-disk record
+    /// is stale. Later refreshes retry the write; until one succeeds, a
+    /// restart must not trust the stale record (see the policy-version
+    /// binding in `init`).
+    private var reconciliationUnpersisted = false
 
     /// Creates a manager and immediately re-evaluates state: any
     /// persisted unlock window is resumed or expired, and the correct
@@ -240,7 +259,10 @@ public final class ShieldManager: @unchecked Sendable {
     /// A reloaded window fails closed when its boot-session identifier
     /// is missing, differs from the current boot, or cannot be
     /// verified, even when the new boot's uptime falls inside the old
-    /// grant-expiry interval.
+    /// grant-expiry interval. It likewise fails closed when its
+    /// policy version is missing or differs from the current policy:
+    /// the record may have missed a narrowing whose re-persist failed,
+    /// and must not resurrect a removed app after a later policy change.
     ///
     /// `nowWallDate` is injected only so tests can jump the wall clock;
     /// it never influences expiry.
@@ -264,7 +286,9 @@ public final class ShieldManager: @unchecked Sendable {
             let currentID = bootSession.currentBootSessionID
             if loaded.bootSessionID == nil
                 || currentID == nil
-                || loaded.bootSessionID != currentID {
+                || loaded.bootSessionID != currentID
+                || loaded.policyVersion == nil
+                || loaded.policyVersion != policyStore.currentPolicy.version {
                 self.window = nil
                 try? unlockStore.clearUnlockWindow()
             } else {
@@ -482,7 +506,8 @@ public final class ShieldManager: @unchecked Sendable {
             duration: duration,
             grantedWallDate: nowWallDate(),
             bootSessionID: bootSession.currentBootSessionID,
-            explicitCategories: explicit
+            explicitCategories: explicit,
+            policyVersion: policyStore.currentPolicy.version
         )
         do {
             try unlockStore.saveUnlockWindow(newWindow)
@@ -490,13 +515,16 @@ public final class ShieldManager: @unchecked Sendable {
             return false
         }
         window = newWindow
+        reconciliationUnpersisted = false
         refreshLocked()
         return true
     }
 
     /// Expires the window if due (boot mismatch, uptime regression, or
     /// elapsed duration), reconciles it against the current policy and
-    /// enumeration, recomputes the configuration, and applies it.
+    /// enumeration, recomputes the configuration, and applies it. A
+    /// reconciliation whose persistence previously failed is retried, so
+    /// a transient write failure cannot leave a stale record behind.
     private func refreshLocked() {
         if let current = window {
             let now = clock.nowUptime
@@ -512,6 +540,16 @@ public final class ShieldManager: @unchecked Sendable {
             } else {
                 reconcileWindowLocked()
             }
+        } else if reconciliationUnpersisted {
+            // A past reconciliation revoked the window in memory but its
+            // clear failed: retry so a restart cannot resurrect the stale
+            // record. A missing file counts as success.
+            do {
+                try unlockStore.clearUnlockWindow()
+                reconciliationUnpersisted = false
+            } catch {
+                // Still failing: stay flagged and retry on a later refresh.
+            }
         }
         let configuration = computeConfigurationLocked()
         lastConfiguration = configuration
@@ -524,16 +562,24 @@ public final class ShieldManager: @unchecked Sendable {
     /// When re-enumeration loses an unlocked app's category metadata,
     /// its suppression is dropped here and the configuration disables
     /// the backstop instead, so the app stays open until its window
-    /// expires rather than re-locking mid-window. Persisting the
-    /// narrowed window is best-effort: relaunch re-reconciles to the
-    /// same state.
+    /// expires rather than re-locking mid-window. The narrowed window
+    /// is stamped with the current policy version and re-persisted; a
+    /// failed write is flagged and retried on later refreshes, and a
+    /// restart refuses records whose version has drifted, so a removed
+    /// app cannot come back from a stale record after the policy
+    /// changes again.
     private func reconcileWindowLocked() {
-        guard var current = window else { return }
+        guard let current = window else { return }
         let policy = policyStore.currentPolicy
         let filtered = current.unlockedApps.filter { policy.isChallengeUnlockable($0) }
         if filtered.isEmpty {
             window = nil
-            try? unlockStore.clearUnlockWindow()
+            do {
+                try unlockStore.clearUnlockWindow()
+                reconciliationUnpersisted = false
+            } catch {
+                reconciliationUnpersisted = true
+            }
             return
         }
         var lookedUp: Set<AppCategoryRef> = []
@@ -542,12 +588,18 @@ public final class ShieldManager: @unchecked Sendable {
                 lookedUp.insert(found)
             }
         }
-        let recomputed = current.explicitCategories.union(lookedUp)
-        if filtered != current.unlockedApps || recomputed != current.unlockedCategories {
-            current.unlockedApps = filtered
-            current.unlockedCategories = recomputed
-            window = current
-            try? unlockStore.saveUnlockWindow(current)
+        var narrowed = current
+        narrowed.unlockedApps = filtered
+        narrowed.unlockedCategories = current.explicitCategories.union(lookedUp)
+        narrowed.policyVersion = policy.version
+        if narrowed != current || reconciliationUnpersisted {
+            window = narrowed
+            do {
+                try unlockStore.saveUnlockWindow(narrowed)
+                reconciliationUnpersisted = false
+            } catch {
+                reconciliationUnpersisted = true
+            }
         }
     }
 

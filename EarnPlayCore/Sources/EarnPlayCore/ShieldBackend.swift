@@ -166,23 +166,36 @@ public protocol BootSessionProvider: Sendable {
 }
 
 /// Production boot-session provider: `kern.bootsessionuuid` when
-/// available, falling back to `kern.boottime`.
+/// available, otherwise unverifiable (`nil`).
+///
+/// There is deliberately no `kern.boottime` fallback: boottime is
+/// wall-clock-derived and shifts when the system clock is adjusted, so
+/// an ID derived from it would change on a clock jump and the manager
+/// would wrongly revoke an unexpired unlock as a spurious reboot. With
+/// `nil` the manager instead keeps the unlock mid-process (remaining
+/// time is unaffected by wall-clock jumps) and fails closed on reload.
 public struct SystemBootSessionProvider: BootSessionProvider {
     public init() {}
 
     public var currentBootSessionID: String? {
         #if canImport(Darwin)
-        if let uuid = Self.sysctlString("kern.bootsessionuuid"),
-           !uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "bootsessionuuid:\(uuid.trimmingCharacters(in: .whitespacesAndNewlines))"
-        }
-        if let bootTime = Self.sysctlBootTime() {
-            return "boottime:\(bootTime)"
-        }
-        return nil
+        return Self.resolveBootSessionID(
+            uuid: Self.sysctlString("kern.bootsessionuuid")
+        )
         #else
         return nil
         #endif
+    }
+
+    /// Resolves the boot-session identifier from a `kern.bootsessionuuid`
+    /// value: the trimmed UUID, or `nil` when missing or blank (never a
+    /// wall-clock-derived substitute). Extracted as a seam so tests can
+    /// pin the no-fallback contract without touching sysctls.
+    static func resolveBootSessionID(uuid: String?) -> String? {
+        if let uuid, !uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "bootsessionuuid:\(uuid.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+        return nil
     }
 
     #if canImport(Darwin)
@@ -200,16 +213,6 @@ public struct SystemBootSessionProvider: BootSessionProvider {
         let bytes = buffer.prefix(size).map { UInt8(bitPattern: $0) }
         let content = bytes.prefix(while: { $0 != 0 })
         return String(bytes: content, encoding: .utf8)
-    }
-
-    static func sysctlBootTime() -> String? {
-        var bootTime = timeval()
-        var size = MemoryLayout<timeval>.size
-        let result = "kern.boottime".withCString {
-            sysctlbyname($0, &bootTime, &size, nil, 0)
-        }
-        guard result == 0 else { return nil }
-        return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
     }
     #endif
 }

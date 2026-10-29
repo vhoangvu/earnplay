@@ -961,4 +961,258 @@ final class ShieldManagerTests: XCTestCase {
         XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.games))
         XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.social))
     }
+
+    // MARK: - Fix round 3 (issue #13): stale-window resurrection + boottime fallback
+
+    private func policyUnlockable(_ apps: [AppRef], version: Int) -> Policy {
+        Policy(
+            version: version,
+            alwaysAllowed: [.phone, Self.allowedGame],
+            unblockable: apps,
+            neverUnlockableOverrides: [Self.browser],
+            unlockDurations: UnlockDurations(practiceMinutes: 30, tradeMinutes: 15),
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: [],
+            movementSettings: .default
+        )
+    }
+
+    func testFailedReconciliationSaveDoesNotResurrectRemovedAppAfterRestore() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 1)), .applied
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlockForAllChallengeUnlockable(duration: 60))
+
+        // Policy v2 removes video while the narrowed-window save fails:
+        // memory narrows to game, disk still holds game+video.
+        failingStore.failNextSave = true
+        XCTAssertEqual(policyStore.apply(policyUnlockable([Self.game], version: 2)), .applied)
+        manager.refresh()
+        XCTAssertEqual(manager.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertTrue(manager.isShielded(app: Self.video, category: Self.entertainment))
+
+        // Transient failure clears; policy v3 restores video before expiry.
+        failingStore.failNextSave = false
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 3)), .applied
+        )
+        manager.refresh()
+
+        // Same-boot restart must resume the narrowed window, not the
+        // stale record: video stays locked without a new grant.
+        let relaunched = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertEqual(relaunched.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertFalse(relaunched.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(relaunched.isShielded(app: Self.video, category: Self.entertainment))
+    }
+
+    func testPersistentReconciliationSaveFailureFailsClosedOnRestart() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 1)), .applied
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlockForAllChallengeUnlockable(duration: 60))
+
+        // The narrowed-window write keeps failing through the removal
+        // and the restoration: disk is stuck at the v1 wide window.
+        failingStore.failNextSave = true
+        XCTAssertEqual(policyStore.apply(policyUnlockable([Self.game], version: 2)), .applied)
+        manager.refresh()
+        XCTAssertEqual(manager.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 3)), .applied
+        )
+        manager.refresh()
+
+        // Same-boot restart: the persisted record predates the policy
+        // changes, so it must not resume — fail closed instead.
+        let relaunched = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertFalse(relaunched.isUnlockActive)
+        XCTAssertEqual(relaunched.remainingUnlockTime, 0)
+        XCTAssertTrue(relaunched.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(relaunched.isShielded(app: Self.video, category: Self.entertainment))
+    }
+
+    func testFailedReconciliationClearDoesNotResurrectRevokedWindow() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 1)), .applied
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+
+        // Policy v2 removes game while the reconciliation clear fails:
+        // memory revokes, the persisted window survives.
+        failingStore.failNextClear = true
+        XCTAssertEqual(policyStore.apply(policyUnlockable([], version: 2)), .applied)
+        manager.refresh()
+        XCTAssertFalse(manager.isUnlockActive)
+
+        // Transient failure clears; policy v3 restores game before expiry.
+        failingStore.failNextClear = false
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 3)), .applied
+        )
+        manager.refresh()
+
+        // Same-boot restart must not resurrect the revoked window.
+        let relaunched = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertFalse(relaunched.isUnlockActive)
+        XCTAssertTrue(relaunched.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testPersistentReconciliationClearFailureFailsClosedOnRestart() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 1)), .applied
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+
+        // The reconciliation clear keeps failing through the removal
+        // and the restoration: the stale v1 window stays on disk.
+        failingStore.failNextClear = true
+        XCTAssertEqual(policyStore.apply(policyUnlockable([], version: 2)), .applied)
+        manager.refresh()
+        XCTAssertFalse(manager.isUnlockActive)
+        XCTAssertEqual(
+            policyStore.apply(policyUnlockable([Self.game, Self.video], version: 3)), .applied
+        )
+        manager.refresh()
+
+        // Same-boot restart: the stale record must not resume.
+        let relaunched = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertFalse(relaunched.isUnlockActive)
+        XCTAssertTrue(relaunched.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testBootSessionIDNeverUsesWallClockDerivedFallback() {
+        XCTAssertEqual(
+            SystemBootSessionProvider.resolveBootSessionID(uuid: "  abc-123\n "),
+            "bootsessionuuid:abc-123"
+        )
+        // No usable UUID means unverifiable (nil): the manager keeps the
+        // unlock mid-process and fails closed on reload, instead of
+        // deriving an ID from wall-clock-derived kern.boottime, which
+        // shifts on clock adjustments and would wrongly revoke unexpired
+        // unlocks as spurious reboots.
+        XCTAssertNil(SystemBootSessionProvider.resolveBootSessionID(uuid: nil))
+        XCTAssertNil(SystemBootSessionProvider.resolveBootSessionID(uuid: ""))
+        XCTAssertNil(SystemBootSessionProvider.resolveBootSessionID(uuid: "  \n "))
+        XCTAssertFalse(
+            (SystemBootSessionProvider().currentBootSessionID ?? "").hasPrefix("boottime:"),
+            "boot-session ID must never come from wall-clock-derived kern.boottime"
+        )
+    }
+
+    func testNilBootFallbackSurvivesWallJumpAndFailsClosedOnRestart() {
+        let clock = FakeMonotonicClock()
+        let wall = FakeWallClock()
+        let backend = SimulatedShieldBackend()
+        let (manager, _) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider(nil),
+            wall: wall
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+        clock.advance(by: 10)
+        wall.jump(by: 2 * 60 * 60)
+        XCTAssertEqual(manager.remainingUnlockTime, 50, accuracy: 0.001)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        wall.jump(by: -3 * 60 * 60)
+        XCTAssertEqual(manager.remainingUnlockTime, 50, accuracy: 0.001)
+        XCTAssertTrue(manager.isUnlockActive)
+
+        // An unverifiable boot never resumes after a restart: fail closed.
+        let relaunched = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider(nil)
+        )
+        XCTAssertFalse(relaunched.isUnlockActive)
+        XCTAssertTrue(relaunched.isShielded(app: Self.game, category: Self.games))
+    }
 }
