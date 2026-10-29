@@ -3,10 +3,12 @@ import EarnPlayCore
 
 /// First-launch model download screen (issue #53).
 ///
-/// Shown instead of the tutor UI until `ModelRuntime.defaultModelURL()`
-/// resolves a model file. The download is Wi-Fi only, verified by
-/// SHA-256, and installed into Application Support; after it succeeds
-/// the app works fully offline.
+/// Shown instead of the tutor UI until the readiness gate resolves a
+/// usable model: the active registry's validated artifacts (so a
+/// retained snapshot stays usable), a legacy model location, or a
+/// size- and SHA-verified first-launch download in Application
+/// Support. The download is Wi-Fi only; after it succeeds the app
+/// works fully offline.
 struct ModelDownloadView: View {
     @ObservedObject var viewModel: ModelDownloadViewModel
 
@@ -56,35 +58,39 @@ struct ModelDownloadView: View {
     }
 }
 
-/// Drives `ModelDownloadView`. The ready check is a pure filesystem
-/// lookup (no network), so an already-downloaded model skips this
-/// screen instantly, including fully offline.
+/// Drives `ModelDownloadView`. The ready check performs no network
+/// I/O (registry validation + file verification only), so an
+/// already-usable model skips this screen, including fully offline.
+/// Resolution hashes model files, so it runs detached off the main
+/// actor; the phase flips when it completes.
 @MainActor
 final class ModelDownloadViewModel: ObservableObject {
-    enum Phase: Equatable {
-        case checking
-        case needsDownload
-        case downloading(progress: Double)
-        case failed(message: String)
-        case ready
-    }
-
-    @Published private(set) var phase: Phase = .checking
+    @Published private(set) var phase: ModelDownloadPhase = .checking
 
     var isReady: Bool { phase == .ready }
 
     private let downloader: ModelDownloader
+    private let readiness: ModelDownloadReadiness
+    /// Epoch so a superseded refresh cannot overwrite a newer result.
+    private var refreshEpoch = 0
 
-    init(downloader: ModelDownloader = ModelDownloader()) {
+    init(downloader: ModelDownloader = ModelDownloader(),
+         readiness: ModelDownloadReadiness = ModelDownloadReadiness()) {
         self.downloader = downloader
+        self.readiness = readiness
     }
 
-    /// Re-resolves the model through the production lookup.
+    /// Re-resolves the model through the production readiness gate.
     func refresh() {
-        if ModelRuntime.defaultModelURL() != nil {
-            phase = .ready
-        } else {
-            phase = .needsDownload
+        refreshEpoch += 1
+        let epoch = refreshEpoch
+        phase = .checking
+        Task.detached(priority: .userInitiated) { [readiness] in
+            let ready = readiness.isReady()
+            await MainActor.run { [weak self] in
+                guard let self, self.refreshEpoch == epoch else { return }
+                self.phase = ready ? .ready : .needsDownload
+            }
         }
     }
 
@@ -103,7 +109,10 @@ final class ModelDownloadViewModel: ObservableObject {
         do {
             _ = try await downloader.downloadIfNeeded(progress: { fraction in
                 Task { @MainActor [weak self] in
-                    self?.phase = .downloading(progress: fraction)
+                    guard let self else { return }
+                    // Queued callbacks arriving after a terminal
+                    // phase are ignored, never reverting the UI.
+                    self.phase = self.phase.applyingProgress(fraction)
                 }
             })
             // Only proceed when the production lookup actually sees

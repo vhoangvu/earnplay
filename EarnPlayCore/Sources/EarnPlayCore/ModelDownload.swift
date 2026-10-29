@@ -49,6 +49,118 @@ public enum ModelAttribution {
         "(bartowski Llama-3.2-1B-Instruct-GGUF, Q4_K_M), used under " +
         "the Llama 3.2 Community License. The model is downloaded " +
         "once over Wi-Fi and runs entirely on this device."
+
+    /// Prominent label required by Llama 3.2 Community License
+    /// Section 1.b.i ("prominently display 'Built with Llama' on a
+    /// related website, user interface, blogpost, about page, or
+    /// product documentation"). The About screen renders this label.
+    public static let builtWithLlamaLabel = "Built with Llama"
+
+    /// Exact attribution sentence required by Llama 3.2 Community
+    /// License Section 1.b.iii inside the shipped Notice file.
+    public static let noticeAttributionSentence =
+        "Llama 3.2 is licensed under the Llama 3.2 Community License, " +
+        "Copyright © Meta Platforms, Inc. All Rights Reserved."
+
+    public static let licenseResourceName = "LLAMA_3_2_COMMUNITY_LICENSE"
+    public static let noticeResourceName = "NOTICE"
+
+    /// Bundled copy of the Llama 3.2 Community License Agreement
+    /// (Section 1.b.i(A): "provide a copy of this Agreement with any
+    /// such Llama Materials"). Nil when the resource is missing.
+    public static func bundledLicenseURL() -> URL? {
+        Bundle.module.url(forResource: licenseResourceName, withExtension: "txt")
+    }
+
+    /// Bundled Notice file carrying the Section 1.b.iii sentence.
+    public static func bundledNoticeURL() -> URL? {
+        Bundle.module.url(forResource: noticeResourceName, withExtension: "txt")
+    }
+
+    /// Offline-readable license text (a bundle file read — no network).
+    public static func bundledLicenseText() -> String? {
+        guard let url = bundledLicenseURL() else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// Offline-readable Notice text (a bundle file read — no network).
+    public static func bundledNoticeText() -> String? {
+        guard let url = bundledNoticeURL() else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+}
+
+/// Phase of the first-launch download UI (fix round 2: defined in
+/// Core so the stale-progress rule is unit-testable; the app view
+/// model publishes this value).
+public enum ModelDownloadPhase: Equatable, Sendable {
+    case checking
+    case needsDownload
+    case downloading(progress: Double)
+    case failed(message: String)
+    case ready
+
+    /// Applies a progress callback to the current phase. Progress
+    /// applies only while `.downloading`: once the operation has
+    /// left that phase (terminal `.ready`/`.failed`, or back to
+    /// `.needsDownload`), queued callbacks are ignored instead of
+    /// reverting the UI and hiding Retry (finding 4).
+    public func applyingProgress(_ fraction: Double) -> ModelDownloadPhase {
+        guard case .downloading = self else { return self }
+        return .downloading(progress: fraction)
+    }
+}
+
+/// First-launch gate readiness (fix round 2, findings 2+3).
+///
+/// Resolves whether the tutor can run without a download. Injected
+/// configuration/destination/store make the resolution hermetic in
+/// tests; production defaults match the live lookup.
+public struct ModelDownloadReadiness: Sendable {
+    public let configuration: ModelDownloadConfiguration
+    public let destinationURL: URL
+    public let registryStoreURL: URL
+
+    public init(configuration: ModelDownloadConfiguration = .production,
+                destinationURL: URL? = nil,
+                registryStoreURL: URL? = nil,
+                fileManager: FileManager = .default) {
+        self.configuration = configuration
+        self.destinationURL = destinationURL ?? ModelDownloader.defaultDestinationURL(fileManager: fileManager)
+        self.registryStoreURL = registryStoreURL ?? VersionRegistry.defaultStoreURL(fileManager: fileManager)
+    }
+
+    /// Resolves whether the tutor can run without a download:
+    /// 1. The active registry's validated artifacts satisfy the
+    ///    gate — the same resolution `SpikeView` runs — so a
+    ///    retained previous-known-good snapshot stays usable even
+    ///    when the default/current file is gone (finding 2). This
+    ///    is a check-only resolve: a retained snapshot is released
+    ///    immediately so the gate never pins registry cleanup.
+    /// 2. Otherwise a legacy default location (env override,
+    ///    Documents, script cache) counts by existence, without
+    ///    re-verification (finding 3: legacy preserved).
+    /// 3. A default file AT the download destination verifies by
+    ///    size + SHA before counting as ready; an invalid file
+    ///    returns false so the UI routes back through the
+    ///    downloader, which discards and re-fetches it (finding 3).
+    ///
+    /// Hashes model files; callers must run this off the main actor.
+    public func isReady(environment: [String: String] = ProcessInfo.processInfo.environment,
+                        fileManager: FileManager = .default) -> Bool {
+        let defaultURL = ModelRuntime.defaultModelURL(environment: environment, fileManager: fileManager)
+        if let registry = try? VersionRegistry.production(storeURL: registryStoreURL, modelURL: defaultURL),
+           let artifacts = try? registry.inferenceArtifacts(defaultModelURL: defaultURL) {
+            registry.releaseInferenceArtifacts(artifacts)
+            return true
+        }
+        guard let defaultURL else { return false }
+        if defaultURL.standardizedFileURL.path != destinationURL.standardizedFileURL.path {
+            return true
+        }
+        let downloader = ModelDownloader(configuration: configuration, destinationURL: destinationURL)
+        return downloader.verifiedExistingModelURL() != nil
+    }
 }
 
 /// Errors from `ModelDownloader`. Every failure leaves the destination
@@ -120,6 +232,18 @@ final class ModelDownloadTaskDelegate: NSObject, URLSessionDownloadDelegate, @un
     private var stagedLocation: URL?
     private var task: URLSessionDownloadTask?
     private var didResume = false
+    /// Recorded under the lock by `cancel()` (finding 5): when set
+    /// before `begin()` assigns the task, `begin()` fails the
+    /// continuation as cancelled without starting the fetch.
+    private var didCancel = false
+
+    /// Test hook (fix round 2, finding 5): true once `begin()` has
+    /// created a URLSession task. Read under the lock.
+    var didStartTask: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return task != nil
+    }
 
     init(progress: @escaping @Sendable (Double) -> Void) {
         self.progress = progress
@@ -128,14 +252,29 @@ final class ModelDownloadTaskDelegate: NSObject, URLSessionDownloadDelegate, @un
     func begin(session: URLSession, url: URL, continuation: CheckedContinuation<URL, any Error>) {
         lock.lock()
         self.continuation = continuation
-        let downloadTask = session.downloadTask(with: url)
-        self.task = downloadTask
+        let wasCancelled = didCancel
+        let downloadTask: URLSessionDownloadTask?
+        if wasCancelled {
+            downloadTask = nil
+        } else {
+            let created = session.downloadTask(with: url)
+            self.task = created
+            downloadTask = created
+        }
         lock.unlock()
-        downloadTask.resume()
+        if wasCancelled {
+            // Cancellation arrived before initialization (including
+            // a fetch from an already-cancelled task): fail without
+            // starting the ~800 MB transfer.
+            finish(throwing: ModelDownloadError.cancelled)
+            return
+        }
+        downloadTask?.resume()
     }
 
     func cancel() {
         lock.lock()
+        didCancel = true
         let downloadTask = task
         lock.unlock()
         downloadTask?.cancel()

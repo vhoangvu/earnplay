@@ -13,6 +13,29 @@ final class ModelDownloadAppTests: XCTestCase {
         XCTAssertTrue(ModelAttribution.llamaCommunityLicenseText.contains("Llama-3.2-1B-Instruct-GGUF"))
     }
 
+    /// Fix round 2, finding 1 (§1.b.i(B)): the About screen's
+    /// prominent label. The rendering inputs below (label + bundled
+    /// texts) are bundle reads, so About renders them fully offline.
+    func testAboutAttributionShowsBuiltWithLlamaLabel() {
+        XCTAssertEqual(ModelAttribution.builtWithLlamaLabel, "Built with Llama")
+    }
+
+    /// Finding 1 (§1.b.i(A)): the license copy ships inside the app
+    /// bundle and reads without network.
+    func testAppBundleShipsLicenseCopyReadableOffline() {
+        let text = ModelAttribution.bundledLicenseText()
+        XCTAssertNotNil(text, "the license copy must ship in the app bundle")
+        XCTAssertTrue(text?.contains("LLAMA 3.2 COMMUNITY LICENSE AGREEMENT") == true)
+    }
+
+    /// Finding 1 (§1.b.iii): the Notice file ships inside the app
+    /// bundle carrying the exact required sentence.
+    func testAppBundleShipsNoticeWithRequiredSentence() {
+        let text = ModelAttribution.bundledNoticeText()
+        XCTAssertNotNil(text, "the Notice file must ship in the app bundle")
+        XCTAssertTrue(text?.contains(ModelAttribution.noticeAttributionSentence) == true)
+    }
+
     func testDefaultDestinationIsApplicationSupportNotCaches() {
         let fileManager = FileManager.default
         let destination = ModelDownloader.defaultDestinationURL(fileManager: fileManager)

@@ -32,7 +32,8 @@ let package = Package(
         .library(name: "EarnPlayCore", targets: ["EarnPlayCore"])
     ],
     targets: [
-        .target(name: "EarnPlayCore", dependencies: earnPlayCoreDeps),
+        .target(name: "EarnPlayCore", dependencies: earnPlayCoreDeps,
+                resources: [.process("Resources")]),
         .testTarget(name: "EarnPlayCoreTests", dependencies: ["EarnPlayCore"])
     ] + extraTargets
 )
