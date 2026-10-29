@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Shield-application types for T2.2 — framework-free, like `Policy`.
 ///
@@ -115,22 +118,98 @@ extension ShieldBackend {
 
 /// Monotonic clock source for unlock timers (LLD unlock timers).
 ///
-/// Values are seconds on a clock that only moves forward at real-time
-/// rate and is unaffected by device wall-clock changes. Unlock expiry
-/// is computed only from this source, never from `Date`.
+/// Values are seconds on a suspend-inclusive monotonic clock that only
+/// moves forward at real-time rate, keeps counting across system sleep,
+/// and is unaffected by device wall-clock changes. Unlock expiry is
+/// computed only from this source, never from `Date`.
 public protocol MonotonicClock: Sendable {
     var nowUptime: TimeInterval { get }
 }
 
-/// Production monotonic clock: system uptime via `ProcessInfo`.
+/// Production monotonic clock: suspend-inclusive continuous time.
 ///
-/// Resets when the device reboots; `ShieldManager` detects an uptime
-/// regression across a restart and re-locks fail-closed rather than
-/// extending a window on a fresh boot's smaller uptime.
+/// Uses `mach_continuous_time` (Darwin), which keeps counting while the
+/// device sleeps, so an unlock cannot retain unused time after the phone
+/// has slept past its real-time deadline. `ProcessInfo.systemUptime`
+/// measures awake time only and must not be used here.
+///
+/// Resets when the device reboots; `ShieldManager` binds each window to
+/// a boot-session identifier and re-locks fail-closed on a reboot or an
+/// uptime regression rather than extending a window on a fresh boot.
 public struct SystemUptimeClock: MonotonicClock {
     public init() {}
 
     public var nowUptime: TimeInterval {
-        ProcessInfo.processInfo.systemUptime
+        #if canImport(Darwin)
+        var info = mach_timebase_info(numer: 0, denom: 0)
+        guard mach_timebase_info(&info) == KERN_SUCCESS, info.denom != 0 else {
+            return ProcessInfo.processInfo.systemUptime
+        }
+        let ticks = mach_continuous_time()
+        let nanos = Double(ticks) * Double(info.numer) / Double(info.denom)
+        return nanos / 1_000_000_000
+        #else
+        return ProcessInfo.processInfo.systemUptime
+        #endif
     }
+}
+
+/// Boot-session identifier source for unlock windows.
+///
+/// Each boot has a distinct identifier; `ShieldManager` persists the
+/// grant-time identifier with the window and fails closed when the
+/// reloaded identifier differs or cannot be verified, so a reboot can
+/// never resume an old window even when the new boot's uptime falls
+/// inside the old grant-expiry interval. `nil` means unverifiable.
+public protocol BootSessionProvider: Sendable {
+    var currentBootSessionID: String? { get }
+}
+
+/// Production boot-session provider: `kern.bootsessionuuid` when
+/// available, falling back to `kern.boottime`.
+public struct SystemBootSessionProvider: BootSessionProvider {
+    public init() {}
+
+    public var currentBootSessionID: String? {
+        #if canImport(Darwin)
+        if let uuid = Self.sysctlString("kern.bootsessionuuid"),
+           !uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "bootsessionuuid:\(uuid.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+        if let bootTime = Self.sysctlBootTime() {
+            return "boottime:\(bootTime)"
+        }
+        return nil
+        #else
+        return nil
+        #endif
+    }
+
+    #if canImport(Darwin)
+    static func sysctlString(_ name: String) -> String? {
+        var size = 0
+        let sized = name.withCString { sysctlbyname($0, nil, &size, nil, 0) }
+        guard sized == 0, size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size + 1)
+        let read = name.withCString { cString in
+            buffer.withUnsafeMutableBytes { raw in
+                sysctlbyname(cString, raw.baseAddress, &size, nil, 0)
+            }
+        }
+        guard read == 0 else { return nil }
+        let bytes = buffer.prefix(size).map { UInt8(bitPattern: $0) }
+        let content = bytes.prefix(while: { $0 != 0 })
+        return String(bytes: content, encoding: .utf8)
+    }
+
+    static func sysctlBootTime() -> String? {
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        let result = "kern.boottime".withCString {
+            sysctlbyname($0, &bootTime, &size, nil, 0)
+        }
+        guard result == 0 else { return nil }
+        return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
+    }
+    #endif
 }

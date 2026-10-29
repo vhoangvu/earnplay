@@ -80,6 +80,62 @@ final class ShieldManagerTests: XCTestCase {
         }
     }
 
+    /// Injectable boot-session identifier: tests control reboot vs same boot.
+    private final class FakeBootSessionProvider: BootSessionProvider, @unchecked Sendable {
+        private let lock = NSLock()
+        private var identifier: String?
+
+        init(_ identifier: String? = "test-boot") { self.identifier = identifier }
+
+        var currentBootSessionID: String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return identifier
+        }
+
+        func setID(_ newValue: String?) {
+            lock.lock()
+            identifier = newValue
+            lock.unlock()
+        }
+    }
+
+    /// File store wrapper that can fail saves or clears on demand.
+    private final class FailableUnlockWindowStore: UnlockWindowStore, @unchecked Sendable {
+        private let wrapped: FileUnlockWindowStore
+        private let lock = NSLock()
+        var failNextSave = false
+        var failNextClear = false
+
+        init(directory: URL) {
+            wrapped = FileUnlockWindowStore(directory: directory)
+        }
+
+        func loadUnlockWindow() -> UnlockWindow? {
+            wrapped.loadUnlockWindow()
+        }
+
+        func saveUnlockWindow(_ window: UnlockWindow) throws {
+            lock.lock()
+            let shouldFail = failNextSave
+            lock.unlock()
+            if shouldFail {
+                throw NSError(domain: "ShieldManagerTests", code: 1)
+            }
+            try wrapped.saveUnlockWindow(window)
+        }
+
+        func clearUnlockWindow() throws {
+            lock.lock()
+            let shouldFail = failNextClear
+            lock.unlock()
+            if shouldFail {
+                throw NSError(domain: "ShieldManagerTests", code: 2)
+            }
+            try wrapped.clearUnlockWindow()
+        }
+    }
+
     // MARK: - Fixtures
 
     private static let games = AppCategoryRef(id: "games")
@@ -352,7 +408,7 @@ final class ShieldManagerTests: XCTestCase {
         XCTAssertTrue(manager.isShielded(app: Self.browser, category: Self.social))
     }
 
-    func testGrantUnlockForAllChallengeUnlockableAndRevoke() {
+    func testGrantUnlockForAllChallengeUnlockableAndRevoke() throws {
         let clock = FakeMonotonicClock()
         let backend = SimulatedShieldBackend()
         let manager = makeManager(clock: clock, backend: backend)
@@ -365,7 +421,7 @@ final class ShieldManagerTests: XCTestCase {
         XCTAssertTrue(manager.isShielded(app: Self.socialApp, category: Self.social))
         XCTAssertFalse(manager.isShielded(app: Self.allowedGame, category: Self.games))
 
-        manager.revokeUnlock()
+        try manager.revokeUnlock()
         XCTAssertFalse(manager.isUnlockActive)
         XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
         XCTAssertTrue(manager.isShielded(app: Self.video, category: Self.entertainment))
@@ -387,5 +443,394 @@ final class ShieldManagerTests: XCTestCase {
         let second = clock.nowUptime
         XCTAssertGreaterThan(first, 0)
         XCTAssertGreaterThanOrEqual(second, first)
+    }
+
+    // MARK: - Fix round 1 (issue #13): Copilot 2nd review
+
+    private func makeCustomManager(
+        policy: Policy,
+        enumeration: ShieldEnumeration,
+        backend: SimulatedShieldBackend,
+        clock: FakeMonotonicClock,
+        unlockStore: any UnlockWindowStore,
+        bootSession: FakeBootSessionProvider,
+        wall: FakeWallClock = FakeWallClock()
+    ) -> (ShieldManager, PolicyStore) {
+        let policyStore = PolicyStore(directory: directory)
+        if policyStore.storedVersion == 0 {
+            XCTAssertEqual(policyStore.apply(policy), .applied)
+        }
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: enumeration,
+            backend: backend,
+            clock: clock,
+            unlockStore: unlockStore,
+            bootSession: bootSession,
+            nowWallDate: { wall.now() }
+        )
+        return (manager, policyStore)
+    }
+
+    func testSleepPastDeadlineExpiresUnlock() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let (manager, _) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider()
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 5 * 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        // Suspend-inclusive time (awake + sleep) past the real-time deadline.
+        clock.advance(by: 5 * 60 + 1)
+        manager.refresh()
+        XCTAssertFalse(manager.isUnlockActive)
+        XCTAssertEqual(manager.remainingUnlockTime, 0)
+        XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testSystemUptimeClockIsSuspendInclusive() {
+        let continuous = SystemUptimeClock().nowUptime
+        let awake = ProcessInfo.processInfo.systemUptime
+        XCTAssertGreaterThan(continuous, 0)
+        // Continuous time includes sleep, so it is never behind awake-only uptime.
+        XCTAssertGreaterThanOrEqual(continuous, awake - 5)
+    }
+
+    func testRebootWithNewUptimeInsideOldWindowFailsClosed() {
+        let backend = SimulatedShieldBackend()
+        let clockBefore = FakeMonotonicClock(start: 1_000)
+        let bootBefore = FakeBootSessionProvider("boot-1")
+        let (manager, _) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clockBefore,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: bootBefore
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+
+        // Reboot: new boot's uptime (1,020) falls between the old grant
+        // (1,000) and expiry (1,060). Uptime comparison alone would resume
+        // with 40 seconds remaining; the boot-session binding must fail closed.
+        let clockAfter = FakeMonotonicClock(start: 1_020)
+        let bootAfter = FakeBootSessionProvider("boot-2")
+        let policyStore = PolicyStore(directory: directory)
+        let relaunched = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clockAfter,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: bootAfter
+        )
+        XCTAssertFalse(relaunched.isUnlockActive)
+        XCTAssertEqual(relaunched.remainingUnlockTime, 0)
+        XCTAssertTrue(relaunched.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testUnverifiableBootSessionFailsClosed() throws {
+        // Old persisted format without a boot-session identifier.
+        let legacyJSON = """
+        {"unlockedApps":[{"id":"com.example.game"}],"unlockedCategories":[{"id":"games"}],\
+        "grantedAtUptime":1000,"duration":60,"grantedWallDate":600000}
+        """.data(using: .utf8)!
+        try legacyJSON.write(
+            to: directory.appendingPathComponent(FileUnlockWindowStore.windowFileName)
+        )
+        let backend = SimulatedShieldBackend()
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(samplePolicy()), .applied)
+        let legacy = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: FakeMonotonicClock(start: 1_020),
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider("boot-1")
+        )
+        XCTAssertFalse(legacy.isUnlockActive)
+        XCTAssertTrue(legacy.isShielded(app: Self.game, category: Self.games))
+
+        // New window that cannot verify the current boot on reload.
+        let clock = FakeMonotonicClock(start: 2_000)
+        let (manager, _) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider("boot-1")
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+        let unverifiable = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider(nil)
+        )
+        XCTAssertFalse(unverifiable.isUnlockActive)
+        XCTAssertTrue(unverifiable.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testFailedWriteGrantLeavesPreviousWindowUntouched() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(samplePolicy()), .applied)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 30 * 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+
+        failingStore.failNextSave = true
+        XCTAssertFalse(manager.grantUnlock(for: Self.video, duration: 60))
+        XCTAssertEqual(manager.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertEqual(manager.remainingUnlockTime, 30 * 60, accuracy: 0.001)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.video, category: Self.entertainment))
+
+        let relaunched = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertEqual(relaunched.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertFalse(relaunched.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(relaunched.isShielded(app: Self.video, category: Self.entertainment))
+    }
+
+    func testFailedDeleteRevocationThrowsAndPreservesWindow() throws {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let failingStore = FailableUnlockWindowStore(directory: directory)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(samplePolicy()), .applied)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: failingStore,
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+
+        failingStore.failNextClear = true
+        XCTAssertThrowsError(try manager.revokeUnlock())
+        XCTAssertTrue(manager.isUnlockActive)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+
+        let relaunchedBeforeFix = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertTrue(relaunchedBeforeFix.isUnlockActive)
+
+        failingStore.failNextClear = false
+        XCTAssertNoThrow(try manager.revokeUnlock())
+        XCTAssertFalse(manager.isUnlockActive)
+        // Missing file counts as success: revoking again must not throw.
+        XCTAssertNoThrow(try manager.revokeUnlock())
+
+        let relaunchedAfterFix = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertFalse(relaunchedAfterFix.isUnlockActive)
+        XCTAssertTrue(relaunchedAfterFix.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testPolicyRemovalOfUnlockedAppRelocksIt() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let (manager, policyStore) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: sampleEnumeration(),
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlockForAllChallengeUnlockable(duration: 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertFalse(manager.isShielded(app: Self.video, category: Self.entertainment))
+
+        var narrowed = samplePolicy()
+        narrowed = Policy(
+            version: 2,
+            alwaysAllowed: narrowed.alwaysAllowed,
+            unblockable: [Self.game],
+            neverUnlockableOverrides: [Self.browser, Self.video],
+            unlockDurations: narrowed.unlockDurations,
+            effortFloorSettings: narrowed.effortFloorSettings,
+            tradeCaps: narrowed.tradeCaps,
+            chorePool: narrowed.chorePool,
+            movementSettings: narrowed.movementSettings
+        )
+        XCTAssertEqual(policyStore.apply(narrowed), .applied)
+        manager.refresh()
+        XCTAssertEqual(manager.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.video, category: Self.entertainment))
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.entertainment))
+
+        let relaunched = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: sampleEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertEqual(relaunched.currentUnlockWindow?.unlockedApps, [Self.game])
+        XCTAssertTrue(relaunched.isShielded(app: Self.video, category: Self.entertainment))
+    }
+
+    func testEnumerationCategoryChangeMidWindowReconciles() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        let boot = FakeBootSessionProvider()
+        let policyStore = PolicyStore(directory: directory)
+        var enumerationPolicy = samplePolicy()
+        enumerationPolicy = Policy(
+            version: 1,
+            alwaysAllowed: [.phone],
+            unblockable: enumerationPolicy.unblockable,
+            neverUnlockableOverrides: enumerationPolicy.neverUnlockableOverrides,
+            unlockDurations: enumerationPolicy.unlockDurations,
+            effortFloorSettings: enumerationPolicy.effortFloorSettings,
+            tradeCaps: enumerationPolicy.tradeCaps,
+            chorePool: enumerationPolicy.chorePool,
+            movementSettings: enumerationPolicy.movementSettings
+        )
+        XCTAssertEqual(policyStore.apply(enumerationPolicy), .applied)
+
+        // Unknown category at grant, known after re-enumeration.
+        let unknown = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.video, category: nil)],
+            categories: []
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: unknown,
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.video, duration: 60))
+        XCTAssertFalse(manager.isShielded(app: Self.video, category: nil))
+
+        let known = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.video, category: Self.entertainment)],
+            categories: [Self.entertainment]
+        )
+        manager.updateEnumeration(known)
+        XCTAssertTrue(manager.isUnlockActive)
+        XCTAssertFalse(manager.isShielded(app: Self.video, category: Self.entertainment))
+        XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.entertainment))
+
+        // Changed mapping drops the obsolete category suppression.
+        let changed = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.video, category: Self.social)],
+            categories: [Self.entertainment, Self.social]
+        )
+        manager.updateEnumeration(changed)
+        XCTAssertFalse(manager.isShielded(app: Self.video, category: Self.social))
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.entertainment))
+        XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.social))
+
+        let relaunched = ShieldManager(
+            policyStore: PolicyStore(directory: directory),
+            enumeration: changed,
+            backend: SimulatedShieldBackend(),
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertFalse(relaunched.isShielded(app: Self.video, category: Self.social))
+    }
+
+    func testAllowlistedAppWithNilCategoryPreservesAccess() {
+        let backend = SimulatedShieldBackend()
+        let enumeration = ShieldEnumeration(
+            apps: [
+                EnumeratedApp(app: Self.game, category: Self.games),
+                EnumeratedApp(app: Self.allowedGame, category: nil),
+            ],
+            categories: [Self.games]
+        )
+        let (manager, _) = makeCustomManager(
+            policy: samplePolicy(),
+            enumeration: enumeration,
+            backend: backend,
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider()
+        )
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
+        XCTAssertFalse(manager.isShielded(app: Self.allowedGame, category: Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testAllowlistedAppAbsentFromEnumerationPreservesAccess() {
+        let backend = SimulatedShieldBackend()
+        let missing = AppRef(id: "com.example.allowed-missing")
+        var policy = samplePolicy()
+        policy = Policy(
+            version: 1,
+            alwaysAllowed: [.phone, missing],
+            unblockable: policy.unblockable,
+            neverUnlockableOverrides: policy.neverUnlockableOverrides,
+            unlockDurations: policy.unlockDurations,
+            effortFloorSettings: policy.effortFloorSettings,
+            tradeCaps: policy.tradeCaps,
+            chorePool: policy.chorePool,
+            movementSettings: policy.movementSettings
+        )
+        let enumeration = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.game, category: Self.games)],
+            categories: [Self.games]
+        )
+        let (manager, _) = makeCustomManager(
+            policy: policy,
+            enumeration: enumeration,
+            backend: backend,
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: FakeBootSessionProvider()
+        )
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
+        XCTAssertFalse(manager.isShielded(app: missing, category: Self.games))
     }
 }

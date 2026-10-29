@@ -22,23 +22,48 @@ tests run without any entitlement.
   and opening an unlock lifts the backstop for the unlocked apps'
   categories — instead of relying on a per-app exemption overriding a
   category shield, which must not be assumed to exist.
+- Allowlist fallback: built-in defaults (Phone, Messages, EarnPlay
+  itself) never need category coverage. When any other allowlisted app
+  is enumerated with an unknown (`nil`) category or is absent from the
+  enumeration, its actual category cannot be withheld, so the category
+  backstop is disabled entirely to preserve allowlist access.
+  Individual shields still apply.
 
 ## Unlock timers
 
-- Unlocks run on an injected monotonic clock (`MonotonicClock`;
-  production `SystemUptimeClock` uses system uptime). Wall-clock time
-  is recorded at grant for display only and never read for expiry, so
-  changing the device clock cannot extend an unlock.
+- Unlocks run on an injected suspend-inclusive monotonic clock
+  (`MonotonicClock`; production `SystemUptimeClock` uses
+  `mach_continuous_time`). Wall-clock time is recorded at grant for
+  display only and never read for expiry, so changing the device clock
+  cannot extend an unlock, and sleeping past the real-time deadline
+  expires it.
+- Each window is bound to its grant-time boot session
+  (`BootSessionProvider`; production uses `kern.bootsessionuuid`,
+  falling back to `kern.boottime`). A reloaded window fails closed to
+  shielded when its identifier is missing (pre-change format), differs
+  from the current boot, or cannot be verified — even when the new
+  boot's uptime falls inside the old grant-expiry interval. An
+  uptime regression likewise re-locks fail-closed.
 - On expiry, shields are re-applied automatically by expiry
   monitoring (`startExpiryMonitoring`), or on the next `refresh()` /
   accessor call.
 - The open window is persisted (`FileUnlockWindowStore`, JSON next to
   the policy cache) and re-evaluated when a `ShieldManager` is created
-  after a restart: an unexpired window resumes with its remaining
-  monotonic time, an expired window re-locks immediately, a corrupt
-  record fails closed to shielded, and an uptime regression (device
-  reboot reset the uptime clock) re-locks fail-closed rather than
-  extending the window.
+  after a restart: an unexpired window on the same boot resumes with
+  its remaining monotonic time, an expired or unverifiable window
+  re-locks immediately, and a corrupt record fails closed to shielded.
+- Grants persist first and commit in-memory/backend state only after
+  the write succeeds; a failed save returns `false` and leaves the
+  previous window untouched. Revocation removes the persisted window
+  first and throws when deletion fails (a missing file counts as
+  success), preserving the in-memory window so revocation is never
+  reported complete before durable removal.
+- Active windows reconcile against the current policy and enumeration
+  before shields apply: apps that stop being challenge-unlockable are
+  removed with their category suppression, and category associations
+  follow the latest enumeration mapping (explicit grant categories are
+  preserved). Narrowed windows are re-persisted best-effort; relaunch
+  re-reconciles to the same state.
 
 ## Backend abstraction and verification status
 
