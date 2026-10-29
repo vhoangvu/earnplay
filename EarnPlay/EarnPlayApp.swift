@@ -34,6 +34,8 @@ struct ContentView: View {
                 Divider()
                 ReadAloudPreviewView()
                 Divider()
+                SimulatedShieldDemoView()
+                Divider()
                 StallProbePreviewView()
                 Divider()
                 SpikeView()
