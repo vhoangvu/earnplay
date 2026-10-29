@@ -136,11 +136,11 @@ public enum DecisionLogError: Error, Equatable, Sendable {
 /// write (if it throws, apply no effect). The session-decision boundary is
 /// `EffortSessionRecorder.evaluateAndLog`, which routes the recorded
 /// session through this log; the plain `evaluate` preview must never drive
-/// an unlock effect. Difficulty-change, offer-trade,
-/// and session-judgment have no live callers yet — no TutorEngine and no
-/// T3.x trade code exist on this branch, and none is invented here — so
-/// their typed seams (`logDifficultyChange`, `logTradeOffer`,
-/// `logSessionJudgment`) are test-only until those callers land.
+/// an unlock effect. Difficulty-change has no live caller yet — no
+/// TutorEngine exists on this branch, and none is invented here — so
+/// `logDifficultyChange` is test-only until it lands. Offer-trade and
+/// session-judgment are live through T3.3 (`TradeOfferDecider.decideAndLog`,
+/// which logs every offer decision including no-offer).
 ///
 /// ## Routine actions
 ///
@@ -343,9 +343,8 @@ public final class DecisionLogger: @unchecked Sendable {
                 timestamp: timestamp, decisionId: decisionId)
     }
 
-    /// Call-site seam for T3.x: logs an offer-trade Decision. No live caller
-    /// exists yet — T3.x trade code is not built and none is invented here —
-    /// so T3.x managers call this when they land. Test-only until then.
+    /// Call-site seam for T3.x: logs an offer-trade Decision. Live caller:
+    /// T3.3 `TradeOfferDecider.decideAndLog` (one record per offered trade).
     @discardableResult
     public func logTradeOffer(sessionId: String, outcome: String, evidenceSummary: String,
                               reasoning: String, alternativeConsidered: String,
@@ -372,7 +371,8 @@ public final class DecisionLogger: @unchecked Sendable {
     }
 
     /// Logs a session-judgment Decision (e.g. the patience-exhausted offer
-    /// condition, LLD §7). No live caller exists yet; test-only until then.
+    /// condition, LLD §7). Live caller: T3.3 `TradeOfferDecider.decideAndLog`
+    /// (one record per no-offer decision).
     @discardableResult
     public func logSessionJudgment(sessionId: String, outcome: String, evidenceSummary: String,
                                    reasoning: String, alternativeConsidered: String,

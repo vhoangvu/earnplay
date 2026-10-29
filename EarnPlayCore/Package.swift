@@ -29,11 +29,14 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .library(name: "EarnPlayCore", targets: ["EarnPlayCore"])
+        .library(name: "EarnPlayCore", targets: ["EarnPlayCore"]),
+        // T5.1 one-command eval harness (macOS CLI; never linked into apps).
+        .executable(name: "eval-harness", targets: ["EvalHarness"])
     ],
     targets: [
         .target(name: "EarnPlayCore", dependencies: earnPlayCoreDeps,
                 resources: [.process("Resources")]),
+        .executableTarget(name: "EvalHarness", dependencies: ["EarnPlayCore"]),
         .testTarget(name: "EarnPlayCoreTests", dependencies: ["EarnPlayCore"])
     ] + extraTargets
 )

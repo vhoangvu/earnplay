@@ -195,13 +195,98 @@ public final class FileUnlockWindowStore: UnlockWindowStore, @unchecked Sendable
     }
 }
 
-/// Applies and removes shields from policy (T2.2).
+/// Persistence seam for post-setup install observations (T2.5
+/// default-deny).
+///
+/// Production uses `FileObservedInstallStore`; tests may use the same
+/// file store over a temporary directory (relaunch-equivalent
+/// restart). Saving reports failures by throwing; loading a missing
+/// or corrupt file yields no observations, and re-observation (or
+/// re-enumeration) restores enforcement. The manager query still
+/// default-denies unknown apps when the record is lost, so only the
+/// per-app backend enforcement lapses — never the gate verdict.
+public protocol ObservedInstallStore: Sendable {
+    func loadObservedInstalls() -> Set<EnumeratedApp>
+    func saveObservedInstalls(_ installs: Set<EnumeratedApp>) throws
+}
+
+/// File-backed observed-install store (JSON in a directory, atomic write).
+///
+/// Follows the `FileUnlockWindowStore` precedent. A missing file loads
+/// as no observations; a corrupt file likewise loads as none, and the
+/// next save overwrites it.
+public final class FileObservedInstallStore: ObservedInstallStore, @unchecked Sendable {
+    public static let installsFileName = "observed-installs.json"
+
+    private let directory: URL
+    private let fileManager: FileManager
+    private let lock = NSLock()
+
+    public init(directory: URL, fileManager: FileManager = .default) {
+        self.directory = directory
+        self.fileManager = fileManager
+    }
+
+    /// Default store directory, shared with `PolicyStore`.
+    public convenience init(fileManager: FileManager = .default) {
+        self.init(
+            directory: PolicyStore.defaultDirectory(fileManager: fileManager),
+            fileManager: fileManager
+        )
+    }
+
+    public func loadObservedInstalls() -> Set<EnumeratedApp> {
+        lock.lock()
+        defer { lock.unlock() }
+        let url = directory.appendingPathComponent(Self.installsFileName)
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        let decoder = JSONDecoder()
+        guard let list = try? decoder.decode([EnumeratedApp].self, from: data) else {
+            return []
+        }
+        return Set(list)
+    }
+
+    public func saveObservedInstalls(_ installs: Set<EnumeratedApp>) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let sorted = installs.sorted {
+            if $0.app.id != $1.app.id { return $0.app.id < $1.app.id }
+            return ($0.category?.id ?? "") < ($1.category?.id ?? "")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(sorted)
+        try data.write(
+            to: directory.appendingPathComponent(Self.installsFileName),
+            options: [.atomic]
+        )
+    }
+}
+
+/// Applies and removes shields from policy (T2.2, default-deny T2.5).
 ///
 /// Enumeration-first: every app enumerated at setup except the policy
 /// allowlist (`Policy.alwaysAllowed`) is shielded individually, and
 /// category shields backstop newly installed apps that are not yet
 /// enumerated. No per-app exemption overriding a category shield is
-/// used anywhere — see `ShieldConfiguration`.
+/// used anywhere — see `ShieldConfiguration`. T2.5 default-deny
+/// enforces in two layers: an install observed via `noteInstalledApp`
+/// is shielded individually in the applied configuration (backend
+/// enforcement, not just the query answer) until a policy sync
+/// classifies it, while an app never observed stays open only when
+/// allowlisted or unlocked, so an unknown token or category resolves
+/// to locked rather than to allowed. The launch gate is
+/// `isShielded(app:category:)` — backend state plus the default-deny
+/// backstop — so a newly installed, not-yet-observed app is blocked
+/// before its first launch; `ShieldBackend.isShielded` answers only
+/// the enforced observed/enumerated state and is not the gate. The
+/// backstop applies only while shields are active (`shieldsActive`):
+/// before setup completes it stays off and the gate reports backend
+/// state, so an inactive system claims no protection.
 ///
 /// Unlock timers run on an injected suspend-inclusive `MonotonicClock`
 /// (continuous time in production). Changing the device wall clock
@@ -240,9 +325,50 @@ public final class ShieldManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private var enumeration: ShieldEnumeration
+    /// Apps observed installed after setup via `noteInstalledApp` (T2.5
+    /// default-deny), at most one entry per app. Observations are install
+    /// facts, not picker state, and are never deleted just because the
+    /// enumeration names the app: while enumerated, the enumeration's
+    /// category governs (see the effective-observed filter in
+    /// `computeConfigurationLocked`); when later unpicked, the retained
+    /// entry restores the individual shield. A non-allowlisted
+    /// observation is shielded individually in the applied configuration
+    /// until a policy sync classifies it. Observations persist through
+    /// `observedInstallStore` when one is provided, and are restored
+    /// before the initial configuration is applied, so a recreated
+    /// manager keeps every observed shield.
+    private var observedInstalls: Set<EnumeratedApp> = []
+    private let observedInstallStore: (any ObservedInstallStore)?
     private var window: UnlockWindow?
     private var lastConfiguration: ShieldConfiguration = .none
+    /// Latched "shields active" signal for the T2.5 default-deny
+    /// fallback in `isShielded`. Set once this instance applies shields
+    /// from a real enumeration or install observation (or is explicitly
+    /// engaged via `applyShields()` / `updateEnumeration(_:)`), and
+    /// never unset in-instance: an applied configuration that happens
+    /// to shield nothing (e.g. every enumerated app allowlisted, so the
+    /// computed configuration is `.none`) still counts as active,
+    /// while a fresh or not-yet-handed-an-enumeration manager (setup
+    /// incomplete, or a relaunch whose SetupFlow withheld the
+    /// committed enumeration pending reauthorization) stays inactive
+    /// and `isShielded` falls through to backend state. Deliberately
+    /// neither `policyStore.storedVersion > 0` — a revoked relaunch
+    /// still has a stored policy while its shields are not restored —
+    /// nor `lastConfiguration != .none` — an applied-but-empty
+    /// configuration must still default-deny.
+    private var shieldsActive = false
     private var monitorTask: Task<Void, Never>?
+    /// Generation counter for the monitor task (guarded by `lock`):
+    /// each `startExpiryMonitoring` call stamps its task, so a task
+    /// that exits on its own only clears `monitorTask` when no newer
+    /// task has since started.
+    private var monitorGeneration: UInt64 = 0
+    /// Test seam (fix round 7, guarded by `lock`): invoked on the
+    /// monitor task immediately after the terminal poll observes a
+    /// closed window and before the loop exits. Lets a regression test
+    /// grant a new window in the exact retirement window. Always nil in
+    /// production; invoked outside the lock so the hook may grant.
+    private var monitorTerminalPollHook: (@Sendable () -> Void)?
     /// True when a reconciliation narrowed or revoked the in-memory
     /// window but persisting that change failed, so the on-disk record
     /// is stale. Later refreshes retry the write; until one succeeds, a
@@ -266,6 +392,14 @@ public final class ShieldManager: @unchecked Sendable {
     ///
     /// `nowWallDate` is injected only so tests can jump the wall clock;
     /// it never influences expiry.
+    ///
+    /// `observedInstallStore` persists post-setup install observations
+    /// across recreation: previously observed installs are restored as-is
+    /// before the initial configuration is applied, so a recreated
+    /// manager keeps every observed shield. While an observed app stays
+    /// enumerated, the enumeration's category governs; the retained entry
+    /// restores the shield if the app is later unpicked. Without a store,
+    /// observations are memory-only for this instance's lifetime.
     public init(
         policyStore: PolicyStore,
         enumeration: ShieldEnumeration,
@@ -273,7 +407,8 @@ public final class ShieldManager: @unchecked Sendable {
         clock: any MonotonicClock = SystemUptimeClock(),
         unlockStore: any UnlockWindowStore,
         bootSession: any BootSessionProvider = SystemBootSessionProvider(),
-        nowWallDate: @escaping @Sendable () -> Date = { Date() }
+        nowWallDate: @escaping @Sendable () -> Date = { Date() },
+        observedInstallStore: (any ObservedInstallStore)? = nil
     ) {
         self.policyStore = policyStore
         self.enumeration = enumeration
@@ -282,6 +417,10 @@ public final class ShieldManager: @unchecked Sendable {
         self.unlockStore = unlockStore
         self.bootSession = bootSession
         self.nowWallDate = nowWallDate
+        self.observedInstallStore = observedInstallStore
+        if let observedInstallStore {
+            observedInstalls = observedInstallStore.loadObservedInstalls()
+        }
         if let loaded = unlockStore.loadUnlockWindow() {
             let currentID = bootSession.currentBootSessionID
             if loaded.bootSessionID == nil
@@ -305,10 +444,14 @@ public final class ShieldManager: @unchecked Sendable {
     // MARK: - Shield application
 
     /// Recomputes shields from the current policy + enumeration and
-    /// applies them, honouring any still-open unlock window.
+    /// applies them, honouring any still-open unlock window. Explicitly
+    /// applying shields engages the shield system: the T2.5
+    /// default-deny fallback in `isShielded` is active from here on,
+    /// even if the applied configuration shields nothing.
     public func applyShields() {
         lock.lock()
         defer { lock.unlock() }
+        shieldsActive = true
         refreshLocked()
     }
 
@@ -316,10 +459,60 @@ public final class ShieldManager: @unchecked Sendable {
     /// after a newly installed app is enumerated) and re-applies. The
     /// active window's category associations are reconciled against the
     /// replacement enumeration before shields are reapplied.
+    ///
+    /// Observed entries are retained: while the replacement names an app,
+    /// its enumeration mapping governs and the retained observation is
+    /// filtered out of placement, so a stale category can neither widen
+    /// allowlist coverage nor linger in an active unlock. When the app is
+    /// later unpicked, the retained entry restores its shield — coverage
+    /// never regresses.
     public func updateEnumeration(_ enumeration: ShieldEnumeration) {
         lock.lock()
         defer { lock.unlock() }
         self.enumeration = enumeration
+        // Handing the manager its enumeration engages the shield
+        // system (setup commit, relaunch restore, abandon, re-pick):
+        // the T2.5 default-deny fallback applies from here on, even
+        // if the replacement enumeration is empty.
+        shieldsActive = true
+        refreshLocked()
+    }
+
+    /// Records an app installed after setup and re-applies shields.
+    ///
+    /// The observation promotes the install into the applied
+    /// configuration: a non-allowlisted, non-unlocked app is shielded
+    /// individually — backend-enforced, so the backend's answer for the
+    /// app (the launch gate in the simulated scope) reports blocked —
+    /// until a policy sync classifies it. An allowlisted install
+    /// withholds its category like an enumerated pick, and an unlocked
+    /// install stays open, so neither exemption regresses. Category
+    /// knowledge is sticky: a report without metadata never discards a
+    /// previously observed category for the same app.
+    ///
+    /// This is the host/simulated observation seam for T2.5 default-deny
+    /// (demo scope: simulated backend; no real device shields). On
+    /// device, re-enumeration via `updateEnumeration` is the observation
+    /// path; here the host drives installs directly after shields apply.
+    ///
+    /// When the current enumeration already names `app`, its mapping
+    /// governs while the observation is still recorded: the retained
+    /// entry is filtered out of placement, so it can neither widen
+    /// allowlist coverage nor linger in an active unlock, and it restores
+    /// the shield if the app is later unpicked. The app keeps its
+    /// enumeration placement (shielded when non-allowlisted).
+    ///
+    /// The updated observation set is persisted best-effort when an
+    /// observed-install store is provided; in-memory and backend state
+    /// always commit regardless, so current-process enforcement never
+    /// depends on the write — only restart recovery does.
+    public func noteInstalledApp(_ app: AppRef, category: AppCategoryRef? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        let prior = observedInstalls.first(where: { $0.app == app })?.category
+        observedInstalls = observedInstalls.filter { $0.app != app }
+        observedInstalls.insert(EnumeratedApp(app: app, category: category ?? prior))
+        try? observedInstallStore?.saveObservedInstalls(observedInstalls)
         refreshLocked()
     }
 
@@ -330,9 +523,47 @@ public final class ShieldManager: @unchecked Sendable {
         return lastConfiguration
     }
 
-    /// Effective shielding, delegated to the backend's applied state.
+    /// Effective shielding: the backend's applied state plus T2.5
+    /// default-deny for never-observed apps.
+    ///
+    /// This is the launch gate: launch decisions must route through this
+    /// query, never through `ShieldBackend.isShielded` alone. The
+    /// backend answers only the enforced observed/enumerated state and
+    /// cannot name an app it has never observed, so it leaves a fresh,
+    /// never-enumerated app open outside the category backstop; this
+    /// query closes that gap.
+    ///
+    /// A backend shield always wins — install-observed apps are shielded
+    /// in the applied configuration itself. Otherwise, while shields are
+    /// active, the app stays open only when the current policy
+    /// allowlists it or an open window unlocks it; every other app —
+    /// including one that was never observed and presents an unknown
+    /// token or category — resolves to locked until a policy sync
+    /// classifies it. T2.2 semantics for classified apps are unchanged:
+    /// this only closes the unknown path that previously resolved to
+    /// allowed.
+    ///
+    /// The default-deny fallback is scoped to active shields (see
+    /// `shieldsActive`): before any policy/configuration has been
+    /// applied — fresh manager, setup incomplete, or a relaunch whose
+    /// committed enumeration was withheld pending reauthorization —
+    /// the query falls through to backend state, so an inactive shield
+    /// system never reports protection it has not applied.
     public func isShielded(app: AppRef, category: AppCategoryRef? = nil) -> Bool {
-        backend.isShielded(app: app, category: category)
+        if backend.isShielded(app: app, category: category) {
+            return true
+        }
+        if policyStore.currentPolicy.alwaysAllowed.contains(app) {
+            return false
+        }
+        lock.lock()
+        let unlocked = window?.unlockedApps.contains(app) ?? false
+        let active = shieldsActive
+        lock.unlock()
+        if unlocked {
+            return false
+        }
+        return active
     }
 
     // MARK: - Unlock
@@ -459,21 +690,32 @@ public final class ShieldManager: @unchecked Sendable {
     }
 
     /// Starts automatic re-lock: polls the monotonic clock and applies
-    /// shields as soon as the window expires. Idempotent.
+    /// shields as soon as the window expires. Idempotent. The polling
+    /// loop stops itself (and clears its task) once a poll shows the
+    /// window ended and shields re-applied, so no explicit stop call
+    /// is needed after expiry — in particular, a hidden screen with no
+    /// further view events does not poll forever.
     public func startExpiryMonitoring(pollInterval: TimeInterval = 1) {
         lock.lock()
         if monitorTask != nil {
             lock.unlock()
             return
         }
+        monitorGeneration += 1
+        let generation = monitorGeneration
         let task = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(
                     nanoseconds: UInt64(max(0.01, pollInterval) * 1_000_000_000)
                 )
                 if Task.isCancelled { break }
-                self?.refresh()
+                guard let strongSelf = self else { break }
+                if strongSelf.refreshAndRetireIfWindowClosed(generation: generation) {
+                    strongSelf.runMonitorTerminalPollHook()
+                    break
+                }
             }
+            self?.finishExpiryMonitoringIfGeneration(generation)
         }
         monitorTask = task
         lock.unlock()
@@ -485,6 +727,64 @@ public final class ShieldManager: @unchecked Sendable {
         monitorTask?.cancel()
         monitorTask = nil
         lock.unlock()
+    }
+
+    /// True while expiry-monitoring polling is running. Becomes false
+    /// on its own shortly after the window ends (the loop stops
+    /// itself), or immediately when `stopExpiryMonitoring()` is called.
+    public var isExpiryMonitoring: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return monitorTask != nil
+    }
+
+    /// Refreshes expiry state (re-applying shields) and, when no
+    /// window remains open, retires the monitor task — atomically under
+    /// a single lock hold. A grant landing before this section sees its
+    /// window open (no retirement, polling continues); a grant landing
+    /// after it sees a nil slot (its start launches a new task). Returns
+    /// true when the caller should stop polling. Retirement is
+    /// generation-guarded: a superseded task leaves a newer task alone,
+    /// and a task cancelled by `stopExpiryMonitoring` clears an
+    /// already-nil slot (harmless) when no newer task has started.
+    private func refreshAndRetireIfWindowClosed(generation: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        refreshLocked()
+        guard window == nil else { return false }
+        if monitorGeneration == generation {
+            monitorTask = nil
+        }
+        return true
+    }
+
+    /// Clears `monitorTask` when the exiting task is still the current
+    /// generation. A task cancelled by `stopExpiryMonitoring` clears an
+    /// already-nil slot (harmless); a task superseded by a newer start
+    /// leaves the new task alone.
+    private func finishExpiryMonitoringIfGeneration(_ generation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        if monitorGeneration == generation {
+            monitorTask = nil
+        }
+    }
+
+    /// Sets the terminal-poll test seam (lock-guarded; test only).
+    func setMonitorTerminalPollHook(_ hook: (@Sendable () -> Void)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        monitorTerminalPollHook = hook
+    }
+
+    /// Runs the terminal-poll test seam, if set. The hook is read under
+    /// the lock and invoked after release so it may call back into the
+    /// manager (e.g. grant a window).
+    private func runMonitorTerminalPollHook() {
+        lock.lock()
+        let hook = monitorTerminalPollHook
+        lock.unlock()
+        hook?()
     }
 
     // MARK: - Internals (caller holds `lock`, except at init)
@@ -551,6 +851,15 @@ public final class ShieldManager: @unchecked Sendable {
                 // Still failing: stay flagged and retry on a later refresh.
             }
         }
+        // Applying shields from a real enumeration or a restored /
+        // observed install engages the shield system for the T2.5
+        // fallback. A bare refresh of a fresh manager (empty
+        // enumeration, no observations) does not: shields stay
+        // inactive until setup hands over an enumeration.
+        if !enumeration.apps.isEmpty || !enumeration.categories.isEmpty
+            || !observedInstalls.isEmpty {
+            shieldsActive = true
+        }
         let configuration = computeConfigurationLocked()
         lastConfiguration = configuration
         backend.applyShieldConfiguration(configuration)
@@ -608,23 +917,39 @@ public final class ShieldManager: @unchecked Sendable {
         let allowed = Set(policy.alwaysAllowed)
         let builtIns: Set<AppRef> = [.phone, .messages, .earnPlaySelf]
 
+        // Placement sources: the setup enumeration plus post-setup
+        // install observations (T2.5 default-deny). Retained observations
+        // for enumerated apps are filtered out here, so the enumeration
+        // mapping governs while named and no app is placed twice or
+        // withholds a stale category; when later unpicked, the retained
+        // entry restores placement. Either source places an app — a
+        // non-allowlisted install is shielded individually in the
+        // applied configuration until a sync classifies it, and an
+        // allowlisted install withholds its category like a picked app.
+        // An allowlisted app is covered when its enumeration mapping
+        // (when named) or its observation (when unenumerated) names a
+        // category, so a later observation can resolve coverage without
+        // ever regressing it.
+        let namedApps = Set(enumeration.apps.map(\.app))
+        let effectiveObserved = observedInstalls.filter { !namedApps.contains($0.app) }
+        var placements = enumeration.apps
+        placements.append(contentsOf: effectiveObserved)
         var shieldedApps: Set<AppRef> = []
         var categoriesOfAllowed: Set<AppCategoryRef> = []
-        var allowlistCoverageIncomplete = false
-        for entry in enumeration.apps {
+        var knownCategories: [AppRef: Set<AppCategoryRef>] = [:]
+        for entry in placements {
             if allowed.contains(entry.app) {
                 if let category = entry.category {
                     categoriesOfAllowed.insert(category)
-                } else if !builtIns.contains(entry.app) {
-                    allowlistCoverageIncomplete = true
+                    knownCategories[entry.app, default: []].insert(category)
                 }
             } else {
                 shieldedApps.insert(entry.app)
             }
         }
-        let enumeratedApps = Set(enumeration.apps.map(\.app))
+        var allowlistCoverageIncomplete = false
         for app in allowed where !builtIns.contains(app) {
-            if !enumeratedApps.contains(app) {
+            if knownCategories[app, default: []].isEmpty {
                 allowlistCoverageIncomplete = true
                 break
             }
@@ -645,6 +970,7 @@ public final class ShieldManager: @unchecked Sendable {
             if !singleExplicitCovered {
                 for app in window.unlockedApps where !builtIns.contains(app) {
                     let found = enumeration.apps.first(where: { $0.app == app })?.category
+                        ?? effectiveObserved.first(where: { $0.app == app })?.category
                     if found == nil {
                         unlockCoverageIncomplete = true
                         break
@@ -681,6 +1007,14 @@ public final class ShieldManager: @unchecked Sendable {
         if let window {
             shieldedApps.subtract(window.unlockedApps)
             backstop.subtract(window.unlockedCategories)
+            // T2.5: withhold install-observed categories of unlocked apps
+            // as well, so an observation arriving after the grant cannot
+            // re-lock the app through the backstop. Retained entries for
+            // enumerated apps are excluded, so an obsolete category
+            // cannot linger in the unlock.
+            for entry in effectiveObserved where window.unlockedApps.contains(entry.app) {
+                if let category = entry.category { backstop.remove(category) }
+            }
         }
 
         return ShieldConfiguration(
