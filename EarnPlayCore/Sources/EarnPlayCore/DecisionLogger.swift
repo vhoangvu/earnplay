@@ -537,17 +537,28 @@ public final class DecisionLogger: @unchecked Sendable {
     /// Re-reads the log from disk — the relaunch-equivalent reload.
     ///
     /// Uses the same fallback chain as initialization (primary, backup,
-    /// empty) and replaces the in-memory log with the result — except an
-    /// unreadable store preserves the in-memory log and returns it, so a
-    /// transient read failure never wipes held history.
+    /// empty) and merges the loaded snapshot with held records missing
+    /// from it — the same union `log` performs — because the snapshot can
+    /// be stale: the backup write is best-effort, so a missed backup write
+    /// followed by a corrupt primary loads OLDER history, and a wholesale
+    /// replace would drop successfully logged decisions still held in
+    /// memory (the next append would then persist that incomplete
+    /// history). An unreadable store preserves the in-memory log and
+    /// returns it, so a transient read failure never wipes held history.
     @discardableResult
     public func reloadFromDisk() -> [Decision] {
         lock.lock()
         defer { lock.unlock() }
         switch Self.loadOutcome(directory: directory, fileManager: fileManager) {
         case .loaded(let loaded):
-            cached = loaded
-            return loaded
+            var seen = Set(loaded.map(\.decisionId))
+            var merged = loaded
+            for held in cached where !seen.contains(held.decisionId) {
+                merged.append(held)
+                seen.insert(held.decisionId)
+            }
+            cached = merged
+            return merged
         case .absent:
             cached = []
             return []

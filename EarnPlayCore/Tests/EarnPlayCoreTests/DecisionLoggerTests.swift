@@ -559,6 +559,82 @@ final class DecisionLoggerTests: XCTestCase {
                        ["absent-1"])
     }
 
+    // MARK: - Fix round 3: reload merges held records like log (review finding)
+
+    func testReloadWithStaleBackupPreservesHeldRecords() throws {
+        // Backup write is best-effort: if it missed the newest record and
+        // the primary later corrupts, the load falls back to the OLDER
+        // backup. Reload must union held records missing from that stale
+        // snapshot — the same merge log() already performs — not drop them.
+        let logger = DecisionLogger(directory: directory)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o1", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base, decisionId: "stale-1")
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o2", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(1), decisionId: "stale-2")
+        // Simulate the missed backup write: backup holds only the first
+        // record; then the primary corrupts, forcing the stale fallback.
+        let primary = directory.appendingPathComponent(DecisionLogger.decisionsFileName)
+        let backup = directory.appendingPathComponent(DecisionLogger.backupFileName)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .deferredToDate
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(Array(logger.decisions.prefix(1))).write(to: backup, options: [.atomic])
+        try "not-json{".data(using: .utf8)!.write(to: primary, options: [.atomic])
+        // Held "stale-2" survives the reload despite missing from disk.
+        XCTAssertEqual(logger.reloadFromDisk().map(\.decisionId), ["stale-1", "stale-2"])
+        XCTAssertEqual(logger.decisions.map(\.decisionId), ["stale-1", "stale-2"])
+    }
+
+    func testAppendAfterStaleReloadPersistsFullMergedHistory() throws {
+        // After the stale-backup reload above, the next append must persist
+        // the FULL merged history — no permanently lost records.
+        let logger = DecisionLogger(directory: directory)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o1", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base, decisionId: "merge-1")
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o2", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(1), decisionId: "merge-2")
+        let primary = directory.appendingPathComponent(DecisionLogger.decisionsFileName)
+        let backup = directory.appendingPathComponent(DecisionLogger.backupFileName)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .deferredToDate
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(Array(logger.decisions.prefix(1))).write(to: backup, options: [.atomic])
+        try "not-json{".data(using: .utf8)!.write(to: primary, options: [.atomic])
+        _ = logger.reloadFromDisk()
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o3", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(2), decisionId: "merge-3")
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["merge-1", "merge-2", "merge-3"])
+    }
+
+    func testReloadWithUnreadableStoreReturnsHeldCache() throws {
+        // Fix-2 behavior still holds for reload: when neither file decodes,
+        // reload preserves and returns the in-memory log instead of wiping
+        // it. Content corruption (not chmod) so this holds even as root.
+        let logger = DecisionLogger(directory: directory)
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5, decisionId: "held-1")
+        let primary = directory.appendingPathComponent(DecisionLogger.decisionsFileName)
+        let backup = directory.appendingPathComponent(DecisionLogger.backupFileName)
+        try "not-json{".data(using: .utf8)!.write(to: primary, options: [.atomic])
+        try "not-json{".data(using: .utf8)!.write(to: backup, options: [.atomic])
+        XCTAssertEqual(logger.reloadFromDisk().map(\.decisionId), ["held-1"])
+        XCTAssertEqual(logger.decisions.map(\.decisionId), ["held-1"])
+    }
+
     // MARK: - Routine one-line reasons (not Decisions)
 
     func testRoutineReasonCollapsesToOneLineAndLogsNothing() {
