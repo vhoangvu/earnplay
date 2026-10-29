@@ -73,11 +73,22 @@ final class ModelDownloadViewModel: ObservableObject {
     private let readiness: ModelDownloadReadiness
     /// Epoch so a superseded refresh cannot overwrite a newer result.
     private var refreshEpoch = 0
+    /// Isolated readiness-lookup inputs (fix round 6 test seam). A nil
+    /// environment means the live process environment and `.default`
+    /// means the live standard directories, so production (which passes
+    /// neither) resolves exactly what the old bare `isReady()` call did.
+    /// Internal so tests can pin the production defaults.
+    let readinessEnvironment: [String: String]?
+    let readinessFileManager: FileManager
 
     init(downloader: ModelDownloader = ModelDownloader(),
-         readiness: ModelDownloadReadiness = ModelDownloadReadiness()) {
+         readiness: ModelDownloadReadiness = ModelDownloadReadiness(),
+         environment: [String: String]? = nil,
+         fileManager: FileManager = .default) {
         self.downloader = downloader
         self.readiness = readiness
+        self.readinessEnvironment = environment
+        self.readinessFileManager = fileManager
     }
 
     /// Initial readiness check for the root view's `.task`. The task
@@ -99,8 +110,12 @@ final class ModelDownloadViewModel: ObservableObject {
         refreshEpoch += 1
         let epoch = refreshEpoch
         phase = .checking
-        Task.detached(priority: .userInitiated) { [readiness] in
-            let ready = readiness.isReady()
+        let readiness = self.readiness
+        let environment = self.readinessEnvironment
+        let fileManager = self.readinessFileManager
+        Task.detached(priority: .userInitiated) { [readiness, environment, fileManager] in
+            let ready = readiness.isReady(environment: environment ?? ProcessInfo.processInfo.environment,
+                                          fileManager: fileManager)
             await MainActor.run { [weak self] in
                 guard let self, self.refreshEpoch == epoch else { return }
                 self.phase = ready ? .ready : .needsDownload
