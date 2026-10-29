@@ -91,6 +91,12 @@ public struct HintEvent: Codable, Equatable, Sendable {
 /// calls it when a hint is shown and again when that event resolves
 /// (upsert by `questionId` + `level`), so a persistent log observes
 /// the changed-answer outcome, not just the showing.
+///
+/// Delivery is asynchronous but ordered: notifications are queued under
+/// the state lock in state-change order and drained serially on a
+/// private queue, so an older unresolved event can never overwrite its
+/// own resolution and callbacks never overlap. Delivery holds no ladder
+/// lock, so a sink may safely read ladder state back from its callback.
 public protocol HintEventSink: AnyObject {
     func recordHintEvent(_ event: HintEvent)
 }
@@ -108,6 +114,14 @@ public final class HintLadder: @unchecked Sendable {
     private var _events: [HintEvent] = []
     private var _shownHints: [Hint] = []
     private var lastSubmittedAnswer: String?
+    /// Sink notifications queued under `lock` in state-change order.
+    private var _pendingSinkEvents: [HintEvent] = []
+    /// Serial drain for sink delivery: every mutation schedules one async
+    /// drain, which takes its batch under `lock` and delivers it with no
+    /// lock held. The async boundary keeps lock order flat (the drain
+    /// never blocks a state change), so re-entrant sink reads cannot
+    /// deadlock while deliveries stay serial and ordered.
+    private let sinkQueue = DispatchQueue(label: "com.earnplay.HintLadder.sink")
 
     public init(question: VerifiedQuestion, proposal: ProposedProblem,
                 solver: SolverService = SolverService(),
@@ -169,6 +183,9 @@ public final class HintLadder: @unchecked Sendable {
         // Solving the proposal alone would hint a mismatched problem
         // (a valid 6 × 9 proposal paired with a verified 7 × 8
         // question): re-verify and require the exact supplied question.
+        // `VerifiedQuestion` carries its source operands, fractions, and
+        // operation, so this equality also rejects same-prompt,
+        // same-answer collisions from different values (6×6 vs 9×4).
         guard case .success(let rechecked) = solver.verify(proposal, questionId: question.questionId),
               rechecked == question else {
             lock.unlock()
@@ -182,11 +199,9 @@ public final class HintLadder: @unchecked Sendable {
                               answerBeforeHint: lastSubmittedAnswer)
         _events.append(event)
         _shownHints.append(hint)
-        let sink = eventSink
+        _pendingSinkEvents.append(event)
         lock.unlock()
-        // Delivered after unlocking: a synchronous sink may read ladder
-        // state back, which would deadlock under the non-recursive lock.
-        sink?.recordHintEvent(event)
+        scheduleSinkDrain()
         return hint
     }
 
@@ -211,11 +226,41 @@ public final class HintLadder: @unchecked Sendable {
             resolved.append(_events[index])
         }
         lastSubmittedAnswer = answer
+        _pendingSinkEvents.append(contentsOf: resolved)
+        lock.unlock()
+        if !resolved.isEmpty { scheduleSinkDrain() }
+        return changed
+    }
+
+    /// Schedules one serial drain of the queued sink notifications. The
+    /// block retains the ladder until its batch is delivered, so events
+    /// are never dropped when the caller releases the ladder first.
+    private func scheduleSinkDrain() {
+        guard eventSink != nil else { return }
+        sinkQueue.async { [self] in self.drainSinkEvents() }
+    }
+
+    /// Delivers one queued batch, in queue order, with no ladder lock held
+    /// (a synchronous sink may read ladder state back). Runs only on
+    /// `sinkQueue`, so deliveries are serial across all caller threads.
+    private func drainSinkEvents() {
+        lock.lock()
+        guard !_pendingSinkEvents.isEmpty else {
+            lock.unlock()
+            return
+        }
+        let batch = _pendingSinkEvents
+        _pendingSinkEvents = []
         let sink = eventSink
         lock.unlock()
-        // Delivered after unlocking, in shown order (see requestHint).
-        for event in resolved { sink?.recordHintEvent(event) }
-        return changed
+        for event in batch { sink?.recordHintEvent(event) }
+    }
+
+    /// Blocks until every scheduled sink delivery has finished. For tests
+    /// only — production code treats delivery as fire-and-forget ordered.
+    /// Must not be called from inside a sink callback (same-queue sync).
+    func waitForSinkDelivery() {
+        sinkQueue.sync {}
     }
 
     /// Answer equivalence for the changed-answer comparison, mirroring
@@ -313,7 +358,7 @@ public final class HintLadder: @unchecked Sendable {
         case .nudge:
             return "Look again at \(dividend) ÷ \(divisor): how many equal groups of \(divisor) fit into \(dividend)?"
         case .strategy:
-            return "Strategy: guess a number, multiply it by \(divisor), and check how close you get to \(dividend). Adjust your guess until the leftover is smaller than \(divisor)."
+            return "Strategy: guess a number, multiply it by \(divisor), and subtract that from \(dividend) to get the leftover. Keep adjusting your guess until the leftover is 0 or more but still smaller than \(divisor)."
         case .workedStep:
             guard divisor > 0, dividend >= 0 else { return genericText(level) }
             let quotient = dividend / divisor
@@ -428,20 +473,35 @@ public final class HintLadder: @unchecked Sendable {
                 }
                 let (total, o3) = tensSum.addingReportingOverflow(onesSum)
                 guard !o3, "\(total)" == answer else { return genericText(level) }
+                // Degenerate split: all single-digit (tens add to 0) or all
+                // multiples of ten (ones add to 0) would state the full
+                // answer as one partial sum ([6,7] gives 6 + 7 = 13).
+                // Split one addend instead so the shown step stops short.
+                if tensSum == 0 || onesSum == 0 {
+                    return additionSplitStep(operands: proposal.operands,
+                                             total: total, answer: answer)
+                }
                 let tensList = proposal.operands.map { "\(($0 / 10) * 10)" }.joined(separator: " + ")
                 let onesList = proposal.operands.map { "\($0 % 10)" }.joined(separator: " + ")
                 return "Worked step: add the tens first, \(tensList) = \(tensSum), then the ones, \(onesList) = \(onesSum). Now put \(tensSum) and \(onesSum) together to finish."
             }
         case .subtract:
             let first = proposal.operands[0]
-            let rest = proposal.operands.dropFirst()
+            // Ignore zero take-aways: subtracting nothing changes nothing,
+            // and keeping a zero can make the multi-operand step show the
+            // full answer ([50,18,0] would show 50 − 18 = 32). When every
+            // take-away is zero, keep one so the single-subtraction branch
+            // still explains that taking away nothing changes nothing.
+            let rest = Array(proposal.operands.dropFirst())
+            let nonZero = rest.filter { $0 != 0 }
+            let takes = nonZero.isEmpty ? Array(rest.prefix(1)) : nonZero
             switch level {
             case .nudge:
                 return "Look again: something starts at \(first) and some is taken away. What is left?"
             case .strategy:
                 return "Strategy: start from \(first) and subtract each taken-away amount in turn."
             case .workedStep:
-                if rest.count == 1, let taken = rest.first, taken >= 0, first >= taken {
+                if takes.count == 1, let taken = takes.first, taken >= 0, first >= taken {
                     // Split one take-away into two smaller subtractions
                     // and work only the first; the child finishes.
                     let tens = (taken / 10) * 10
@@ -467,7 +527,7 @@ public final class HintLadder: @unchecked Sendable {
                     }
                     return genericText(level)
                 }
-                if rest.count > 1, let firstTaken = rest.first, firstTaken >= 0, first >= firstTaken {
+                if takes.count > 1, let firstTaken = takes.first, firstTaken >= 0, first >= firstTaken {
                     // Work only the first subtraction; the child continues.
                     let mid = first - firstTaken
                     return "Worked step: \(first) − \(firstTaken) = \(mid). Now keep subtracting the rest from \(mid), one amount at a time."
@@ -475,6 +535,29 @@ public final class HintLadder: @unchecked Sendable {
                 return genericText(level)
             }
         }
+    }
+
+    /// Worked step for degenerate additions (all single-digit or all
+    /// multiples of ten): split one addend into two positive parts, work
+    /// the sum of everything except the second part, and leave the final
+    /// addition to the child. The shown partial is below the solver's
+    /// total by construction; when no safe split exists (tiny sums whose
+    /// every number is the answer), a number-free step is shown instead.
+    private static func additionSplitStep(operands: [Int], total: Int, answer: String) -> String {
+        if let value = operands.first(where: { $0 >= 2 }) {
+            let firstPart = value / 2
+            let secondPart = value - firstPart
+            let (partial, overflow) = total.subtractingReportingOverflow(secondPart)
+            if !overflow {
+                let step = "Worked step: split \(value) into \(firstPart) + \(secondPart). Add everything except \(secondPart) first: you get \(partial). Now add \(secondPart) more to \(partial) yourself to finish."
+                // Fail closed: restating an operand that already equals the
+                // total ([0,7]) would show the answer.
+                if !step.contains(answer) {
+                    return step
+                }
+            }
+        }
+        return "Worked step: add the amounts together one at a time, starting from the first amount. What do you get?"
     }
 
     private static func readingText(level: HintLevel, proposal: ProposedProblem,
@@ -488,7 +571,9 @@ public final class HintLadder: @unchecked Sendable {
             // Quote the evidence sentence with the answer blanked out:
             // the child fills the blank instead of reading the answer.
             if let passage = proposal.passage,
-               case .supported(let evidence) = solver.verifyReadingSupport(passage: passage, proposedAnswer: answer),
+               let evidence = Self.evidenceSentence(passage: passage,
+                                                    promptText: proposal.promptText,
+                                                    answer: answer, solver: solver),
                let blanked = Self.blankAnswerSpan(in: evidence, answer: answer) {
                 return "Worked step: re-read this sentence from the passage: \u{201C}\(blanked)\u{201D} Which words go in the blank to answer the question?"
             }
@@ -496,22 +581,176 @@ public final class HintLadder: @unchecked Sendable {
         }
     }
 
-    /// Returns `evidence` with every case-insensitive occurrence of the
-    /// answer replaced by a blank, or nil when the answer span cannot
-    /// be located (the caller falls back instead of quoting it whole).
-    private static func blankAnswerSpan(in evidence: String, answer: String) -> String? {
-        let target = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !target.isEmpty else { return nil }
-        var blanked = evidence
-        var searchFrom = blanked.startIndex
-        var replaced = false
-        while let range = blanked.range(of: target, options: .caseInsensitive,
-                                        range: searchFrom..<blanked.endIndex) {
-            blanked.replaceSubrange(range, with: "___")
-            searchFrom = blanked.index(range.lowerBound, offsetBy: 3)
-            replaced = true
+    /// Picks the passage sentence to quote. The solver's support verdict
+    /// stays the gate (T1.2 owns support); when exactly one sentence holds
+    /// the answer span, that sentence is quoted. When several do, the one
+    /// sharing the most content words with the question is quoted — the
+    /// first answer-containing sentence may answer a different question
+    /// ("Maya wore a red hat. A red fox ran past." / "What color was the
+    /// fox?"). Returns nil when the choice is ambiguous (a tie for best,
+    /// or no question-word overlap at all), so the caller points at the
+    /// passage instead of quoting the wrong sentence.
+    private static func evidenceSentence(passage: String, promptText: String,
+                                         answer: String, solver: SolverService) -> String? {
+        guard case .supported(let firstEvidence) =
+                solver.verifyReadingSupport(passage: passage, proposedAnswer: answer) else {
+            return nil
         }
-        return replaced ? blanked : nil
+        let normalizedAnswer = SolverService.normalizeForSupport(answer)
+        guard !normalizedAnswer.isEmpty else { return nil }
+        let answerSpan = " \(normalizedAnswer) "
+        let candidates = SolverService.passageSentences(passage).filter {
+            " \(SolverService.normalizeForSupport($0)) ".contains(answerSpan)
+        }
+        guard candidates.count > 1 else { return firstEvidence }
+        let answerTokens = Set(normalizedAnswer.split(separator: " ").map(String.init))
+        let questionWords = contentWords(questionText(in: promptText, passage: passage) ?? "",
+                                         excluding: answerTokens)
+        guard !questionWords.isEmpty else { return nil }
+        var best = 0
+        var bestScore = 0
+        var tied = true
+        for (index, sentence) in candidates.enumerated() {
+            let sentenceWords = Set(SolverService.normalizeForSupport(sentence)
+                .split(separator: " ").map(String.init))
+            let score = questionWords.intersection(sentenceWords).count
+            if score > bestScore {
+                best = index
+                bestScore = score
+                tied = false
+            } else if score == bestScore {
+                tied = true
+            }
+        }
+        guard bestScore > 0, !tied else { return nil }
+        return candidates[best]
+    }
+
+    /// The question part of a reading prompt: everything after the passage
+    /// (prompts render as "Read: <passage> <question>").
+    private static func questionText(in promptText: String, passage: String) -> String? {
+        guard let range = promptText.range(of: passage) else { return nil }
+        let rest = promptText[range.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? nil : rest
+    }
+
+    /// Function words that carry no topic signal for evidence selection.
+    private static let questionStopwords: Set<String> = [
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "do", "does", "did", "what", "which", "who", "whom", "whose",
+        "when", "where", "why", "how", "many", "much", "there", "that",
+        "this", "these", "those", "it", "its", "of", "in", "on", "at",
+        "to", "for", "and", "or", "but", "not", "no", "so", "as", "by",
+        "from", "with", "than", "then", "he", "she", "they", "them",
+        "his", "her", "their", "you", "your", "we", "our", "i", "my",
+        "me", "him", "us", "have", "has", "had", "can", "could", "would",
+        "should", "will", "shall", "may", "might", "must", "s", "t", "d",
+        "ll", "re", "ve", "m",
+    ]
+
+    /// Normalized content words of `text`: lowercased whole tokens without
+    /// stopwords or answer tokens.
+    private static func contentWords(_ text: String, excluding answerTokens: Set<String>) -> Set<String> {
+        Set(SolverService.normalizeForSupport(text).split(separator: " ").map(String.init))
+            .subtracting(questionStopwords)
+            .subtracting(answerTokens)
+    }
+
+    /// Returns `evidence` with every normalized whole-token occurrence of
+    /// the answer replaced by a blank, or nil when no occurrence can be
+    /// located (the caller falls back instead of quoting it whole).
+    /// Matching follows the reading grader's normalization, so every
+    /// accepted spelling is blanked ("blue box" and "blue-box" alike) and
+    /// a punctuated verified answer ("blue box!") still finds its span.
+    private static func blankAnswerSpan(in evidence: String, answer: String) -> String? {
+        let normalizedAnswer = SolverService.normalizeForSupport(answer)
+        guard !normalizedAnswer.isEmpty else { return nil }
+        let answerTokens = normalizedAnswer.split(separator: " ").map(String.init)
+        let spans = normalizedTokenSpans(in: evidence)
+        guard answerTokens.count <= spans.count else { return nil }
+        // Whole-token matches as token-index intervals, merging overlaps
+        // so one blank covers one contiguous span.
+        var merged: [Range<Int>] = []
+        for start in 0...(spans.count - answerTokens.count) {
+            guard spans[start..<(start + answerTokens.count)]
+                .map(\.token).elementsEqual(answerTokens) else { continue }
+            let match = start..<(start + answerTokens.count)
+            if let last = merged.last, match.lowerBound < last.upperBound {
+                merged[merged.count - 1] = last.lowerBound..<max(last.upperBound, match.upperBound)
+            } else {
+                merged.append(match)
+            }
+        }
+        guard !merged.isEmpty else { return nil }
+        var blanked = evidence
+        for match in merged.reversed() {
+            let range = spans[match.lowerBound].range.lowerBound..<spans[match.upperBound - 1].range.upperBound
+            blanked.replaceSubrange(range, with: "___")
+        }
+        return blanked
+    }
+
+    /// Tokenizes `text` into normalized tokens with their original ranges,
+    /// mirroring `SolverService.normalizeForSupport` (lowercase, split on
+    /// non-alphanumeric boundaries, numeric punctuation kept inside a
+    /// number, thousands commas dropped). Each token is lowercased
+    /// individually rather than as part of the whole string; the two agree
+    /// except for context-sensitive Unicode case mappings.
+    private static func normalizedTokenSpans(in text: String) -> [(token: String, range: Range<String.Index>)] {
+        var raw: [(String, Range<String.Index>)] = []
+        var current = ""
+        var start: String.Index?
+        var index = text.startIndex
+        while index < text.endIndex {
+            let c = text[index]
+            let nextIndex = text.index(after: index)
+            let next: Character? = nextIndex < text.endIndex ? text[nextIndex] : nil
+            if c.isLetter || c.isNumber {
+                if start == nil { start = index }
+                current.append(c)
+            } else if (c == "." || c == "/" || c == ","),
+                      current.last?.isNumber == true,
+                      let nx = next, nx.isNumber {
+                current.append(c)
+            } else if let s = start {
+                raw.append((current, s..<index))
+                current = ""
+                start = nil
+            }
+            index = nextIndex
+        }
+        if let s = start { raw.append((current, s..<text.endIndex)) }
+        var out: [(String, Range<String.Index>)] = []
+        for (tok, range) in raw {
+            let lowered = tok.lowercased()
+            guard lowered.contains(",") else {
+                out.append((lowered, range))
+                continue
+            }
+            if SolverService.isThousandsGroupedNumber(lowered) {
+                out.append((lowered.filter { $0 != "," }, range))
+                continue
+            }
+            var subStart = range.lowerBound
+            var sub = ""
+            var subIndex = range.lowerBound
+            while subIndex < range.upperBound {
+                if text[subIndex] == "," {
+                    if !sub.isEmpty {
+                        out.append((sub.lowercased(), subStart..<subIndex))
+                        sub = ""
+                    }
+                    subIndex = text.index(after: subIndex)
+                    subStart = subIndex
+                } else {
+                    sub.append(text[subIndex])
+                    subIndex = text.index(after: subIndex)
+                }
+            }
+            if !sub.isEmpty { out.append((sub.lowercased(), subStart..<range.upperBound)) }
+        }
+        return out
     }
 
     /// Least common multiple that returns nil instead of trapping when

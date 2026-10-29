@@ -333,9 +333,11 @@ final class HintLadderTests: XCTestCase {
                                 now: { self.baseDate }, eventSink: sink)
         ladder.recordAnswerSubmission("1")
         _ = ladder.requestHint()
+        ladder.waitForSinkDelivery()
         XCTAssertEqual(sink.events.count, 1)
         XCTAssertNil(sink.events.first?.followedByChangedAnswer)
         ladder.recordAnswerSubmission("2")
+        ladder.waitForSinkDelivery()
         XCTAssertEqual(sink.events.count, 2, "resolution is reported as an upsert of the same event")
         XCTAssertEqual(sink.events.last?.questionId, "q-sink")
         XCTAssertEqual(sink.events.last?.level, .nudge)
@@ -369,6 +371,7 @@ final class HintLadderTests: XCTestCase {
         _ = ladder.requestHint()
         ladder.recordAnswerSubmission("56")
         _ = ladder.requestHint()
+        ladder.waitForSinkDelivery()
         // Showing order preserved, then resolutions in shown order.
         XCTAssertEqual(sink.delivered.map(\.level),
                        [.nudge, .strategy, .nudge, .strategy, .workedStep])
@@ -474,5 +477,285 @@ final class HintLadderTests: XCTestCase {
         XCTAssertEqual(second.nextLevel, .nudge)
         XCTAssertTrue(second.events.isEmpty)
         XCTAssertEqual(first.events.map(\.questionId), ["q-a", "q-a"])
+    }
+
+    // MARK: - Fix round 2 (a): verified-question / proposal operand binding
+
+    func testSamePromptSameAnswerDifferentOperandsAreRejected() {
+        // 6×6 and 9×4 both verify to 36: with the same prompt text the old
+        // `rechecked == question` guard accepted the mismatched pair and
+        // hinted one problem under another question's id.
+        let prompt = "Bags of marbles. How many marbles in all?"
+        let from66 = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                     operands: [6, 6], promptText: prompt)
+        let from94 = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                     operands: [9, 4], promptText: prompt)
+        XCTAssertEqual(solver.solve(from66), .verified(verifiedAnswer: "36"))
+        XCTAssertEqual(solver.solve(from94), .verified(verifiedAnswer: "36"))
+        guard case .success(let question66) = solver.verify(from66, questionId: "q-bind") else {
+            return XCTFail("control proposal must verify")
+        }
+        let mismatched = HintLadder(question: question66, proposal: from94,
+                                    now: { self.baseDate })
+        XCTAssertNil(mismatched.requestHint(),
+                     "same prompt+answer with different operands must show no hint")
+        XCTAssertTrue(mismatched.events.isEmpty)
+        XCTAssertTrue(mismatched.tutorMessages.isEmpty)
+    }
+
+    func testSameOperandsDifferentOperationAreRejected() {
+        // 2+2 and 2×2 both verify to 4: the binding must include the operation.
+        let prompt = "Two and two. How many?"
+        let add = ProposedProblem(skill: .wordProblem, form: .story, operands: [2, 2],
+                                  operation: .add, promptText: prompt)
+        let multiply = ProposedProblem(skill: .wordProblem, form: .story, operands: [2, 2],
+                                       operation: .multiply, promptText: prompt)
+        XCTAssertEqual(solver.solve(add), .verified(verifiedAnswer: "4"))
+        XCTAssertEqual(solver.solve(multiply), .verified(verifiedAnswer: "4"))
+        guard case .success(let addQuestion) = solver.verify(add, questionId: "q-op") else {
+            return XCTFail("control proposal must verify")
+        }
+        let mismatched = HintLadder(question: addQuestion, proposal: multiply,
+                                    now: { self.baseDate })
+        XCTAssertNil(mismatched.requestHint(),
+                     "same operands with a different operation must show no hint")
+        XCTAssertTrue(mismatched.events.isEmpty)
+        XCTAssertTrue(mismatched.tutorMessages.isEmpty)
+    }
+
+    // MARK: - Fix round 2 (c): addition partial-sum reveal
+
+    func testSingleDigitAdditionWorkedStepStopsShortOfAnswer() {
+        // [6,7]: the old tens/ones split showed "6 + 7 = 13" — the answer.
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [6, 7], operation: .add,
+                                       promptText: "6 ribbons Monday, 7 Tuesday. How many?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "13"))
+        let ladder = makeLadder(proposal, questionId: "q-add67")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("13") == true,
+                       "worked step must not reveal the answer: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("split 6 into 3 + 3") == true,
+                      "degenerate addition must split one addend: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("you get 10") == true,
+                      "split step must show the short-of-answer partial: \(worked?.text ?? "")")
+    }
+
+    func testRoundNumberAdditionWorkedStepStopsShortOfAnswer() {
+        // [20,30]: the old tens/ones split showed "20 + 30 = 50" — the answer.
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [20, 30], operation: .add,
+                                       promptText: "20 shells, then 30 more. How many?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "50"))
+        let ladder = makeLadder(proposal, questionId: "q-add2030")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("50") == true,
+                       "worked step must not reveal the answer: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("split 20 into 10 + 10") == true,
+                      "degenerate addition must split one addend: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("you get 40") == true,
+                      "split step must show the short-of-answer partial: \(worked?.text ?? "")")
+    }
+
+    // MARK: - Fix round 2 (d): zero-subtraction reveal
+
+    func testZeroTakeawayIsIgnoredBeforeChoosingWorkedStep() {
+        // [50,18,0]: the old multi-operand step showed "50 − 18 = 32" — the answer.
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [50, 18, 0], operation: .subtract,
+                                       promptText: "50 muffins, 18 sold. How many left?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "32"))
+        let ladder = makeLadder(proposal, questionId: "q-sub0")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text.contains("32") == true,
+                       "worked step must not reveal the answer: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("50 − 10 = 40") == true,
+                      "a single meaningful subtraction must use the split step: \(worked?.text ?? "")")
+    }
+
+    func testLeadingZeroTakeawayIsIgnored() {
+        // [50,0,18]: a zero take-away first must not produce "50 − 0 = 50".
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [50, 0, 18], operation: .subtract,
+                                       promptText: "50 muffins, 18 sold. How many left?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "32"))
+        let ladder = makeLadder(proposal, questionId: "q-sub0lead")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertTrue(worked?.text.contains("50 − 10 = 40") == true,
+                      "a single meaningful subtraction must use the split step: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("50 − 0") == true,
+                       "zero take-aways must never be worked: \(worked?.text ?? "")")
+    }
+
+    func testAllZeroTakeawaysExplainTakingNothing() {
+        // [50,0]: the only take-away is zero — explain without stating 50.
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [50, 0], operation: .subtract,
+                                       promptText: "50 muffins, none sold. How many left?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "50"))
+        let ladder = makeLadder(proposal, questionId: "q-sub00")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertFalse(worked?.text.contains("50") == true,
+                       "worked step must not reveal the answer: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("taking away 0") == true,
+                      "all-zero take-aways must keep the taking-nothing step: \(worked?.text ?? "")")
+    }
+
+    // MARK: - Fix round 2 (e): normalized-answer blanking
+
+    func testReadingWorkedStepBlanksEverySpellingOfTheAnswer() {
+        // Evidence holds both "blue box" and "blue-box": both normalize to the
+        // accepted answer, so both must be blanked.
+        let passage = "The blue box sat by the blue-box shed."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "blue box",
+                                       promptText: "Read: \(passage) Where did the box sit?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue box"))
+        let ladder = makeLadder(proposal, questionId: "q-blank2")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertTrue(worked?.text.contains("___") == true,
+                      "must quote blanked evidence: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.lowercased().contains("blue box") == true,
+                       "no accepted spelling may stay visible: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.lowercased().contains("blue-box") == true,
+                       "no accepted spelling may stay visible: \(worked?.text ?? "")")
+    }
+
+    func testReadingWorkedStepBlanksAnswerWithTrailingPunctuation() {
+        // Verified answer "blue box!": normalization strips the "!", so the
+        // evidence span must still be found and blanked (old code fell back).
+        let passage = "The blue box is by the bed."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "blue box!",
+                                       promptText: "Read: \(passage) What is by the bed?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "blue box!"))
+        let ladder = makeLadder(proposal, questionId: "q-blankbang")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertTrue(worked?.text.contains("___") == true,
+                      "must quote blanked evidence, not fall back: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("blue box") == true,
+                       "the answer span must be blanked: \(worked?.text ?? "")")
+    }
+
+    // MARK: - Fix round 2 (f): division nonnegative leftover
+
+    func testDivisionStrategyRequiresNonnegativeLeftover() {
+        // 17÷5, guess 4 leaves −3 < 5: the strategy must demand 0-or-more too.
+        let proposal = ProposedProblem(skill: .division, form: .story, operands: [17, 5],
+                                       promptText: "17 cookies shared among 5 friends.")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "3 r 2"))
+        let ladder = makeLadder(proposal, questionId: "q-divstrat")
+        _ = ladder.requestHint()
+        let strategy = ladder.requestHint()
+        XCTAssertEqual(strategy?.level, .strategy)
+        XCTAssertTrue(strategy?.text.contains("0 or more") == true,
+                      "strategy must require a nonnegative leftover: \(strategy?.text ?? "")")
+        XCTAssertTrue(strategy?.text.contains("smaller than 5") == true,
+                      "strategy must keep the smaller-than-divisor bound: \(strategy?.text ?? "")")
+        XCTAssertFalse(strategy?.text.contains("3 r 2") == true,
+                       "strategy must not reveal the answer: \(strategy?.text ?? "")")
+    }
+
+    // MARK: - Fix round 2 (g): reading-evidence relevance
+
+    func testReadingWorkedStepQuotesSentenceThatAnswersTheQuestion() {
+        // Both sentences contain "red"; only the fox sentence answers the question.
+        let passage = "Maya wore a red hat. A red fox ran past."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "red",
+                                       promptText: "Read: \(passage) What color was the fox?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "red"))
+        let ladder = makeLadder(proposal, questionId: "q-fox")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertTrue(worked?.text.contains("A ___ fox ran past.") == true,
+                      "must quote the fox sentence with the answer blanked: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("hat") == true,
+                       "must not quote the hat sentence: \(worked?.text ?? "")")
+    }
+
+    func testReadingWorkedStepAvoidsQuotingWhenEvidenceIsAmbiguous() {
+        // Both sentences match the question equally: quote neither.
+        let passage = "A red hat sat here. A red mat sat there."
+        let proposal = ProposedProblem(skill: .readingComprehension, form: .story,
+                                       passage: passage, candidateAnswer: "red",
+                                       promptText: "Read: \(passage) What sat?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "red"))
+        let ladder = makeLadder(proposal, questionId: "q-ambig")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertFalse(worked?.text.contains("___") == true,
+                       "must not quote ambiguous evidence: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("point to the exact sentence") == true,
+                      "must fall back to pointing at the passage: \(worked?.text ?? "")")
+    }
+
+    // MARK: - Fix round 2 (b): notification ordering and serialization
+
+    /// Slow thread-safe sink that records every delivery in arrival order
+    /// plus the maximum number of concurrent in-flight deliveries. The
+    /// sleep widens the race window: pre-fix, concurrent Hint taps
+    /// overlapped inside the sink (maxActive 3) and resolutions could land
+    /// before their own showings.
+    private final class ConcurrencyProbingSink: HintEventSink, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _active = 0
+        private var _maxActive = 0
+        private var _delivered: [HintEvent] = []
+        var maxActive: Int { lock.withLock { _maxActive } }
+        var delivered: [HintEvent] { lock.withLock { _delivered } }
+        func recordHintEvent(_ event: HintEvent) {
+            lock.withLock {
+                _active += 1
+                _maxActive = max(_maxActive, _active)
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+            lock.withLock {
+                _active -= 1
+                _delivered.append(event)
+            }
+        }
+    }
+
+    func testConcurrentHintTapsDeliverSeriallyInStateChangeOrder() {
+        guard case .success(let question) = solver.verify(fixtures[0].proposal,
+                                                          questionId: "q-conc") else {
+            return XCTFail("fixture must verify")
+        }
+        let sink = ConcurrencyProbingSink()
+        let ladder = HintLadder(question: question, proposal: fixtures[0].proposal,
+                                now: { self.baseDate }, eventSink: sink)
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            _ = ladder.requestHint()
+        }
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            ladder.recordAnswerSubmission("7")
+        }
+        ladder.waitForSinkDelivery()
+
+        let delivered = sink.delivered
+        XCTAssertEqual(delivered.count, 6, "three showings plus three resolutions")
+        XCTAssertEqual(sink.maxActive, 1, "sink deliveries must never overlap")
+        // State-change order: every showing in ladder order first (all
+        // showings precede the resolving answer), then every resolution in
+        // shown order — an older unresolved event never overwrites its own
+        // resolution.
+        XCTAssertEqual(delivered.map(\.level),
+                       [.nudge, .strategy, .workedStep, .nudge, .strategy, .workedStep])
+        XCTAssertEqual(delivered.map(\.followedByChangedAnswer),
+                       [nil, nil, nil, false, false, false],
+                       "first answer with no baseline resolves as unchanged, not a revision")
+        XCTAssertEqual(delivered.map(\.nextAnswer),
+                       [nil, nil, nil, "7", "7", "7"])
     }
 }

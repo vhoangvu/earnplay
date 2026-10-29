@@ -56,9 +56,24 @@ revision); `nextAnswer` keeps the resolving answer. Hints still
 awaiting an answer keep `followedByChangedAnswer == nil`. An
 optional `HintEventSink` receives each event on showing and again
 on resolution (upsert by question + level), mirroring
-`HintListenEventSink`; notifications are captured under the lock
-and delivered after unlocking, in order, so a synchronous sink
-that reads ladder state back cannot deadlock the Hint tap.
+`HintListenEventSink`; notifications are queued under the lock in
+state-change order and drained asynchronously and serially on a
+private queue, so callbacks never overlap, an older unresolved
+event can never overwrite its own resolution, and a synchronous
+sink that reads ladder state back cannot deadlock the Hint tap.
+
+The mismatch check binds values, not just text: `VerifiedQuestion`
+carries the source operands, fractions, and operation it was
+verified from, so a same-prompt same-answer collision from
+different values (6×6 vs 9×4) is still rejected. Degenerate
+addition (all single-digit or all multiples of ten) splits one
+addend instead of showing a partial sum that equals the answer;
+zero take-aways are ignored before choosing the subtraction step.
+Reading evidence is the unique answer-containing sentence, or —
+when several contain the answer — the one sharing the most
+content words with the question; on a tie no sentence is quoted.
+Blanking follows the reading grader's normalization, so every
+accepted spelling of the answer is blanked.
 
 ## Tests
 
@@ -77,4 +92,9 @@ state back, reading worked steps quoting blanked passage
 evidence, fail-closed behaviour on solver-rejected values and
 on mismatched proposal/question pairs, and the
 huge-denominator comparison that takes the cross-multiplication
-path without trapping.
+path without trapping. Fix round 2 adds: operand/operation
+binding collisions, concurrent-tap sink serialization and
+ordering, degenerate-addition and zero-subtraction stop-short
+steps, normalized blanking of every accepted spelling,
+division-strategy nonnegative-leftover wording, and
+question-relevant (or abstaining) reading evidence.
