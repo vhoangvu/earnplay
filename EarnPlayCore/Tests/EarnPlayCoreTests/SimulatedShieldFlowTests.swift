@@ -355,4 +355,71 @@ final class SimulatedShieldFlowTests: XCTestCase {
         XCTAssertEqual(flow.challengeDecisionText, SimulatedShieldFlow.unlockGrantedText)
         XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed])
     }
+
+    // MARK: - Fix round 3: answer edits
+
+    /// Typing between submits is interaction: edits at 10s intervals
+    /// over 40s keep every gap under the 20s idle cap, so no active
+    /// time is lost — but edits alone never grant (the
+    /// attempt-plus-hint floor stays unmet, zero attempt points).
+    @MainActor
+    func testAnswerEditsRecordInteractionWithoutGrantingAttemptEffort() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        var now = Date(timeIntervalSince1970: 50_000)
+        let recorder = EffortSessionRecorder(startedAt: now, now: { now })
+        let flow = SimulatedShieldFlow(
+            manager: makeManager(clock: clock, backend: backend),
+            backend: backend,
+            app: Self.game,
+            category: Self.games,
+            scorer: EffortScorer(threshold: 8),
+            recorder: recorder,
+            unlockDuration: 60,
+            isSimulatedMode: true
+        )
+
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "7")
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "7*")
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "7*8")
+        now.addTimeInterval(10)
+        let score = flow.finishChallenge()
+        XCTAssertEqual(score.signals.activeSeconds, 40)
+        XCTAssertEqual(score.signals.genuineAttempts, 0)
+        XCTAssertEqual(score.signals.hintInteractions, 0)
+        XCTAssertEqual(score.decision, .denied)
+        XCTAssertTrue(flow.isShieldPresented)
+        XCTAssertEqual(flow.managedSettingsCallCount, 0)
+    }
+
+    /// A blank field (including the clear after a submit) records
+    /// nothing: 40s with only blank edits collapses to the single
+    /// capped 20s gap, granting no active-time effort.
+    @MainActor
+    func testBlankAnswerEditRecordsNothing() {
+        let clock = FakeMonotonicClock()
+        let backend = SimulatedShieldBackend()
+        var now = Date(timeIntervalSince1970: 60_000)
+        let recorder = EffortSessionRecorder(startedAt: now, now: { now })
+        let flow = SimulatedShieldFlow(
+            manager: makeManager(clock: clock, backend: backend),
+            backend: backend,
+            app: Self.game,
+            category: Self.games,
+            scorer: EffortScorer(threshold: 8),
+            recorder: recorder,
+            unlockDuration: 60,
+            isSimulatedMode: true
+        )
+
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "")
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "   ")
+        now.addTimeInterval(10); flow.recordAnswerEdit(answer: "")
+        now.addTimeInterval(10)
+        let score = flow.finishChallenge()
+        XCTAssertEqual(score.signals.activeSeconds, 20)
+        XCTAssertEqual(score.signals.genuineAttempts, 0)
+        XCTAssertEqual(score.decision, .denied)
+        XCTAssertTrue(flow.isShieldPresented)
+    }
 }

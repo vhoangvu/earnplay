@@ -132,6 +132,15 @@ public final class SimulatedShieldFlow: ObservableObject {
         recorder.recordHintInteraction()
     }
 
+    /// Records an answer-field edit as interaction only — the same
+    /// recorder path as a blank submit. Typing keeps active time
+    /// running but never scores as an attempt. A blank edit records
+    /// nothing, so clearing the field grants no effort.
+    public func recordAnswerEdit(answer: String) {
+        guard !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        recorder.recordInteraction()
+    }
+
     /// Finishes the challenge: scores the recorded session with the real
     /// `EffortScorer` and, only on a granted score, opens the timed
     /// unlock window through `ShieldManager`, dismissing the shield. A

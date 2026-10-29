@@ -51,6 +51,9 @@ struct SimulatedShieldView: View {
                     TextField("Your answer", text: $answerText)
                         .textFieldStyle(.roundedBorder)
                         .accessibilityIdentifier("answerField")
+                        .onChange(of: answerText) { _, newValue in
+                            flow.recordAnswerEdit(answer: newValue)
+                        }
 
                     HStack {
                         Button("Submit attempt") {

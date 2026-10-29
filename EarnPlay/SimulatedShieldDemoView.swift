@@ -39,8 +39,10 @@ final class SimulatedShieldDemoState: ObservableObject {
 
     @Published var activeAppID: String?
 
-    init() {
-        let directory = PolicyStore.defaultDirectory()
+    /// - Parameter directory: Policy/window store root. Defaults to
+    ///   the persistent demo path; tests inject a temporary directory.
+    init(directory: URL? = nil) {
+        let directory = directory ?? PolicyStore.defaultDirectory()
             .appendingPathComponent("SimulatedDemo", isDirectory: true)
         let store = PolicyStore(directory: directory)
         if store.storedVersion == 0 {
