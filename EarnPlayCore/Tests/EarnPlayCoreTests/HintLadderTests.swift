@@ -1089,6 +1089,89 @@ final class HintLadderTests: XCTestCase {
                        "must not fall back to generic instructions: \(worked?.text ?? "")")
     }
 
+    // MARK: - Fix round 5: verbal zero disclosure
+
+    /// Word-forms of zero must never appear as the disclosed result in a
+    /// zero-answer worked step (issue #6 fix round 5). Whole-word match so
+    /// innocent substrings ("another") cannot fail the check.
+    private func assertHintHidesZeroWords(_ text: String,
+                                         file: StaticString = #filePath, line: UInt = #line) {
+        let words = Set(text.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+        for zeroWord in ["zero", "nothing", "none", "empty"] {
+            XCTAssertFalse(words.contains(zeroWord),
+                           "worked step states the zero answer in words (\(zeroWord)): \(text)",
+                           file: file, line: line)
+        }
+    }
+
+    func testZeroPlusZeroAdditionDoesNotStateResultInWords() {
+        // 0 + 0 (and 0 + 0 + 0): "still leaves nothing" stated the answer.
+        let cases: [(operands: [Int], id: String)] = [
+            ([0, 0], "q-add00"),
+            ([0, 0, 0], "q-add000"),
+        ]
+        for (operands, id) in cases {
+            let rounds = operands.map { "\($0)" }.joined(separator: ", ")
+            let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                           operands: operands, operation: .add,
+                                           promptText: "Mia collects shells in rounds of \(rounds). How many shells does she collect in all?")
+            XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"), id)
+            let ladder = makeLadder(proposal, questionId: id)
+            _ = ladder.requestHint(); _ = ladder.requestHint()
+            let worked = ladder.requestHint()
+            XCTAssertEqual(worked?.level, .workedStep, id)
+            assertHintHidesZeroWords(worked?.text ?? "")
+            XCTAssertTrue(worked?.text.lowercased().contains("how many") == true,
+                          "\(id): child must still determine the total: \(worked?.text ?? "")")
+            XCTAssertFalse(worked?.text.contains("0") == true,
+                           "\(id): number-free step, any digit would be the answer: \(worked?.text ?? "")")
+        }
+    }
+
+    func testZeroFactorMultiplicationDoesNotStateResultInWords() {
+        // "every part is empty — there is nothing to count" stated the answer.
+        let facts: [(operands: [Int], id: String, prompt: String)] = [
+            ([0, 7], "q-mul07", "0 bags of 7 marbles. How many marbles?"),
+            ([6, 0], "q-mul60", "6 bags with 0 marbles in each bag. How many marbles?"),
+            ([0, 0], "q-mul00", "0 bags with 0 marbles in each bag. How many marbles?"),
+        ]
+        for (operands, id, prompt) in facts {
+            let proposal = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                           operands: operands, promptText: prompt)
+            XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"), id)
+            let ladder = makeLadder(proposal, questionId: id)
+            _ = ladder.requestHint(); _ = ladder.requestHint()
+            let worked = ladder.requestHint()
+            XCTAssertEqual(worked?.level, .workedStep, id)
+            assertHintHidesZeroWords(worked?.text ?? "")
+            XCTAssertTrue(worked?.text.contains("\(operands[0]) × \(operands[1])") == true,
+                          "\(id): must name the problem: \(worked?.text ?? "")")
+            XCTAssertTrue(worked?.text.lowercased().contains("how many") == true,
+                          "\(id): child must still finish: \(worked?.text ?? "")")
+            XCTAssertFalse(worked?.text.contains("groups of") == true,
+                           "\(id): must stay orientation-neutral: \(worked?.text ?? "")")
+        }
+        // Word-problem shapes share the template: 0 rows of 7, 6 rows of 0.
+        let stories: [(operands: [Int], id: String, prompt: String)] = [
+            ([0, 7], "q-zmul07", "A gardener plants 0 rows with 7 flowers in each row. How many flowers are there in all?"),
+            ([6, 0], "q-zmul60", "A gardener plants 6 rows with 0 flowers in each row. How many flowers are there in all?"),
+        ]
+        for (operands, id, prompt) in stories {
+            let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                           operands: operands, operation: .multiply, promptText: prompt)
+            XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"), id)
+            let ladder = makeLadder(proposal, questionId: id)
+            _ = ladder.requestHint(); _ = ladder.requestHint()
+            let worked = ladder.requestHint()
+            XCTAssertEqual(worked?.level, .workedStep, id)
+            assertHintHidesZeroWords(worked?.text ?? "")
+            XCTAssertTrue(worked?.text.contains("\(operands[0]) × \(operands[1])") == true,
+                          "\(id): must name the problem: \(worked?.text ?? "")")
+            XCTAssertFalse(worked?.text.contains("groups of") == true,
+                           "\(id): must stay orientation-neutral: \(worked?.text ?? "")")
+        }
+    }
+
     func testTrimmedPassageLookupFindsEvidence() {
         let trimmed = "Maya wore a red hat. A red fox ran past."
         let passage = "  \(trimmed)  "

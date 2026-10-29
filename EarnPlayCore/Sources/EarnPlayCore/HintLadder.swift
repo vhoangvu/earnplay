@@ -366,11 +366,12 @@ public final class HintLadder: @unchecked Sendable {
             // Zero product: the near-complete template would show
             // 0 × 7 = 0 × 6 + 0 = 0 + 0, whose partial already equals
             // the answer. Use a conceptual step instead, with no group
-            // count or size: word problems render a-groups-of-b while
+            // count or size (word problems render a-groups-of-b while
             // multiplication facts render b-groups-of-a, so naming
-            // either direction reverses one of them.
+            // either direction reverses one of them) and no zero
+            // word-form (nothing/empty/zero/none would state the answer).
             if a == 0, b >= 2 {
-                return "Worked step: \(a) × \(b) means every part is empty — there is nothing to count in any part. How many is that altogether?"
+                return "Worked step: \(a) × \(b) — picture what each part holds, then count all the parts together. How many is that altogether?"
             }
             // One step short of the answer: the near-complete product,
             // leaving the final addition to the child. The completion
@@ -385,7 +386,7 @@ public final class HintLadder: @unchecked Sendable {
                 return "Worked step: \(a) × 1 means the amount appears just once. How many is that altogether?"
             }
             if b == 0 {
-                return "Worked step: \(a) × 0 means every part is empty — there is nothing to count in any part. How many is that altogether?"
+                return "Worked step: \(a) × 0 — picture what each part holds, then count all the parts together. How many is that altogether?"
             }
             return genericText(level)
         }
@@ -598,7 +599,8 @@ public final class HintLadder: @unchecked Sendable {
     /// multiples of ten). Prefers a problem-specific partial that stops
     /// short of the solver's total, failing closed to a generic step only
     /// when every numeric partial would restate the answer:
-    /// - all zeros: a number-free step (any digit would be the answer);
+    /// - all zeros: a number-free, zero-word-free step (any digit or
+    ///   zero word-form would be the answer);
     /// - three or more addends: work the sum of all but one addend and
     ///   leave that addend unfinished (1+1+1 works 1+1=2);
     /// - a zero among the addends: adding zero changes nothing, so the
@@ -610,7 +612,7 @@ public final class HintLadder: @unchecked Sendable {
     ///   addition to the child.
     private static func additionSplitStep(operands: [Int], total: Int, answer: String) -> String {
         if total == 0 {
-            return "Worked step: adding nothing to nothing still leaves nothing — how many is that?"
+            return "Worked step: start with the first amount and add each next amount in turn — how many is that altogether?"
         }
         if operands.count >= 3 {
             for index in operands.indices.reversed() where operands[index] > 0 {
