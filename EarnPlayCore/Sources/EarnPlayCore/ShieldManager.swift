@@ -248,6 +248,12 @@ public final class ShieldManager: @unchecked Sendable {
     /// that exits on its own only clears `monitorTask` when no newer
     /// task has since started.
     private var monitorGeneration: UInt64 = 0
+    /// Test seam (fix round 7, guarded by `lock`): invoked on the
+    /// monitor task immediately after the terminal poll observes a
+    /// closed window and before the loop exits. Lets a regression test
+    /// grant a new window in the exact retirement window. Always nil in
+    /// production; invoked outside the lock so the hook may grant.
+    private var monitorTerminalPollHook: (@Sendable () -> Void)?
     /// True when a reconciliation narrowed or revoked the in-memory
     /// window but persisting that change failed, so the on-disk record
     /// is stale. Later refreshes retry the write; until one succeeds, a
@@ -484,7 +490,10 @@ public final class ShieldManager: @unchecked Sendable {
                 )
                 if Task.isCancelled { break }
                 guard let strongSelf = self else { break }
-                if !strongSelf.refreshAndHasOpenWindow() { break }
+                if strongSelf.refreshAndRetireIfWindowClosed(generation: generation) {
+                    strongSelf.runMonitorTerminalPollHook()
+                    break
+                }
             }
             self?.finishExpiryMonitoringIfGeneration(generation)
         }
@@ -509,14 +518,24 @@ public final class ShieldManager: @unchecked Sendable {
         return monitorTask != nil
     }
 
-    /// Refreshes expiry state (re-applying shields) and atomically
-    /// reports whether a window remains open. The monitor loop uses
-    /// this single locked step so each tick applies exactly once.
-    private func refreshAndHasOpenWindow() -> Bool {
+    /// Refreshes expiry state (re-applying shields) and, when no
+    /// window remains open, retires the monitor task — atomically under
+    /// a single lock hold. A grant landing before this section sees its
+    /// window open (no retirement, polling continues); a grant landing
+    /// after it sees a nil slot (its start launches a new task). Returns
+    /// true when the caller should stop polling. Retirement is
+    /// generation-guarded: a superseded task leaves a newer task alone,
+    /// and a task cancelled by `stopExpiryMonitoring` clears an
+    /// already-nil slot (harmless) when no newer task has started.
+    private func refreshAndRetireIfWindowClosed(generation: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         refreshLocked()
-        return window != nil
+        guard window == nil else { return false }
+        if monitorGeneration == generation {
+            monitorTask = nil
+        }
+        return true
     }
 
     /// Clears `monitorTask` when the exiting task is still the current
@@ -529,6 +548,23 @@ public final class ShieldManager: @unchecked Sendable {
         if monitorGeneration == generation {
             monitorTask = nil
         }
+    }
+
+    /// Sets the terminal-poll test seam (lock-guarded; test only).
+    func setMonitorTerminalPollHook(_ hook: (@Sendable () -> Void)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        monitorTerminalPollHook = hook
+    }
+
+    /// Runs the terminal-poll test seam, if set. The hook is read under
+    /// the lock and invoked after release so it may call back into the
+    /// manager (e.g. grant a window).
+    private func runMonitorTerminalPollHook() {
+        lock.lock()
+        let hook = monitorTerminalPollHook
+        lock.unlock()
+        hook?()
     }
 
     // MARK: - Internals (caller holds `lock`, except at init)
