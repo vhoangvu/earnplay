@@ -48,16 +48,15 @@ tests run without any entitlement.
   state plus the default-deny backstop — never the backend query
   alone: the backend cannot name an app it has never observed, so only
   the gate blocks a fresh install before its first observation.
-- Observations are install facts, not picker state: replacing the
-  enumeration never clears observations for apps the replacement does
-  not name, so an installed-but-unpicked app stays shielded (including
-  with an empty enumeration). When the enumeration names an app, its
-  mapping wins and the superseded observed entry for that app is
-  dropped, so a stale category can neither widen allowlist coverage
-  nor linger in an unlock; coverage for genuinely unenumerated
-  observed apps never regresses. An allowlisted install withholds its
-  category like a picked app, and an unlocked install stays open;
-  category knowledge is sticky and never regresses.
+- Observations are install facts, not picker state, and are never
+  deleted just because the enumeration names the app. While enumerated,
+  the enumeration's category governs and the retained observation is
+  filtered out of placement, so a stale category can neither widen
+  allowlist coverage nor linger in an unlock; when later unpicked, the
+  retained entry restores the shield — including with an empty
+  enumeration. An allowlisted install withholds its category like a
+  picked app, and an unlocked install stays open; category knowledge
+  is sticky and never regresses.
 - Observations persist via `FileObservedInstallStore` and are restored
   before the initial configuration is applied, so a recreated manager
   keeps every observed shield.
