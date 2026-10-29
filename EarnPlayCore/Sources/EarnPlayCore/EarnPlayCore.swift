@@ -9,3 +9,5 @@ public enum EarnPlayCore {
 
 /// Effort scoring lives in `EffortScoring.swift` (`EffortScorer`,
 /// `EffortSignals`, `EffortScore`, `EffortSessionRecorder`).
+/// Stalling probes live in `StallingDetection.swift` (`StallingDetector`,
+/// `StallProbe`, `StallProbeSession`).
