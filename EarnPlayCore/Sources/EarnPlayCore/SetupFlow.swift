@@ -85,6 +85,21 @@ public enum SetupStep: String, Codable, Equatable, Sendable {
     case complete
 }
 
+/// Outcome of submitting the FamilyActivityPicker enumeration.
+public enum SetupEnumerationResult: Equatable, Sendable {
+    /// The enumeration was accepted (staged in memory and, when no policy
+    /// is stored yet, persisted as the incomplete restrictive record). The
+    /// flow advanced to `selection`.
+    case submitted
+    /// A prerequisite was missing (wrong step, no authorization, or an
+    /// empty enumeration). Nothing was staged or written.
+    case notReady
+    /// The enumeration could not be persisted as the incomplete
+    /// restrictive record. Nothing was staged and the flow stays at
+    /// `enumeration`; the caller may retry.
+    case persistenceFailed
+}
+
 /// Outcome of acknowledging the prevent-deleting-apps guidance, which is
 /// the commit point of the setup flow.
 public enum SetupFinishResult: Equatable, Sendable {
@@ -461,11 +476,26 @@ public final class SetupFlow: @unchecked Sendable {
     /// step loses nothing and claims no completed protection.
     @discardableResult
     public func submitEnumeration(_ enumeration: ShieldEnumeration) -> Bool {
+        submitEnumerationResult(enumeration) == .submitted
+    }
+
+    /// Submits the FamilyActivityPicker enumeration, reporting WHY a
+    /// submit failed so the caller can show the right recovery message.
+    ///
+    /// Same prerequisites and effects as `submitEnumeration(_:)`; the
+    /// `Bool` variant stays as a convenience wrapper. In particular a
+    /// storage failure (`saveIncompleteEnumeration` throwing) reports
+    /// `.persistenceFailed` — distinct from `.notReady` — so the UI never
+    /// tells an already-authorized user to complete authorization when
+    /// the real problem is persistence.
+    public func submitEnumerationResult(
+        _ enumeration: ShieldEnumeration
+    ) -> SetupEnumerationResult {
         lock.lock()
         defer { lock.unlock() }
-        guard step == .enumeration, authorized else { return false }
+        guard step == .enumeration, authorized else { return .notReady }
         guard !enumeration.apps.isEmpty || !enumeration.categories.isEmpty else {
-            return false
+            return .notReady
         }
         if policyStore.storedVersion == 0 {
             let merged = Self.mergedRestrictiveRecord(
@@ -478,12 +508,12 @@ public final class SetupFlow: @unchecked Sendable {
             do {
                 try enumerationStore.saveIncompleteEnumeration(merged)
             } catch {
-                return false
+                return .persistenceFailed
             }
         }
         stagedEnumeration = enumeration
         step = .selection
-        return true
+        return .submitted
     }
 
     /// Submits the allowlist / unblockable split of the enumerated apps.

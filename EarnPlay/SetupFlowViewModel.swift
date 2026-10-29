@@ -200,7 +200,15 @@ public final class SetupFlowViewModel: ObservableObject {
             progressError = "Pick at least one app or category before continuing."
             return
         }
-        guard flow.submitEnumeration(enumeration) else {
+        switch flow.submitEnumerationResult(enumeration) {
+        case .submitted:
+            break
+        case .persistenceFailed:
+            progressError = "Could not save the picked apps. " +
+                "Check available storage and try again — setup is still " +
+                "incomplete and nothing is shielded."
+            return
+        case .notReady:
             progressError = "Setup is not ready for enumeration yet. " +
                 "Complete the authorization step first."
             return
