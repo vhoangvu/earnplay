@@ -1,30 +1,40 @@
 import SwiftUI
 import EarnPlayCore
 
-/// T4.6 admin sync surface (manual-test surface): sessions received
-/// from the child, stored exactly once. Running a session on the child
-/// makes it appear here after sync; a queued offline session arrives
-/// on reconnect, once, without re-running anything.
+/// T4.6 admin sync surface: sessions received from the child, stored
+/// exactly once. The sync service itself is app-scoped (started by
+/// EarnPlayAdminApp regardless of the selected tab, finding 6); this
+/// view only renders the published snapshot (finding 5).
 struct SessionsView: View {
-    @State private var sessionStore = SessionLogStore()
-    @State private var policyQueue = PolicyUpdateQueue()
-    @State private var service: AdminSyncService?
-    @State private var status = "Sync not started"
+    let controller: AdminSyncController
+    @StateObject private var ui = AdminSyncUIState(snapshot: AdminSyncSnapshot(
+        storedSessionCount: 0, sessionIDs: [], pendingPolicies: 0, isPaired: false))
+    @State private var peerCode = ""
+    @State private var status = "Sync starting…"
 
     var body: some View {
         NavigationStack {
             List {
                 Section("Sync (Bluetooth)") {
                     Text(status).font(.caption).foregroundStyle(.secondary)
-                    Text("Policy updates pending delivery: \(policyQueue.pendingUpdates().count)")
+                    Text("Paired: \(ui.snapshot.isPaired ? "yes" : "no") · Policy updates pending delivery: \(ui.snapshot.pendingPolicies)")
                         .font(.caption)
-                    Button("Retry sync now") { service?.handleReconnect(); status = "Retried — \(sessionStore.allLogs.count) session(s) stored" }
+                    Text("This device pairing code: \(controller.pairing.localCode)")
+                        .font(.caption.monospaced())
+                    HStack {
+                        TextField("Code shown on child", text: $peerCode)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Pair") { pair() }
+                            .disabled(peerCode.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    Button("Retry sync now") { controller.service.handleReconnect() }
                 }
-                Section("Sessions from child (\(sessionStore.allLogs.count))") {
-                    if sessionStore.allLogs.isEmpty {
+                Section("Sessions from child (\(ui.snapshot.storedSessionCount))") {
+                    if controller.sessionStore.allLogs.isEmpty {
                         Text("No sessions yet").foregroundStyle(.secondary)
                     }
-                    ForEach(sessionStore.allLogs, id: \.sessionId) { log in
+                    ForEach(controller.sessionStore.allLogs, id: \.sessionId) { log in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(log.sessionId).font(.body.monospaced())
                             Text("\(log.decisions.count) decision(s) · policy v\(log.policyVersion)")
@@ -34,15 +44,21 @@ struct SessionsView: View {
                 }
             }
             .navigationTitle("Sessions")
-            .onAppear { startSync() }
+            .onAppear {
+                controller.service.onSnapshotChange = { ui.snapshot = $0 }
+                ui.snapshot = controller.service.snapshot
+                status = controller.service.isPaired
+                    ? "Sync started — paired" : "Sync started — enter the code shown on the child to pair"
+            }
         }
     }
 
-    private func startSync() {
-        guard service == nil else { return }
-        let s = AdminSyncService(
-            policyQueue: policyQueue, sessionStore: sessionStore,
-            transport: MultipeerSyncTransport(role: .browser, displayName: "EarnPlay-Admin"))
-        service = s; s.start(); status = "Sync started — looking for child nearby…"
+    private func pair() {
+        if controller.pairing.preparePairing(enteredCode: peerCode) {
+            status = "Pairing code saved — looking for child nearby… Confirm on the child when asked."
+            controller.service.handleReconnect()
+        } else {
+            status = "Enter the 6-digit code shown on the child."
+        }
     }
 }

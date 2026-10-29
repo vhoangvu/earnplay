@@ -21,7 +21,7 @@ public enum SyncMessageCodec {
     }
 }
 
-public enum SyncTransportError: Error, Equatable, Sendable { case notConnected }
+public enum SyncTransportError: Error, Equatable, Sendable { case notConnected, notPaired }
 
 /// Byte transport seam. Production is MultipeerConnectivity
 /// (Bluetooth/local, no account/server/internet); tests use the

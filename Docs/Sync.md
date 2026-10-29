@@ -19,3 +19,9 @@ child Sync section shows the new version/practice minutes in seconds;
 (2) child → "Run demo session" → admin Sessions tab lists it;
 (3) Airplane Mode on child, run a session, Airplane Mode off with
 both apps open → queued session arrives once in the admin list.
+- **Pairing (local only):** both devices show a 6-digit code; the admin
+  enters the child's code, the child confirms the request — no data
+  flows before pairing, single peer only.
+- **Durable acks:** a session is acked only after durable persistence
+  (or as an already-persisted duplicate); unacked sends retry with
+  bounded backoff. The admin service starts at app scope.

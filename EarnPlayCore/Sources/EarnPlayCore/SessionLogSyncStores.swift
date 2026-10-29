@@ -41,27 +41,38 @@ public final class SessionLogQueue: @unchecked Sendable {
     }
 }
 
+/// Result of `SessionLogStore.storeResult` (finding 3): a durable
+/// duplicate must be acked, a failed write must NOT be acked.
+public enum SessionLogStoreResult: Equatable, Sendable { case stored, duplicate, failed }
+
 /// Admin-side persistent store for received SessionLogs (T4.6).
-/// `store` is idempotent by sessionId — the exactly-once anchor:
-/// a redelivered log (lost ack) returns false and adds nothing.
+/// Idempotent by sessionId — the exactly-once anchor.
 public final class SessionLogStore: @unchecked Sendable {
     public static let fileName = "received-session-logs.json"
     private let directory: URL; private let lock = NSLock()
+    private let dataWriter: (Data, URL) throws -> Void
     private var items: [SessionLog]
-    public init(directory: URL) {
+    public init(directory: URL, dataWriter: ((Data, URL) throws -> Void)? = nil) {
         self.directory = directory
+        self.dataWriter = dataWriter ?? { data, url in try data.write(to: url, options: [.atomic]) }
         self.items = Self.load(directory: directory) ?? []
     }
     public convenience init() { self.init(directory: PolicyStore.defaultDirectory()) }
-    @discardableResult
-    public func store(_ log: SessionLog) -> Bool {
+    public func storeResult(_ log: SessionLog) -> SessionLogStoreResult {
         lock.lock(); defer { lock.unlock() }
         items = Self.load(directory: directory) ?? items
-        guard !items.contains(where: { $0.sessionId == log.sessionId }) else { return false }
+        guard !items.contains(where: { $0.sessionId == log.sessionId }) else { return .duplicate }
         items.append(log)
-        do { try persist() } catch { items = Self.load(directory: directory) ?? items; return false }
-        return true
+        do { try persist() } catch {
+            // Roll back any unpersisted cache change (finding 3).
+            if let reloaded = Self.load(directory: directory) { items = reloaded }
+            else { items.removeAll { $0.sessionId == log.sessionId } }
+            return .failed
+        }
+        return .stored
     }
+    @discardableResult
+    public func store(_ log: SessionLog) -> Bool { storeResult(log) == .stored }
     public var allLogs: [SessionLog] {
         lock.lock(); defer { lock.unlock() }
         items = Self.load(directory: directory) ?? items; return items
@@ -69,8 +80,8 @@ public final class SessionLogStore: @unchecked Sendable {
     public func contains(sessionId: String) -> Bool { allLogs.contains { $0.sessionId == sessionId } }
     private func persist() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try SessionLogCodec.encode(items).write(
-            to: directory.appendingPathComponent(Self.fileName), options: [.atomic])
+        try dataWriter(SessionLogCodec.encode(items),
+                       directory.appendingPathComponent(Self.fileName))
     }
     private static func load(directory: URL) -> [SessionLog]? {
         guard let d = try? Data(contentsOf: directory.appendingPathComponent(fileName))
