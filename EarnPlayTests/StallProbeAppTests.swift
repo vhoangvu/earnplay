@@ -75,3 +75,32 @@ final class StallProbePreviewModelTests: XCTestCase {
         XCTAssertEqual(model.session.probesFired.count, 1)
     }
 }
+
+/// Fix round 2 (issue #8 review): after a substantive reply the success
+/// notice must be present even though no probe is pending — the view renders
+/// it outside the pending-probe conditional. Rejected replies keep their
+/// notice while the probe stays pending.
+@MainActor
+final class StallProbePreviewNoticeTests: XCTestCase {
+    func testSubstantiveReplyKeepsSuccessNoticeWithNoProbePending() {
+        let model = StallProbePreviewModel()
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        XCTAssertNotNil(model.pendingProbe)
+        model.submitReply("I tried adding the tops")
+        XCTAssertNil(model.pendingProbe)
+        XCTAssertEqual(model.replyNotice, "Effort recorded — keep going.")
+    }
+
+    func testRejectedReplyKeepsNoticeWithProbePending() {
+        let model = StallProbePreviewModel()
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        XCTAssertNotNil(model.pendingProbe)
+        model.submitReply("...")
+        XCTAssertNotNil(model.pendingProbe)
+        XCTAssertEqual(model.replyNotice, "Say a little more about what you tried.")
+    }
+}

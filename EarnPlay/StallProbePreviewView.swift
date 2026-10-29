@@ -65,16 +65,17 @@ struct StallProbePreviewView: View {
                         }
                         .accessibilityIdentifier("stallSendReplyButton")
                     }
-                    if let notice = model.replyNotice {
-                        Text(notice)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 }
                 .padding(8)
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .accessibilityIdentifier("stallProbeCard")
+            }
+            if let notice = model.replyNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("stallReplyNotice")
             }
 
             Text(model.statusLine)
