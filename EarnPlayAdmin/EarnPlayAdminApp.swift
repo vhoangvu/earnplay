@@ -8,6 +8,8 @@ struct EarnPlayAdminApp: App {
             TabView {
                 PolicyEditorView()
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
+                SessionsView()
+                    .tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
                 AdminVersionView()
                     .tabItem { Label("Version", systemImage: "info.circle") }
             }
