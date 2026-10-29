@@ -12,8 +12,9 @@ import XCTest
 /// difficulty engine exists yet). Each record must carry all five
 /// justification fields non-empty, the correct type, and ordered timestamps;
 /// an empty-field record fails. Trade (`logTradeOffer`) and
-/// session-judgment (`logSessionJudgment`) seams are covered as test-only
-/// too: no T3.x / TutorEngine callers exist yet and none are invented here.
+/// session-judgment (`logSessionJudgment`) seams are covered here as raw
+/// seams; their live caller is T3.3 (`TradeOfferDecider.decideAndLog`,
+/// covered in `TradeOfferLogicTests`).
 final class DecisionLoggerTests: XCTestCase {
     private var directory: URL!
 
