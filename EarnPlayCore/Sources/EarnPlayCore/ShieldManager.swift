@@ -195,13 +195,16 @@ public final class FileUnlockWindowStore: UnlockWindowStore, @unchecked Sendable
     }
 }
 
-/// Applies and removes shields from policy (T2.2).
+/// Applies and removes shields from policy (T2.2, default-deny T2.5).
 ///
 /// Enumeration-first: every app enumerated at setup except the policy
 /// allowlist (`Policy.alwaysAllowed`) is shielded individually, and
 /// category shields backstop newly installed apps that are not yet
 /// enumerated. No per-app exemption overriding a category shield is
-/// used anywhere — see `ShieldConfiguration`.
+/// used anywhere — see `ShieldConfiguration`. T2.5 default-deny closes
+/// the query path: any app the backend does not shield stays open only
+/// when allowlisted or unlocked, so a newly installed app with an
+/// unknown token or category resolves to locked until policy sync.
 ///
 /// Unlock timers run on an injected suspend-inclusive `MonotonicClock`
 /// (continuous time in production). Changing the device wall clock
@@ -330,9 +333,30 @@ public final class ShieldManager: @unchecked Sendable {
         return lastConfiguration
     }
 
-    /// Effective shielding, delegated to the backend's applied state.
+    /// Effective shielding: the backend's applied state plus T2.5
+    /// default-deny for new/unclassified apps.
+    ///
+    /// A backend shield always wins. Otherwise the app stays open only
+    /// when the current policy allowlists it or an open window unlocks
+    /// it; every other app — including a newly installed app that has
+    /// not been enumerated yet and presents an unknown token or category
+    /// — resolves to locked until a policy sync classifies it. T2.2
+    /// semantics for classified apps are unchanged: this only closes the
+    /// unknown path that previously resolved to allowed.
     public func isShielded(app: AppRef, category: AppCategoryRef? = nil) -> Bool {
-        backend.isShielded(app: app, category: category)
+        if backend.isShielded(app: app, category: category) {
+            return true
+        }
+        if policyStore.currentPolicy.alwaysAllowed.contains(app) {
+            return false
+        }
+        lock.lock()
+        let unlocked = window?.unlockedApps.contains(app) ?? false
+        lock.unlock()
+        if unlocked {
+            return false
+        }
+        return true
     }
 
     // MARK: - Unlock
