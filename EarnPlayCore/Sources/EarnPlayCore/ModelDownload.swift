@@ -131,18 +131,29 @@ public struct ModelDownloadReadiness: Sendable {
     }
 
     /// Resolves whether the tutor can run without a download:
-    /// 1. The active registry's validated artifacts satisfy the
-    ///    gate — the same resolution `SpikeView` runs — so a
-    ///    retained previous-known-good snapshot stays usable even
-    ///    when the default/current file is gone (finding 2). This
-    ///    is a check-only resolve: a retained snapshot is released
-    ///    immediately so the gate never pins registry cleanup.
+    /// 0. Fast path (fix round 4): when the default lookup already
+    ///    selects the download destination, ONE pinned size+SHA
+    ///    verification decides readiness immediately. Without this,
+    ///    every normal launch with the downloaded model selected
+    ///    hashes the ~800 MB file three times (registry production
+    ///    + inferenceArtifacts digest + the fix-3 pinned check)
+    ///    while the UI shows "Checking for model…".
+    /// 1. Otherwise the active registry's validated artifacts
+    ///    satisfy the gate — the same resolution `SpikeView`
+    ///    runs — so a retained previous-known-good snapshot stays
+    ///    usable even when the default/current file is gone
+    ///    (finding 2). This is a check-only resolve: a retained
+    ///    snapshot is released immediately so the gate never pins
+    ///    registry cleanup. A corrupt destination falls through to
+    ///    this fallback (never silently ready) so a retained
+    ///    snapshot can still satisfy the gate.
     ///    Fix round 3: when the resolved artifact sits AT the
     ///    download destination, the pinned size+SHA check still
     ///    applies — the registry digest is computed from the
     ///    current bytes, so a modified/truncated destination file
     ///    with a valid GGUF header would otherwise self-validate
-    ///    and skip repair.
+    ///    and skip repair. The fast path's failed result is reused
+    ///    here instead of hashing the corrupt file again.
     /// 2. Otherwise a legacy default location (env override,
     ///    Documents, script cache) counts by existence, without
     ///    re-verification (finding 3: legacy preserved).
@@ -155,12 +166,23 @@ public struct ModelDownloadReadiness: Sendable {
     public func isReady(environment: [String: String] = ProcessInfo.processInfo.environment,
                         fileManager: FileManager = .default) -> Bool {
         let defaultURL = ModelRuntime.defaultModelURL(environment: environment, fileManager: fileManager)
+        let downloader = ModelDownloader(configuration: configuration, destinationURL: destinationURL)
+        var destinationFailedPin = false
+        if let defaultURL,
+           defaultURL.standardizedFileURL.path == destinationURL.standardizedFileURL.path {
+            if downloader.verifiedExistingModelURL() != nil {
+                return true
+            }
+            destinationFailedPin = true
+        }
         if let registry = try? VersionRegistry.production(storeURL: registryStoreURL, modelURL: defaultURL),
            let artifacts = try? registry.inferenceArtifacts(defaultModelURL: defaultURL) {
             registry.releaseInferenceArtifacts(artifacts)
             if let modelURL = artifacts.modelURL,
                modelURL.standardizedFileURL.path == destinationURL.standardizedFileURL.path {
-                let downloader = ModelDownloader(configuration: configuration, destinationURL: destinationURL)
+                if destinationFailedPin {
+                    return false
+                }
                 return downloader.verifiedExistingModelURL() != nil
             }
             return true
@@ -169,8 +191,11 @@ public struct ModelDownloadReadiness: Sendable {
         if defaultURL.standardizedFileURL.path != destinationURL.standardizedFileURL.path {
             return true
         }
-        let downloader = ModelDownloader(configuration: configuration, destinationURL: destinationURL)
-        return downloader.verifiedExistingModelURL() != nil
+        // The default lookup selects the destination, so the fast path
+        // above already ran the pinned verification: an intact file
+        // returned true immediately, and anything reaching here failed
+        // it — never ready (fix 3), and never hashed twice.
+        return false
     }
 }
 
