@@ -406,6 +406,7 @@ struct ChatConversationView: View {
                 .accessibilityIdentifier("chatHintButton")
 
                 TextField("Type your answer", text: $viewModel.draft, axis: .vertical)
+                    .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier("chatComposerField")
                     .onSubmit { viewModel.submitDraft() }

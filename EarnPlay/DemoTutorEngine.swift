@@ -164,7 +164,18 @@ final class DemoTutorEngine: ChatTutorEngine {
 
     private func questionTurn(_ item: Item) -> ChatTurn {
         let question = item.result.question
-        let text = question.passage.map { "\($0)\n\n\(question.promptText)" } ?? question.promptText
+        // Fallback reading prompts already embed their passage
+        // verbatim (FallbackQuestionBank + QuestionGeneration both
+        // require promptText to contain it, and SolverService.verify
+        // preserves both). Prepending the passage again would render
+        // and speak it twice, so only prepend when it is absent.
+        let text: String
+        if let passage = question.passage,
+           !question.promptText.contains(passage.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            text = "\(passage)\n\n\(question.promptText)"
+        } else {
+            text = question.promptText
+        }
         return .tutor(TutorMessage(id: question.questionId, text: text, kind: .question))
     }
 
