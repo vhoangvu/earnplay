@@ -61,6 +61,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.tests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.0"
+        BUNDLE_LOADER: $(TEST_HOST)
 schemes:
   EarnPlay:
     build:

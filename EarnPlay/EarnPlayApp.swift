@@ -25,6 +25,8 @@ struct ContentView: View {
                 StallProbePreviewView()
                 Divider()
                 SpikeView()
+                Divider()
+                MovementTradePreviewView()
             }
             .padding()
         }
