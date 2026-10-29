@@ -300,4 +300,23 @@ final class EffortScoringTests: XCTestCase {
         XCTAssertFalse(result.floorMet)
         XCTAssertEqual(result.decision, .denied)
     }
+
+    // MARK: Fix round 2 — evaluations before session start grant nothing (review #3)
+
+    func testEvaluationBeforeSessionStartReturnsEmptySignals() {
+        // Review counterexample: one attempt + three hints at startedAt,
+        // querying at startedAt - 1 must deny, not score 8 with floor met.
+        let start = Date(timeIntervalSince1970: 9_000)
+        let recorder = EffortSessionRecorder(startedAt: start)
+        recorder.recordAttempt(at: start)
+        recorder.recordHintInteraction(at: start)
+        recorder.recordHintInteraction(at: start)
+        recorder.recordHintInteraction(at: start)
+        let signals = recorder.signals(at: start.addingTimeInterval(-1))
+        XCTAssertEqual(signals, EffortSignals())
+        let result = EffortScorer(threshold: 8).evaluate(signals)
+        XCTAssertEqual(result.score, 0)
+        XCTAssertFalse(result.floorMet)
+        XCTAssertEqual(result.decision, .denied)
+    }
 }

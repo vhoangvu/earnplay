@@ -406,9 +406,12 @@ public final class EffortSessionRecorder: HintListenEventSink, @unchecked Sendab
     /// counts are scoped to the session evaluation interval
     /// `startedAt...evaluatedAt`, matching the active-time calculation:
     /// events before the session started or after the evaluation time
-    /// contribute to neither the score nor the floor.
+    /// contribute to neither the score nor the floor. An evaluation
+    /// before the session started returns empty signals, so no grant is
+    /// possible before the session starts.
     public func signals(at date: Date? = nil) -> EffortSignals {
         let evaluatedAt = date ?? now()
+        if evaluatedAt < startedAt { return EffortSignals() }
         lock.lock(); defer { lock.unlock() }
         let end = max(startedAt, evaluatedAt)
         func count(_ dates: [Date]) -> Int {
