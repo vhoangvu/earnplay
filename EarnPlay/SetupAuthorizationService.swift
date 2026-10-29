@@ -31,6 +31,17 @@ public protocol SetupAuthorizationService: Sendable {
 /// Real authorization via `AuthorizationCenter` (child's device, Screen
 /// Time). Works when authorized — which requires the entitlement (v1).
 public final class FamilyControlsSetupAuthorizationService: SetupAuthorizationService, Sendable {
+    /// The FamilyControls membership setup requests: the guardian-approved
+    /// child member. The parent (device organizer) grants FamilyControls
+    /// authorization during setup (ENT-authorization-and-parental-consent;
+    /// T2.3 inputs: "parent present to approve Screen Time authorization"),
+    /// so the request must target `.child` — `.individual` would let the
+    /// device user (the child) approve, and later revoke, access alone,
+    /// bypassing the parent-consent boundary. `FamilyControlsMember` (both
+    /// cases) is iOS 16.0 API and is present in the CI SDK (Xcode 16.4 /
+    /// iPhoneSimulator18.5); see the mapping comment below for the SDK pin.
+    static let requestedMembership: FamilyControlsMember = .child
+
     public init() {}
 
     public func currentStatus() -> SetupAuthorizationState {
@@ -39,7 +50,7 @@ public final class FamilyControlsSetupAuthorizationService: SetupAuthorizationSe
 
     public func requestAuthorization() async -> Bool {
         do {
-            try await AuthorizationCenter.shared.requestAuthorization(for: .individual)
+            try await AuthorizationCenter.shared.requestAuthorization(for: Self.requestedMembership)
         } catch {
             return false
         }

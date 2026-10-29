@@ -55,6 +55,12 @@ private struct AuthorizationStepView: View {
                     "and to shield them outside earned unlocks. This step " +
                     "must be done on the child's device.")
                     .foregroundStyle(.secondary)
+                if viewModel.needsReauthorization {
+                    Text("Your completed setup is still saved. Approve Screen " +
+                        "Time access again to restore protection — you won't " +
+                        "need to pick apps again.")
+                        .font(.footnote)
+                }
                 Button {
                     isRequesting = true
                     Task {
@@ -280,10 +286,19 @@ private struct PreventDeletingGuidanceView: View {
 
 // MARK: - Step 5: complete
 
-private struct SetupCompleteView: View {
+/// The saved-policy summary, shown after setup completes (and after a
+/// relaunch while the completion stands) until the parent taps Continue —
+/// including the category-backstop-disabled warning when an allowlisted
+/// app's unknown category disables the backstop. Public so `ContentView`
+/// can keep it visible instead of jumping straight to the main screen.
+public struct SetupCompleteView: View {
     @ObservedObject var viewModel: SetupFlowViewModel
 
-    var body: some View {
+    public init(viewModel: SetupFlowViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Setup complete")
@@ -324,6 +339,10 @@ private struct SetupCompleteView: View {
                     "shielding through the simulated path.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                Button("Continue") {
+                    viewModel.dismissSummary()
+                }
+                .buttonStyle(.borderedProminent)
             }
             .padding()
         }

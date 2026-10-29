@@ -269,7 +269,12 @@ final class SetupFlowTests: XCTestCase {
 
     // MARK: - Abandonment: never half-open
 
-    func testAbandoningMidFlowLeavesNoPolicyAndNoProtection() {
+    func testAbandoningMidFlowShieldsPickedAppsAndStaysIncomplete() {
+        // Fix round 3 (finding 6): abandoning no longer leaves picked apps
+        // unshielded — issue #14's acceptance requires default-deny on
+        // abandon ("never in a half-open state"), so the old `.none`
+        // expectations encoded the bug. Abandoning still commits no policy
+        // and claims no completed protection.
         let (flow, store, manager, backend) = makeSetup()
 
         flow.recordAuthorization(granted: true)
@@ -285,15 +290,27 @@ final class SetupFlowTests: XCTestCase {
         XCTAssertFalse(flow.claimsProtection)
         XCTAssertNil(flow.pendingEnumeration)
         XCTAssertEqual(store.storedVersion, 0)
-        XCTAssertEqual(backend.currentShieldConfiguration, .none)
-        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        // Restrictive incomplete-setup configuration: every picked app
+        // shielded, with the category backstop — default-deny.
+        XCTAssertEqual(
+            backend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.video, Self.socialApp, Self.allowedGame]
+        )
+        XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.newSocial, category: Self.social))
 
-        // A fresh flow over the same directory is incomplete too: nothing
-        // durable was left behind.
-        let (relaunched, _, _, _) = makeSetup()
+        // A fresh flow over the same directory is incomplete too, with the
+        // picked apps still shielded: the restrictive record survives
+        // relaunch without ever reading as a completed setup.
+        let (relaunched, _, relaunchManager, relaunchBackend) = makeSetup()
         XCTAssertEqual(relaunched.currentStep, .authorization)
         XCTAssertFalse(relaunched.isComplete)
         XCTAssertFalse(relaunched.claimsProtection)
+        XCTAssertTrue(relaunchManager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertEqual(
+            relaunchBackend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.video, Self.socialApp, Self.allowedGame]
+        )
     }
 
     // MARK: - Persistence failures stay incomplete
@@ -318,6 +335,15 @@ final class SetupFlowTests: XCTestCase {
         XCTAssertEqual(failingStore.storedVersion, 0)
         XCTAssertEqual(backend.currentShieldConfiguration, .none)
         XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+
+        // Fix round 3 (finding 5): the failed commit leaves no orphan
+        // enumeration behind, so a relaunch cannot mistake it for a
+        // completed setup.
+        XCTAssertNil(FileSetupEnumerationStore(directory: directory).loadEnumeration())
+        let (relaunched, _, _, relaunchBackend) = makeSetup()
+        XCTAssertEqual(relaunched.currentStep, .authorization)
+        XCTAssertFalse(relaunched.isComplete)
+        XCTAssertEqual(relaunchBackend.currentShieldConfiguration, .none)
     }
 
     // MARK: - Restore across relaunch
@@ -329,8 +355,10 @@ final class SetupFlowTests: XCTestCase {
         XCTAssertTrue(flow.submitSelections(allowlist: [Self.allowedGame], unblockable: [Self.game]))
         XCTAssertEqual(flow.acknowledgePreventDeletingGuidance(), .finished)
 
-        // Relaunch equivalent: new instances over the same directory.
-        let (relaunched, store, manager, backend) = makeSetup()
+        // Relaunch equivalent: new instances over the same directory,
+        // with Screen Time access still approved (fix round 3, finding 3:
+        // restoring active protection requires current authorization).
+        let (relaunched, store, manager, backend) = makeSetup(authorized: true)
         XCTAssertEqual(relaunched.currentStep, .complete)
         XCTAssertTrue(relaunched.isComplete)
         XCTAssertTrue(relaunched.claimsProtection)

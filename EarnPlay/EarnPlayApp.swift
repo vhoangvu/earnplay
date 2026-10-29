@@ -14,7 +14,9 @@ struct ContentView: View {
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
 
     var body: some View {
-        if setup.step == .complete {
+        if setup.step == .complete, !setup.summaryDismissed {
+            SetupCompleteView(viewModel: setup)
+        } else if setup.step == .complete {
             mainPlaceholder
         } else {
             SetupFlowView(viewModel: setup)

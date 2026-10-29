@@ -33,4 +33,16 @@ final class SetupAuthorizationMappingTests: XCTestCase {
             .notDetermined
         )
     }
+
+    /// T2.3 fix round 3 — the setup authorization request must target the
+    /// guardian-approved child member: the parent (device organizer) grants
+    /// FamilyControls authorization during setup, so `.individual` (device
+    /// user self-approval) would bypass the parent-consent boundary.
+    /// `FamilyControlsMember.child` is iOS 16.0 API, present in the CI SDK.
+    func testRequestPathUsesGuardianApprovedChildMember() {
+        XCTAssertEqual(
+            FamilyControlsSetupAuthorizationService.requestedMembership,
+            .child
+        )
+    }
 }

@@ -82,8 +82,29 @@ public final class SetupFlowViewModel: ObservableObject {
     @Published public var authorizationError: String?
     @Published public var progressError: String?
     @Published public private(set) var summary: CompletionSummary?
+    /// Whether the parent dismissed the completion summary. The summary
+    /// (including the category-backstop-disabled warning) stays visible
+    /// until an explicit Continue; reset whenever the flow leaves
+    /// `complete` so a later completion shows it again.
+    @Published public private(set) var summaryDismissed = false
 
-    private let flow: SetupFlow
+    /// Dismisses the completion summary (the Continue action).
+    public func dismissSummary() {
+        summaryDismissed = true
+    }
+
+    /// True when a committed setup is waiting for Screen Time access to be
+    /// approved again (see `SetupFlow.needsReauthorization`): the wizard
+    /// shows the authorization step, and a grant restores completion
+    /// without re-running the picker.
+    public var needsReauthorization: Bool {
+        flow.needsReauthorization
+    }
+
+    /// The driven state machine. Internal (not private) so app tests can
+    /// drive the flow to a given step; production UI uses only the
+    /// view-model methods. No behavior change.
+    let flow: SetupFlow
     private let policyStore: PolicyStore
     private let backend: NonEnforcingShieldBackend
     private let authService: any SetupAuthorizationService
@@ -115,6 +136,7 @@ public final class SetupFlowViewModel: ObservableObject {
     ) -> SetupFlowViewModel {
         let store = PolicyStore()
         let backend = NonEnforcingShieldBackend()
+        let auth = authService ?? FamilyControlsSetupAuthorizationService()
         let manager = ShieldManager(
             policyStore: store,
             enumeration: .empty,
@@ -124,13 +146,14 @@ public final class SetupFlowViewModel: ObservableObject {
         let flow = SetupFlow(
             policyStore: store,
             shieldManager: manager,
-            enumerationStore: FileSetupEnumerationStore()
+            enumerationStore: FileSetupEnumerationStore(),
+            authorized: auth.currentStatus() == .approved
         )
         return SetupFlowViewModel(
             flow: flow,
             policyStore: store,
             backend: backend,
-            authService: authService ?? FamilyControlsSetupAuthorizationService(),
+            authService: auth,
             tokenStore: SetupTokenStore()
         )
     }
@@ -220,8 +243,22 @@ public final class SetupFlowViewModel: ObservableObject {
     }
 
     /// Acknowledges the prevent-deleting-apps guidance and commits setup.
+    ///
+    /// Rechecks live Screen Time authorization first: access may have been
+    /// revoked while the user was in Settings, and the grant recorded
+    /// earlier in the flow must not be trusted at commit time. When access
+    /// is no longer approved, the run is abandoned (no policy is saved),
+    /// the wizard returns to authorization, and an authorization error is
+    /// shown instead of committing.
     public func finishSetup() {
         progressError = nil
+        guard authService.currentStatus() == .approved else {
+            flow.abandon()
+            refresh()
+            authorizationError = "Screen Time authorization is no longer approved. " +
+                "Approve access again to finish setup — nothing was saved."
+            return
+        }
         switch flow.acknowledgePreventDeletingGuidance() {
         case .finished:
             refresh()
@@ -251,6 +288,7 @@ public final class SetupFlowViewModel: ObservableObject {
             rebuildSummary()
         } else {
             summary = nil
+            summaryDismissed = false
         }
     }
 

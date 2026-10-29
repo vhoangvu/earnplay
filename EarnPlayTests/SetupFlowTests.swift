@@ -114,8 +114,12 @@ final class SetupFlowAppTests: XCTestCase {
         XCTAssertTrue(manager.isShielded(app: Self.newSocial, category: Self.social))
     }
 
-    func testAbandonedSetupClaimsNoProtection() {
-        let (flow, store, _, backend) = makeSetup()
+    func testAbandonedSetupClaimsNoCompletedProtectionButShieldsPickedApps() {
+        // Fix round 3 (finding 6): abandoning still commits no policy and
+        // claims no completed protection, but the picked apps are shielded
+        // restrictively (default-deny) instead of left unshielded — the
+        // old `.none` expectation encoded the bug.
+        let (flow, store, manager, backend) = makeSetup()
 
         flow.recordAuthorization(granted: true)
         XCTAssertTrue(flow.submitEnumeration(sampleEnumeration()))
@@ -125,6 +129,11 @@ final class SetupFlowAppTests: XCTestCase {
         XCTAssertFalse(flow.isComplete)
         XCTAssertFalse(flow.claimsProtection)
         XCTAssertEqual(store.storedVersion, 0)
-        XCTAssertEqual(backend.currentShieldConfiguration, .none)
+        XCTAssertEqual(
+            backend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.socialApp, Self.allowedApp]
+        )
+        XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.newSocial, category: Self.social))
     }
 }

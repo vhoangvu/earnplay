@@ -22,20 +22,34 @@ import Foundation
 /// the flow completes.
 ///
 /// Completion is a single atomic commit: the enumeration is persisted,
-/// then the initial policy (version `storedVersion + 1`) is written to
+/// then the initial policy (version `storedVersion + 1`, keeping every
+/// existing field except the setup selections) is written to
 /// `PolicyStore`, then the enumeration is handed to `ShieldManager`, which
 /// shields every enumerated app except the allowlist (enumeration-first)
 /// with the picked categories as the backstop for newly installed apps.
-/// Abandoning the flow before that commit leaves no policy, no persisted
-/// enumeration, and no shields behind: an incomplete flow stays incomplete
-/// and claims no protection. Once a policy exists, unknown apps are
-/// governed by T2.5's default-deny rule (a later task; only the handoff is
-/// stated here).
+/// If the policy write fails, the just-written enumeration is rolled back
+/// (the previous content, if any, is restored), so a failed commit never
+/// leaves a policy/enumeration pair behind that a relaunch could mistake
+/// for a completed setup.
+/// Abandoning the flow before that commit writes no policy, but the picked
+/// apps are NOT left unshielded: abandoning with a staged enumeration
+/// applies it as a restrictive incomplete-setup configuration
+/// (default-deny — every picked app shielded under the current policy)
+/// and persists it when no policy exists yet, so a relaunch stays
+/// incomplete with the picked apps still shielded. An incomplete flow
+/// never claims the protection of a completed one. Once a policy exists,
+/// unknown apps are governed by T2.5's default-deny rule (a later task;
+/// only the handoff is stated here).
 ///
-/// A completed setup survives relaunch: a new `SetupFlow` over the same
-/// stores starts at `complete` and re-applies the persisted enumeration to
-/// its `ShieldManager`, so shields are active again without re-running
-/// the picker.
+/// A completed setup survives relaunch, but only while Screen Time access
+/// is still approved: a new `SetupFlow` over the same stores starts at
+/// `complete` and re-applies the persisted enumeration to its
+/// `ShieldManager` only when the `authorized` seed (the app's current
+/// system status at launch) confirms access. With a committed
+/// policy/enumeration pair on disk but no current approval, the flow
+/// starts at `authorization` with `needsReauthorization` true and applies
+/// no shields; re-granting restores completion without re-running the
+/// picker, and abandoning never destroys the committed pair.
 ///
 /// ## Framework-free boundary and verification status
 ///
@@ -174,6 +188,13 @@ public final class SetupFlow: @unchecked Sendable {
     private var stagedEnumeration: ShieldEnumeration?
     private var stagedAllowlist: Set<AppRef>?
     private var stagedUnblockable: Set<AppRef>?
+    /// A committed enumeration waiting for Screen Time access to be
+    /// approved again (see `needsReauthorization`). Set only at init when
+    /// a committed policy/enumeration pair exists on disk without current
+    /// approval; consumed only by a re-grant. While set, the flow can only
+    /// return to `complete` via `recordAuthorization(granted: true)` —
+    /// no step can be submitted, and `abandon()` preserves the pair.
+    private var pendingCommittedEnumeration: ShieldEnumeration?
 
     /// Creates a flow over the given stores.
     ///
@@ -181,16 +202,24 @@ public final class SetupFlow: @unchecked Sendable {
     ///   a fresh install, so shields are inactive until this flow
     ///   completes and hands over the real enumeration.
     /// - `authorized` seeds the in-memory authorization flag (the app
-    ///   passes the current system status at launch); it never marks an
-    ///   incomplete flow complete.
+    ///   passes the current system status at launch). It gates the
+    ///   restore below: a committed setup restores as active protection
+    ///   only with current approval.
     ///
     /// Restore: when the policy store already holds a policy
     /// (`storedVersion > 0`) AND a non-empty enumeration was persisted,
     /// this starts at `complete` and re-applies the persisted enumeration
-    /// to `shieldManager` so shields are active again. Any other
-    /// combination — including a policy without an enumeration or an
-    /// enumeration without a policy — restores as incomplete and claims
-    /// no protection.
+    /// to `shieldManager` so shields are active again — but only when
+    /// `authorized` is true. With a committed pair but no current
+    /// approval, this starts at `authorization` with
+    /// `needsReauthorization` true and applies no shields; re-granting
+    /// restores completion without re-running the picker.
+    /// A persisted enumeration without a policy is an abandoned run's
+    /// restrictive record: it restores as incomplete and claims no
+    /// completed protection, but the enumeration is applied so the picked
+    /// apps stay shielded (default-deny). Any other combination —
+    /// including a policy without an enumeration — restores as incomplete
+    /// with no shields applied.
     public init(
         policyStore: PolicyStore,
         shieldManager: ShieldManager,
@@ -202,14 +231,23 @@ public final class SetupFlow: @unchecked Sendable {
         self.enumerationStore = enumerationStore
         self.authorized = authorized
         let persisted = enumerationStore.loadEnumeration()
-        if policyStore.storedVersion > 0,
-           let persisted,
-           !persisted.apps.isEmpty || !persisted.categories.isEmpty {
-            self.step = .complete
-            self.stagedEnumeration = persisted
-            shieldManager.updateEnumeration(persisted)
+        let persistedIsNonEmpty = persisted.map {
+            !$0.apps.isEmpty || !$0.categories.isEmpty
+        } ?? false
+        if policyStore.storedVersion > 0, let persisted, persistedIsNonEmpty {
+            if authorized {
+                self.step = .complete
+                self.stagedEnumeration = persisted
+                shieldManager.updateEnumeration(persisted)
+            } else {
+                self.step = .authorization
+                self.pendingCommittedEnumeration = persisted
+            }
         } else {
             self.step = .authorization
+            if let persisted, persistedIsNonEmpty {
+                shieldManager.updateEnumeration(persisted)
+            }
         }
     }
 
@@ -236,12 +274,25 @@ public final class SetupFlow: @unchecked Sendable {
     }
 
     /// Whether the flow claims any protection. False until the completion
-    /// commit: an incomplete flow — including one abandoned mid-flow —
-    /// claims no protection.
+    /// commit: an incomplete flow — including one abandoned mid-flow or
+    /// one waiting for reauthorization — claims no completed protection.
+    /// (An abandoned run still shields its picked apps restrictively, but
+    /// that is default-deny, not a completed setup.)
     public var claimsProtection: Bool {
         lock.lock()
         defer { lock.unlock() }
         return step == .complete
+    }
+
+    /// True when a committed setup exists on disk but Screen Time access
+    /// is not currently approved, so active protection was NOT restored.
+    /// The committed policy/enumeration pair is intact: re-granting
+    /// authorization (see `recordAuthorization(granted:)`) restores
+    /// completion without re-running the picker.
+    public var needsReauthorization: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return step == .authorization && pendingCommittedEnumeration != nil
     }
 
     /// The staged enumeration, if one has been submitted this run (or was
@@ -254,16 +305,29 @@ public final class SetupFlow: @unchecked Sendable {
 
     /// Records a FamilyControls authorization result.
     ///
-    /// A grant advances `authorization` to `enumeration`. A denial leaves
-    /// the step — and everything else — untouched, so the flow cannot
-    /// proceed without authorization. No-op once complete.
+    /// A grant advances `authorization` to `enumeration` — except when a
+    /// committed setup is waiting for reauthorization (see
+    /// `needsReauthorization`): then the grant restores `complete`
+    /// directly, re-applying the committed enumeration, without
+    /// re-running the picker. A denial leaves the step — and everything
+    /// else — untouched, so the flow cannot proceed without authorization.
+    /// No-op once complete.
     public func recordAuthorization(granted: Bool) {
         lock.lock()
         defer { lock.unlock() }
         guard step != .complete else { return }
         authorized = granted
         if granted, step == .authorization {
-            step = .enumeration
+            if let pending = pendingCommittedEnumeration,
+               policyStore.storedVersion > 0 {
+                pendingCommittedEnumeration = nil
+                stagedEnumeration = pending
+                shieldManager.updateEnumeration(pending)
+                step = .complete
+            } else {
+                pendingCommittedEnumeration = nil
+                step = .enumeration
+            }
         }
     }
 
@@ -333,19 +397,27 @@ public final class SetupFlow: @unchecked Sendable {
     ///
     /// Requires the `preventDeletingGuidance` step with authorization
     /// recorded and staged enumeration/selections. The commit, in order:
-    /// persist the enumeration, write the initial policy (version
-    /// `storedVersion + 1`; allowlist = built-in defaults plus the staged
-    /// allowlist; unblockable = the staged set; no never-unlockable
-    /// overrides — the admin app may add those later), then hand the
-    /// enumeration to `ShieldManager`, which applies the shields.
+    /// persist the enumeration, write the policy (version
+    /// `storedVersion + 1`, starting from the current policy so existing
+    /// overrides, chore pool, durations, caps, and settings are preserved;
+    /// only the setup selections change — allowlist = built-in defaults
+    /// plus the staged allowlist, unblockable = the staged set), then hand
+    /// the enumeration to `ShieldManager`, which applies the shields.
+    /// Policy construction reads only the policy store and the staged
+    /// selections — never the saved enumeration — so the write order is
+    /// free; enumeration-first is kept so a failed policy write can roll
+    /// the enumeration back without consuming a policy version.
     ///
     /// - `.finished`: committed; the flow is complete and claims
     ///   protection (subject to the entitlement honesty note above).
     /// - `.notReady`: called out of order or with missing prerequisites;
     ///   nothing was written or applied.
     /// - `.persistenceFailed`: the enumeration or the policy could not be
-    ///   persisted; nothing advances, shields stay inactive, and the
-    ///   caller may retry this method.
+    ///   persisted. On a policy failure the just-written enumeration is
+    ///   rolled back (the previous content, if any, is restored), so no
+    ///   uncommitted enumeration data survives and a relaunch cannot
+    ///   mistake the failed setup for a completed one. Nothing advances,
+    ///   and the caller may retry this method.
     @discardableResult
     public func acknowledgePreventDeletingGuidance() -> SetupFinishResult {
         lock.lock()
@@ -358,24 +430,23 @@ public final class SetupFlow: @unchecked Sendable {
         else {
             return .notReady
         }
-        let policy = Policy(
-            version: policyStore.storedVersion + 1,
-            alwaysAllowed: [.phone, .messages, .earnPlaySelf]
-                + allowlist.sorted(by: { $0.id < $1.id }),
-            unblockable: unblockable.sorted(by: { $0.id < $1.id }),
-            neverUnlockableOverrides: [],
-            unlockDurations: .default,
-            effortFloorSettings: .default,
-            tradeCaps: .default,
-            chorePool: [],
-            movementSettings: .default
-        )
+        var policy = policyStore.currentPolicy
+        policy.version = policyStore.storedVersion + 1
+        policy.alwaysAllowed = [.phone, .messages, .earnPlaySelf]
+            + allowlist.sorted(by: { $0.id < $1.id })
+        policy.unblockable = unblockable.sorted(by: { $0.id < $1.id })
+        let previousEnumeration = enumerationStore.loadEnumeration()
         do {
             try enumerationStore.saveEnumeration(enumeration)
         } catch {
             return .persistenceFailed
         }
         guard policyStore.apply(policy) == .applied else {
+            if let previousEnumeration {
+                try? enumerationStore.saveEnumeration(previousEnumeration)
+            } else {
+                try? enumerationStore.clearEnumeration()
+            }
             return .persistenceFailed
         }
         shieldManager.updateEnumeration(enumeration)
@@ -386,14 +457,29 @@ public final class SetupFlow: @unchecked Sendable {
     /// Abandons an in-progress setup run.
     ///
     /// Clears the in-memory authorization flag, staged enumeration, and
-    /// staged selections, and returns to the `authorization` step. Nothing
-    /// is written: no policy, no persisted enumeration, no shield change —
-    /// an abandoned flow stays incomplete and claims no protection.
-    /// No-op once complete (a committed setup is not un-committed).
+    /// staged selections, and returns to the `authorization` step. No full
+    /// policy is committed — but when an enumeration was staged, it is
+    /// applied to the `ShieldManager` as a restrictive incomplete-setup
+    /// configuration (default-deny: every picked app shielded under the
+    /// current policy) and, when no policy exists yet, persisted so a
+    /// relaunch stays incomplete with the picked apps still shielded.
+    /// Persisting over a stored policy is refused: that would forge a
+    /// policy/enumeration pair and falsely restore as complete.
+    /// No-op once complete (a committed setup is not un-committed), and a
+    /// no-op while a committed setup waits for reauthorization (the pair
+    /// and the reauthorization path survive abandoning).
     public func abandon() {
         lock.lock()
         defer { lock.unlock() }
         guard step != .complete else { return }
+        guard pendingCommittedEnumeration == nil else { return }
+        if let staged = stagedEnumeration,
+           !staged.apps.isEmpty || !staged.categories.isEmpty {
+            if policyStore.storedVersion == 0 {
+                try? enumerationStore.saveEnumeration(staged)
+            }
+            shieldManager.updateEnumeration(staged)
+        }
         authorized = false
         stagedEnumeration = nil
         stagedAllowlist = nil
