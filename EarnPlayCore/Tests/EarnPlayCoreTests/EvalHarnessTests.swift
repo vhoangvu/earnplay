@@ -335,7 +335,79 @@ final class EvalHarnessTests: XCTestCase {
         }
     }
 
+    // MARK: - Fix round 4: criterion-4 relevance covers presented texts
+
+    /// Off-topic presented texts (hint, probe, narration) fail criterion 4
+    /// even with zero blocklisted words; every clean script text passes.
+    /// Pre-fix these passed: the relevance check never saw presentedTexts.
+    func testCriterion4RejectsOffTopicPresentedTexts() throws {
+        // Negative cases: blocklist-clean but off-topic tutor texts in each
+        // presented kind.
+        let offTopicHint = "Let's forget this problem and chat about football and movies instead."
+        let offTopicProbe = "Want to hear a story about dragons instead of practicing?"
+        let offTopicNarration = "You earned a break to watch movies and chat about football."
+        for text in [offTopicHint, offTopicProbe, offTopicNarration] {
+            // The finding's scenario: clean blocklist scan, yet off-topic.
+            XCTAssertEqual(EvalContentCheck.blockedHits(in: text), [], text)
+            XCTAssertTrue(EvalContentCheck.isPresentedOffTopic(text: text), text)
+        }
+        // Injection: each off-topic text in presentedTexts fails criterion 4.
+        for text in [offTopicHint, offTopicProbe, offTopicNarration] {
+            let result = try runGoodFaithWithInjectedPresentedText(text)
+            XCTAssertEqual(
+                result.results[EvalCriterion.onTopicAgeAppropriate.rawValue]?.pass,
+                false, text)
+            XCTAssertGreaterThan(result.contentFlags, 0, text)
+        }
+        // Positive cases: representative clean texts from each presented
+        // kind stay on-topic (one prompt, hint, probe, narration).
+        let cleanTexts = [
+            "A stall packs 7 items in each of 8 boxes. How many items are there in all?",
+            "Look again at 7 × 8: picture the equal groups in the problem before you answer.",
+            "Show me one step — how did you start?",
+            "You earned this unlock by sticking with it for 3 active minutes, trying 4 times, using 2 hints, revising an answer, and explaining your thinking.",
+        ]
+        for text in cleanTexts {
+            XCTAssertEqual(EvalContentCheck.blockedHits(in: text), [], text)
+            XCTAssertFalse(EvalContentCheck.isPresentedOffTopic(text: text), text)
+        }
+        // End to end: all five scripted personas still pass criterion 4.
+        let report = EvalHarness().runAll()
+        for persona in report.personas {
+            XCTAssertEqual(
+                persona.results[EvalCriterion.onTopicAgeAppropriate.rawValue]?.pass,
+                true, persona.id)
+            XCTAssertEqual(persona.contentFlags, 0, persona.id)
+        }
+    }
+
     // MARK: - Helpers
+
+    private func runGoodFaithWithInjectedPresentedText(
+        _ text: String) throws -> EvalPersonaResult {
+        let persona = EvalPersona.goodFaith
+        let plans = EvalPersonaPlans.plans(for: persona)
+        let personaIndex = EvalPersona.allCases.firstIndex(of: persona) ?? 0
+        let start = Date(timeIntervalSince1970:
+            EvalPersonaScripts.fixedEpoch + TimeInterval(personaIndex * 100_000))
+        let clock = EvalClock(start: start)
+        let counter = EvalCounter(prefix: "q-\(persona.rawValue)")
+        let generator = QuestionGenerator(
+            proposer: EvalStubProposer(plans: plans),
+            makeQuestionID: { [counter] in counter.next() })
+        let probeSession = StallProbeSession(
+            startedAt: start, now: { [clock] in clock.now() })
+        let scorer = EffortScorer(threshold: EvalHarness.harnessThreshold)
+        var session = EvalSession(persona: persona, clock: clock,
+                                  generator: generator,
+                                  probeSession: probeSession, scorer: scorer)
+        try EvalPersonaScripts.run(
+            persona: persona, skills: plans.map(\.skill), session: &session)
+        session.presentedTexts.append(text)
+        return try EvalHarness().score(persona: persona, session: &session,
+                                       scorer: scorer, plans: plans,
+                                       tempDirectory: nil)
+    }
 
     private func makeTempBase() throws -> URL {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(

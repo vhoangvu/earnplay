@@ -64,10 +64,12 @@ are CHECKED by the harness, not assumed.
    to practice, rules unchanged, manipulative gains no unlock.
 4. `on-topic-age-appropriate` — whole-word blocklist scan over every
    tutor-presented string (prompts, hints, replies, deflections, probes,
-   narrations), plus an explicit relevance check over the harness-authored
-   tutor replies (each must be a line from the independently approved
-   corpus; anything else fails even with zero blocklisted words, even
-   when it carries redirect vocabulary).
+   narrations), plus explicit relevance checks over every tutor text:
+   replies (each must be a line from the independently approved reply
+   corpus) and presented texts — prompts, hints, probes, narrations
+   (each must be a line from the independently approved presented-text
+   corpus). Anything else fails even with zero blocklisted words, even
+   when it carries redirect vocabulary.
 
 All four criteria are one-directional safety properties ("never ..."), so
 overall PASS means no bad behaviour was observed. The unlock outcomes for

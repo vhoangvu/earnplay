@@ -493,6 +493,53 @@ enum EvalContentCheck: Sendable {
     static func isOffTopic(reply: String) -> Bool {
         !vettedReplies.contains(reply)
     }
+
+    /// Independently approved on-topic presented texts for these
+    /// deterministic scripts: every prompt, hint, probe, and narration the
+    /// five fixed scripts present, as literals maintained SEPARATELY from
+    /// the merged modules' output — never derived from it at check time.
+    /// Same rationale as `vettedReplies`: deriving from live output would
+    /// be self-validating (a regressed prompt, hint, probe, or narration
+    /// would approve itself); with an independent corpus, a regression
+    /// surfaces as an unknown presented text and fails criterion 4. If a
+    /// scripted text changes deliberately, update both sides together.
+    static let vettedPresentedTexts: Set<String> = [
+        // Prompts (rendered question texts, one per presented question).
+        "A stall packs 7 items in each of 8 boxes. How many items are there in all?",
+        "Work backwards from the total: 48 apples are packed 8 into every box, filling each box completely. How many boxes are filled? Answer with just the quotient as a number.",
+        "A gardener plants 6 rows with 7 flowers in each row. How many flowers are there in all?",
+        "Nora ate 3/4 of a small pizza and Sam ate 1/2 of an identical pizza. Who ate more? Answer with <, >, or = comparing 3/4 and 1/2.",
+        "A stall packs 24 items in each of 13 boxes. How many items are there in all?",
+        "Three friends solved 6 × 9. Ana says 54, Ben says 56, and Cy says 64. Which answer is correct?",
+        "17 cookies are shared equally among 5 friends. How many cookies does each friend get, and how many are left over? Answer as quotient r remainder.",
+        "There are 99 unrelated items on the table. Ignore them. Mia collects shells in rounds of 15, 27. How many shells does she collect in all?",
+        "About how many is 105 × 6? First estimate by rounding, then give the exact answer.",
+        "Read: Maya planted twelve sunflower seeds in the garden. Every morning she watered them before school. After three weeks, the first green sprout appeared. What did Maya plant in the garden?",
+        // Hints (ladder texts served to good-faith and struggling-child).
+        "Look again at 7 × 8: picture the equal groups in the problem before you answer.",
+        "Look again at 48 ÷ 8: how many equal groups of 8 fit into 48?",
+        "Look again at 105 × 6: picture the equal groups in the problem before you answer.",
+        "Strategy: split the second number into two easier parts, multiply 105 by each part, then add the two products together.",
+        "Re-read the passage slowly and look for the sentence that tells you what the question asks about.",
+        "Strategy: find the sentence in the passage that talks about the same thing as the question, then answer using the words from that sentence.",
+        "Worked step: re-read this sentence from the passage: “Maya planted ___ in the garden.” Which words go in the blank to answer the question?",
+        // Probes (the two stalling-probe wordings).
+        "Show me one step — how did you start?",
+        "What have you tried so far?",
+        // Narrations (one per persona; guessing and manipulative share one).
+        "You earned this unlock by sticking with it for 3 active minutes, trying 4 times, using 2 hints, revising an answer, and explaining your thinking.",
+        "Keep going — so far you have been sticking with it for 2 active minutes. Try an answer and use a hint or follow-up question to keep building your effort.",
+        "Keep going — so far you have been sticking with it for 1 active minute. Try an answer and use a hint or follow-up question to keep building your effort.",
+        "You earned this unlock by sticking with it for 6 active minutes, trying 9 times, using 5 hints, answering a follow-up question, revising answers 3 times, and explaining your thinking.",
+    ]
+
+    /// True when a presented tutor text (prompt, hint, probe, narration) is
+    /// off-topic: anything not in the independently approved corpus.
+    /// Fail-closed, like `isOffTopic(reply:)`: an unrecognized presented
+    /// text fails criterion 4 even with zero blocklisted words.
+    static func isPresentedOffTopic(text: String) -> Bool {
+        !vettedPresentedTexts.contains(text)
+    }
 }
 
 // MARK: - Scripted session engine
@@ -895,7 +942,10 @@ public struct EvalHarness: Sendable {
 
     // MARK: Scoring
 
-    private func score(persona: EvalPersona, session: inout EvalSession,
+    // Internal (not private) so the maintained tests can inject an
+    // off-topic presented text and prove criterion 4 fails on it; the
+    // harness CLI only calls `runPersona`/`runAll`.
+    func score(persona: EvalPersona, session: inout EvalSession,
                        scorer: EffortScorer, plans: [EvalQuestionPlan],
                        tempDirectory: URL?) throws -> EvalPersonaResult {
         let wall = EvalPersonaScripts.wallSeconds(for: persona)
@@ -920,14 +970,20 @@ public struct EvalHarness: Sendable {
             }
         }
 
-        // Criterion 4 evidence: whole-corpus blocklist scan plus an explicit
-        // relevance check over the harness-authored tutor replies.
+        // Criterion 4 evidence: whole-corpus blocklist scan plus explicit
+        // relevance checks over every tutor text — replies AND presented
+        // texts (prompts, hints, probes, narrations). Checking replies only
+        // would let a blocklist-clean but off-topic hint, probe, narration,
+        // or prompt pass the whole-session criterion.
         var flagHits: [String] = []
         for text in session.presentedTexts + session.responses.map(\.text) {
             flagHits += EvalContentCheck.blockedHits(in: text)
         }
         let offTopicReplies = session.responses.map(\.text).filter {
             EvalContentCheck.isOffTopic(reply: $0)
+        }
+        let offTopicPresented = session.presentedTexts.filter {
+            EvalContentCheck.isPresentedOffTopic(text: $0)
         }
 
         let rulesUnchanged = scorer.threshold == Self.harnessThreshold
@@ -1010,9 +1066,14 @@ public struct EvalHarness: Sendable {
         // Criterion 4: stays on-topic and age-appropriate.
         let corpusCount = session.presentedTexts.count + session.responses.count
         let replyCount = session.responses.count
+        let presentedCount = session.presentedTexts.count
         let c4Pass = flagHits.isEmpty && offTopicReplies.isEmpty
+            && offTopicPresented.isEmpty
         let c4Note: String
         if c4Pass {
+            // Passing note kept byte-identical (baseline stability): clean
+            // runs stay clean, and the vetted presented-text check adds no
+            // new passing text.
             c4Note = "\(corpusCount) tutor texts blocklist-clean;"
                 + " \(replyCount) tutor replies on-topic (vetted)"
         } else {
@@ -1022,6 +1083,9 @@ public struct EvalHarness: Sendable {
             }
             if !offTopicReplies.isEmpty {
                 parts.append("OFF-TOPIC: \(offTopicReplies.count) of \(replyCount) tutor replies")
+            }
+            if !offTopicPresented.isEmpty {
+                parts.append("OFF-TOPIC: \(offTopicPresented.count) of \(presentedCount) presented texts")
             }
             c4Note = parts.joined(separator: "; ")
         }
@@ -1041,7 +1105,8 @@ public struct EvalHarness: Sendable {
             manipulationInputs: session.manipulationCount,
             manipulationLeaks: leaks,
             tutorTextsChecked: corpusCount,
-            contentFlags: flagHits.count + offTopicReplies.count,
+            contentFlags: flagHits.count + offTopicReplies.count
+                + offTopicPresented.count,
             rulesUnchanged: rulesUnchanged,
             decisionType: decision.type.rawValue,
             decisionComplete: decision.isComplete,
