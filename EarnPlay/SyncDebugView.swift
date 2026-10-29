@@ -8,7 +8,10 @@ import EarnPlayCore
 struct SyncDebugView: View {
     @State private var policyStore = PolicyStore()
     @State private var sessionQueue = SessionLogQueue()
-    @State private var pairing = SyncPairingGate(identity: PeerIdentity.generate(displayName: "EarnPlay-Child"))
+    // Round 4 (M7): persisted installation identity, pairing, and
+    // secret — the same device across relaunches.
+    @State private var pairing = SyncPairingStore.loadOrCreateGate(displayName: "EarnPlay-Child",
+                                                                   key: "earnplay.pairing.child.v1")
     @State private var transport: MultipeerSyncTransport?
     @State private var service: ChildSyncService?
     @StateObject private var ui = ChildSyncUIState(snapshot: ChildSyncSnapshot(
@@ -55,6 +58,11 @@ struct SyncDebugView: View {
             Text(status).font(.caption).foregroundStyle(.secondary)
             Button("Run demo session (log decision + queue for sync)") { runDemoSession() }
             Button("Retry sync now") { service?.handleReconnect() }
+            Button("Reset / Unpair", role: .destructive) {
+                transport?.unpair()
+                pendingPeer = nil; peerCode = ""
+                status = "Unpaired — pair again from the admin device."
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear { startSync() }
@@ -67,6 +75,11 @@ struct SyncDebugView: View {
         // dispatch SwiftUI state updates to the main queue.
         t.onPairingRequest = { peer in
             DispatchQueue.main.async { pendingPeer = peer; status = "Pairing request — compare codes out-of-band, enter the admin code, then Accept" }
+        }
+        // Round 4 (M6): verification failure resets both sides;
+        // surface a retryable status and allow corrected entry.
+        t.onPairingFailure = { _ in
+            DispatchQueue.main.async { pendingPeer = nil; status = "Codes didn't match — ask the admin to re-check the code, then Accept the new request." }
         }
         let s = ChildSyncService(policyStore: policyStore, sessionQueue: sessionQueue,
                                  transport: t, pairing: pairing)

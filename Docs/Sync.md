@@ -66,6 +66,33 @@ Accept → both show paired, then (1)/(2) flow.
   and receives. After a drop, the trusted identity may be
   re-invited and reuses its verified pairing without another
   manual confirmation; other identities remain refused.
+- **Provisional pairing (fix round 4, M6):** pairing completes
+  only when both sides have verified each other and exchanged
+  confirmations. A one-sided verification stays provisional; a
+  failed verification notifies the peer so both sides reset the
+  attempt, show a retryable "codes didn't match" status, and
+  accept corrected codes with a fresh handshake.
+- **Trusted reconnect proof (fix round 4, H3):** authenticated
+  pairing establishes a random per-peer secret, shared once over
+  the encrypted session and never equal to a user-entered code or
+  the broadcast stableID. A retained pairing reconnects only
+  after the peer proves possession of that secret against a
+  fresh nonce; with no secret (or a failed proof) both sides drop
+  the retained pairing and fall back to full manual re-pairing —
+  never silent trust. Identity resolution binds each live peer
+  instance to its stable identity (never its display name), and
+  transport state is serialized with a lock held only around
+  state access, never across sends or service callbacks (H1/H2).
+- **Reconnect (fix round 4, H4):** rediscovery revives a failed
+  trusted candidate, and a dropped trusted session schedules
+  re-invitations with capped exponential backoff even without a
+  new discovery event, still under the single-peer rules.
+- **Persistence (fix round 4, M7):** the installation identity,
+  its code, the paired peer, and the pairing secret persist in
+  UserDefaults (`SyncPairingStore`), so a one-sided relaunch
+  reconnects as the same device and queued delivery resumes.
+  Reset/Unpair controls in the admin Sessions tab and the child
+  sync view clear the pairing and secret (identity is kept).
 - **Limits:** this is demo/local scope. The 6-digit code is a
   human-compared short secret, not a credential; MPC transport
   encryption (`encryptionPreference: .required`) protects the

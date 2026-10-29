@@ -29,6 +29,11 @@ struct SessionsView: View {
                             .disabled(peerCode.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                     Button("Retry sync now") { controller.service.handleReconnect() }
+                    Button("Reset / Unpair", role: .destructive) {
+                        controller.unpair()
+                        peerCode = ""
+                        status = "Unpaired — enter the code shown on the child to pair again."
+                    }
                 }
                 Section("Sessions from child (\(ui.snapshot.storedSessionCount))") {
                     if controller.sessionStore.allLogs.isEmpty {
@@ -47,6 +52,11 @@ struct SessionsView: View {
             .onAppear {
                 // Finding 4: deliver snapshot assignments on the main queue.
                 controller.service.onSnapshotChange = { snap in DispatchQueue.main.async { ui.snapshot = snap } }
+                // Round 4 (M6): a failed verification resets both
+                // sides; surface a retryable status here.
+                controller.transport.onPairingFailure = { _ in
+                    DispatchQueue.main.async { status = "Codes didn't match — re-enter the code shown on the child and tap Pair." }
+                }
                 ui.snapshot = controller.service.snapshot
                 status = controller.service.isPaired
                     ? "Sync started — paired" : "Sync started — enter the code shown on the child to pair"
