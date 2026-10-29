@@ -35,7 +35,7 @@ final class SimulatedShieldDemoStateTests: XCTestCase {
         demo.select(game, isSimulatedMode: true)
         let flowA = try XCTUnwrap(demo.flow(for: game, isSimulatedMode: true))
         recordPassingEffort(on: flowA)
-        XCTAssertEqual(flowA.finishChallenge().decision, .granted)
+        XCTAssertEqual(flowA.finishChallenge()?.decision, .granted)
         XCTAssertFalse(flowA.isShieldPresented)
 
         // Unlock B: the shared manager replaces A's window.
@@ -43,7 +43,7 @@ final class SimulatedShieldDemoStateTests: XCTestCase {
         let flowB = try XCTUnwrap(demo.flow(for: video, isSimulatedMode: true))
         XCTAssertTrue(flowB.isShieldPresented)
         recordPassingEffort(on: flowB)
-        XCTAssertEqual(flowB.finishChallenge().decision, .granted)
+        XCTAssertEqual(flowB.finishChallenge()?.decision, .granted)
         XCTAssertFalse(flowB.isShieldPresented)
 
         // Re-select A: shielded immediately, no stale unlocked state.
@@ -67,7 +67,7 @@ final class SimulatedShieldDemoStateTests: XCTestCase {
         demo.select(game, isSimulatedMode: true)
         let flow = try XCTUnwrap(demo.flow(for: game, isSimulatedMode: true))
         recordPassingEffort(on: flow)
-        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertEqual(flow.finishChallenge()?.decision, .granted)
         XCTAssertFalse(flow.isShieldPresented)
 
         let isolated = SimulatedShieldDemoState(directory: other)

@@ -20,10 +20,16 @@ public enum SimulatedShieldPresentationEvent: String, Equatable, Sendable {
 /// shielding and the timed unlock window come from `ShieldManager`
 /// (fronting a `SimulatedShieldBackend`), and the challenge gate is the
 /// real Epic 1 path — attempts and hint interactions record into an
-/// `EffortSessionRecorder`, `EffortScorer` decides, and only a granted
-/// score calls `grantUnlock`. Correctness is never an input (per the
-/// `EffortScoring` contract): any non-blank submitted answer is a
-/// genuine attempt.
+/// `EffortSessionRecorder`, the session-decision boundary
+/// `EffortSessionRecorder.evaluateAndLog` persists the grant/deny
+/// Decision, and only a granted score calls `grantUnlock`. Correctness
+/// is never an input (per the `EffortScoring` contract): any non-blank
+/// submitted answer is a genuine attempt.
+///
+/// Log-before-effect: the Decision is persisted before the unlock is
+/// applied. When the log write fails, no score returns, no unlock is
+/// applied, and the shield stays up with a retryable error — the same
+/// keep-effort-for-retry behavior as a denial or a refused grant.
 ///
 /// Presentation rule: the shield is presented if and only if simulated
 /// mode is forced on AND the manager reports the app shielded. Expiry
@@ -44,6 +50,9 @@ public final class SimulatedShieldFlow: ObservableObject {
     private let backend: SimulatedShieldBackend
     private var scorer: EffortScorer
     private var recorder: EffortSessionRecorder
+    /// Demo-scoped decision log: the same isolated directory as the
+    /// demo policy/window store (never production logging).
+    private let decisionLogger: DecisionLogger
 
     /// The demo app this flow guards.
     public let app: AppRef
@@ -63,19 +72,35 @@ public final class SimulatedShieldFlow: ObservableObject {
     @Published public private(set) var isShieldPresented: Bool = false
     /// Remaining unlock seconds on the manager's monotonic clock.
     @Published public private(set) var remainingUnlockTime: TimeInterval = 0
-    /// The most recent challenge score, if the challenge was finished.
+    /// The most recent challenge score, if the last finish logged a decision.
     @Published public private(set) var lastScore: EffortScore?
+    /// The persisted Decision for the most recent finished challenge, if logged.
+    @Published public private(set) var lastDecision: Decision?
+    /// The log-write failure from the most recent finish, if logging failed.
+    /// Set only when no Decision was persisted (and no unlock applied);
+    /// cleared by the next logged finish or a fresh challenge session.
+    @Published public private(set) var lastLogError: DecisionLogError?
+    /// Demo session context for the decision log: rotated on every fresh
+    /// challenge session, kept across denied/refused/failed retries.
+    public private(set) var decisionSessionId: String
+    /// Unlock minutes recorded in the Decision outcome. Defaults from
+    /// `unlockDuration` (rounded up, minimum 1); the demo passes the
+    /// policy practice minutes explicitly so the record matches the window.
+    public let decisionDurationMinutes: Int
     /// Decision lines rendered by the shield screen.
     public nonisolated static let unlockGrantedText = "Granted — unlock window open (simulated)."
     public nonisolated static let unlockGrantFailedText = "Effort passed but the unlock failed — try again."
     public nonisolated static let unlockDeniedText = "Denied — keep practicing to earn the unlock."
+    public nonisolated static let unlockLogFailedText = "Couldn't save the unlock decision — try again."
 
     /// The decision line for the shield screen, or nil before the first
-    /// finish. A granted score reports an open window only when the
-    /// shield actually dismissed; a granted score with the shield still
-    /// up (the manager refused the grant) reports a retryable failure
-    /// instead of claiming an open window.
+    /// finish. A log-write failure reports a retryable error (no score
+    /// exists to report). Otherwise a granted score reports an open
+    /// window only when the shield actually dismissed; a granted score
+    /// with the shield still up (the manager refused the grant) reports
+    /// a retryable failure instead of claiming an open window.
     public var challengeDecisionText: String? {
+        if lastLogError != nil { return Self.unlockLogFailedText }
         guard let score = lastScore else { return nil }
         switch score.decision {
         case .granted:
@@ -98,7 +123,10 @@ public final class SimulatedShieldFlow: ObservableObject {
         scorer: EffortScorer,
         recorder: EffortSessionRecorder,
         unlockDuration: TimeInterval,
-        isSimulatedMode: Bool
+        isSimulatedMode: Bool,
+        decisionLogger: DecisionLogger,
+        decisionSessionId: String = UUID().uuidString,
+        decisionDurationMinutes: Int? = nil
     ) {
         self.manager = manager
         self.backend = backend
@@ -108,6 +136,10 @@ public final class SimulatedShieldFlow: ObservableObject {
         self.recorder = recorder
         self.unlockDuration = unlockDuration
         self.isSimulatedMode = isSimulatedMode
+        self.decisionLogger = decisionLogger
+        self.decisionSessionId = decisionSessionId
+        self.decisionDurationMinutes = decisionDurationMinutes
+            ?? max(1, Int(ceil(unlockDuration / 60)))
         let bankPrompt = FallbackQuestionBank.demo.proposal(
             for: .multiplicationFacts, rotationIndex: 0
         )?.promptText
@@ -141,28 +173,57 @@ public final class SimulatedShieldFlow: ObservableObject {
         recorder.recordInteraction()
     }
 
-    /// Finishes the challenge: scores the recorded session with the real
-    /// `EffortScorer` and, only on a granted score, opens the timed
-    /// unlock window through `ShieldManager`, dismissing the shield. A
-    /// denied score — or a grant the manager refuses — leaves the shield
-    /// presented with the recorded effort kept for a retry. When a
-    /// previous unlock has ended since the last tick, the shield
-    /// re-presents and a fresh session starts BEFORE scoring, so stale
-    /// passing effort can never grant a free window. Returns the score
-    /// for the result narration.
+    /// Finishes the challenge: scores the recorded session through the
+    /// session-decision boundary (`EffortSessionRecorder.evaluateAndLog`,
+    /// which persists the grant/deny Decision) and, only on a granted
+    /// score, opens the timed unlock window through `ShieldManager`,
+    /// dismissing the shield. The Decision is persisted before the
+    /// unlock is applied; when logging throws, nothing returns, no
+    /// unlock is applied, and the shield stays up with a retryable
+    /// error — the same keep-effort-for-retry behavior as a denied
+    /// score or a grant the manager refuses. When a previous unlock has
+    /// ended since the last tick, the shield re-presents and a fresh
+    /// session starts BEFORE scoring, so stale passing effort can never
+    /// grant a free window. Returns the score for the result narration,
+    /// or nil when the log write failed.
     @discardableResult
-    public func finishChallenge() -> EffortScore {
+    public func finishChallenge() -> EffortScore? {
         manager.refresh()
         remainingUnlockTime = manager.remainingUnlockTime
         updatePresentation()
-        let score = scorer.evaluate(recorder.signals())
-        lastScore = score
-        if score.decision == .granted {
+        let logged: (score: EffortScore, decision: Decision)
+        do {
+            logged = try recorder.evaluateAndLog(
+                scorer,
+                logger: decisionLogger,
+                sessionId: decisionSessionId,
+                appId: app.id,
+                durationMinutes: decisionDurationMinutes
+            )
+        } catch let error as DecisionLogError {
+            lastScore = nil
+            lastDecision = nil
+            lastLogError = error
+            remainingUnlockTime = manager.remainingUnlockTime
+            updatePresentation()
+            return nil
+        } catch {
+            lastScore = nil
+            lastDecision = nil
+            lastLogError = .persistenceFailed
+            remainingUnlockTime = manager.remainingUnlockTime
+            updatePresentation()
+            return nil
+        }
+        lastScore = logged.score
+        lastDecision = logged.decision
+        lastLogError = nil
+        if logged.score.decision == .granted {
             manager.grantUnlock(for: app, category: category, duration: unlockDuration)
         }
         remainingUnlockTime = manager.remainingUnlockTime
         updatePresentation()
-        return score
+        return logged.score
     }
 
     /// Re-evaluates expiry and presentation. The view calls this on a
@@ -183,14 +244,18 @@ public final class SimulatedShieldFlow: ObservableObject {
     }
 
     /// Starts a fresh challenge session — a new recorder, a new
-    /// per-session scorer draw, and the previous result cleared. Runs
-    /// only when the shield re-presents after an unlock ends (expiry or
-    /// a replaced window), so a denied challenge or a refused grant
-    /// keeps its recorded effort for a retry.
+    /// per-session scorer draw, a new decision session id, and the
+    /// previous result cleared. Runs only when the shield re-presents
+    /// after an unlock ends (expiry or a replaced window), so a denied
+    /// challenge, a refused grant, or a failed log write keeps its
+    /// recorded effort for a retry.
     private func resetChallengeSession() {
         recorder = EffortSessionRecorder(startedAt: Date())
         scorer = EffortScorer(floorSettings: scorer.floorSettings, weights: scorer.weights)
+        decisionSessionId = UUID().uuidString
         lastScore = nil
+        lastDecision = nil
+        lastLogError = nil
     }
 
     private static let fallbackPrompt =

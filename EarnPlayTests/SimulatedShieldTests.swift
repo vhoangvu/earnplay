@@ -78,7 +78,8 @@ final class SimulatedShieldTests: XCTestCase {
             scorer: EffortScorer(threshold: 8),
             recorder: EffortSessionRecorder(startedAt: Date()),
             unlockDuration: 2,
-            isSimulatedMode: true
+            isSimulatedMode: true,
+            decisionLogger: DecisionLogger(directory: directory)
         )
     }
 
@@ -98,7 +99,7 @@ final class SimulatedShieldTests: XCTestCase {
         flow.submitAttempt(answer: "56 again")
         flow.useHint()
         flow.useHint()
-        XCTAssertEqual(flow.finishChallenge().decision, .granted)
+        XCTAssertEqual(flow.finishChallenge()?.decision, .granted)
         XCTAssertFalse(flow.isShieldPresented)
         XCTAssertEqual(flow.presentationEvents, [.presented, .dismissed])
         XCTAssertEqual(flow.remainingUnlockTime, 2, accuracy: 0.001)

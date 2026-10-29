@@ -8,9 +8,11 @@ import EarnPlayCore
 /// (`Application Support/EarnPlay/SimulatedDemo/`, separate from any
 /// real policy cache) fronting a `SimulatedShieldBackend`, plus one
 /// `SimulatedShieldFlow` per tapped demo app. Unlocks use the demo
-/// policy's practice duration. Nothing here touches ManagedSettings or
-/// FamilyControls; real enforcement needs the T0.4 entitlement
-/// (v1, not filed).
+/// policy's practice duration. Decision logging is demo-scoped too: one
+/// `DecisionLogger` over the same isolated directory, so demo grants
+/// and denials never touch production logging. Nothing here touches
+/// ManagedSettings or FamilyControls; real enforcement needs the T0.4
+/// entitlement (v1, not filed).
 @MainActor
 final class SimulatedShieldDemoState: ObservableObject {
     struct DemoApp {
@@ -22,6 +24,7 @@ final class SimulatedShieldDemoState: ObservableObject {
     private let policyStore: PolicyStore
     private let manager: ShieldManager
     private let backend = SimulatedShieldBackend()
+    private let decisionLogger: DecisionLogger
     private var flows: [String: SimulatedShieldFlow] = [:]
 
     let apps: [DemoApp] = [
@@ -39,11 +42,13 @@ final class SimulatedShieldDemoState: ObservableObject {
 
     @Published var activeAppID: String?
 
-    /// - Parameter directory: Policy/window store root. Defaults to
-    ///   the persistent demo path; tests inject a temporary directory.
+    /// - Parameter directory: Policy/window/decision-log store root.
+    ///   Defaults to the persistent demo path; tests inject a temporary
+    ///   directory.
     init(directory: URL? = nil) {
         let directory = directory ?? PolicyStore.defaultDirectory()
             .appendingPathComponent("SimulatedDemo", isDirectory: true)
+        self.decisionLogger = DecisionLogger(directory: directory)
         let store = PolicyStore(directory: directory)
         if store.storedVersion == 0 {
             _ = store.apply(Policy(
@@ -92,7 +97,9 @@ final class SimulatedShieldDemoState: ObservableObject {
             scorer: EffortScorer(),
             recorder: EffortSessionRecorder(startedAt: Date()),
             unlockDuration: TimeInterval(minutes) * 60,
-            isSimulatedMode: isSimulatedMode
+            isSimulatedMode: isSimulatedMode,
+            decisionLogger: decisionLogger,
+            decisionDurationMinutes: minutes
         )
         flows[id] = flow
         return flow

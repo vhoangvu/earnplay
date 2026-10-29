@@ -85,11 +85,11 @@ struct SimulatedShieldView: View {
                         Text(score.narration)
                             .font(.callout)
                             .accessibilityIdentifier("challengeResultLabel")
-                        if let decisionText = flow.challengeDecisionText {
-                            Text(decisionText)
-                                .font(.callout.bold())
-                                .accessibilityIdentifier("challengeDecisionLabel")
-                        }
+                    }
+                    if let decisionText = flow.challengeDecisionText {
+                        Text(decisionText)
+                            .font(.callout.bold())
+                            .accessibilityIdentifier("challengeDecisionLabel")
                     }
                 }
                 .padding()
