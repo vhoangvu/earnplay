@@ -70,3 +70,19 @@ model size, and the exact CI gap are recorded in
 `Docs/ModelRuntimeSpike.md`. Without setup, the package still builds
 (runtime reports unavailable) and the offline integration test skips
 rather than passing vacuously.
+
+## Eval harness (T5.1)
+
+Scripted end-to-end sessions for five personas (good-faith, guessing,
+idling, manipulative, struggling child), scored against the LLD's fixed
+pass criteria. One command, from the repo root, locally or in CI
+(stub-only — no model needed):
+
+```sh
+swift run --package-path EarnPlayCore eval-harness
+```
+
+Prints a per-criterion pass/fail scorecard, writes
+`EarnPlayCore/EvalHarness/eval-report-latest.json` next to the committed
+baseline, and exits nonzero on any criterion failure or regression.
+Details: `Docs/EvalHarness.md`.
