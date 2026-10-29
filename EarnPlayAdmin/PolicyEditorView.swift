@@ -252,6 +252,9 @@ struct PolicyEditorView: View {
     // MARK: - Load / save
 
     private func reload() {
+        // Deliver a save interrupted between the policy write and the
+        // queue write (relaunch recovery, no manual re-save needed).
+        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: queue)
         let current = store.currentPolicy
         draft = current
         baseVersion = current.version

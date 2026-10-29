@@ -380,4 +380,152 @@ final class PolicyEditorTests: XCTestCase {
         )
         XCTAssertTrue(PolicyUpdateQueue(directory: queueDir).isEmpty)
     }
+
+    // MARK: - Failed policy writes (Copilot fix round 1, Finding 1)
+
+    func testFailedPersistenceDoesNotEnqueueAndReportsFailure() throws {
+        var shouldFail = false
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let store = PolicyStore(directory: storeDir, dataWriter: { data, url in
+            if shouldFail {
+                throw NSError(domain: "PolicyEditorTests", code: 1)
+            }
+            try data.write(to: url, options: [.atomic])
+        })
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let queue = freshQueue()
+
+        shouldFail = true
+        var draft = store.currentPolicy
+        draft.movementSettings.maxReps = 50
+        XCTAssertThrowsError(
+            try PolicyEditorSave.save(draft: draft, adminStore: store, queue: queue)
+        ) { error in
+            XCTAssertEqual(
+                error as? PolicyEditorSaveError,
+                .persistenceFailed(currentVersion: 9, attemptedVersion: 10)
+            )
+        }
+        // Nothing queued, store unchanged, no intent left behind — and
+        // the retry stamps the same version instead of skipping it.
+        XCTAssertTrue(queue.isEmpty)
+        XCTAssertEqual(store.storedVersion, 9)
+        XCTAssertNil(queue.loadSaveIntent())
+        shouldFail = false
+        let (update, _) = try PolicyEditorSave.save(
+            draft: draft, adminStore: store, queue: queue
+        )
+        XCTAssertEqual(update.version, 10)
+        XCTAssertEqual(queue.pendingUpdates(), [update])
+    }
+
+    func testStaleStoreReadDoesNotEnqueueAndReportsFailure() throws {
+        // Store A caches v5; store B (same directory) advances the
+        // persisted policy to v10. A's save stamps from its stale
+        // cache (v6) and `apply` must reject it: nothing queued.
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let storeA = PolicyStore(directory: storeDir)
+        XCTAssertEqual(storeA.apply(fixturePolicy(version: 5)), .applied)
+        let storeB = PolicyStore(directory: storeDir)
+        XCTAssertEqual(storeB.apply(fixturePolicy(version: 10)), .applied)
+        XCTAssertEqual(storeA.storedVersion, 5)
+        let queue = freshQueue()
+
+        var draft = storeA.currentPolicy
+        draft.movementSettings.maxReps = 50
+        XCTAssertThrowsError(
+            try PolicyEditorSave.save(draft: draft, adminStore: storeA, queue: queue)
+        ) { error in
+            XCTAssertEqual(
+                error as? PolicyEditorSaveError,
+                .staleVersion(currentVersion: 10, attemptedVersion: 6)
+            )
+        }
+        XCTAssertTrue(queue.isEmpty)
+        XCTAssertNil(queue.loadSaveIntent())
+        XCTAssertEqual(storeA.storedVersion, 10)
+    }
+
+    // MARK: - Crash recovery (Copilot fix round 1, Finding 2)
+
+    func testCrashBetweenPolicyWriteAndQueueWriteRecoversOnRelaunch() throws {
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let store = PolicyStore(directory: storeDir)
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let queue = PolicyUpdateQueue(directory: queueDir)
+
+        // Simulate the crash: intent journaled, policy durable, queue
+        // write never happened.
+        var draft = store.currentPolicy
+        draft.movementSettings.maxReps = 50
+        let update = PolicyEditorSave.updatedPolicy(
+            draft: draft, baseVersion: store.storedVersion
+        )
+        try queue.writeSaveIntent(update)
+        XCTAssertEqual(store.apply(update), .applied)
+
+        // Relaunch: a fresh queue over the directory recovers the
+        // saved version with no further manual save.
+        let relaunched = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertEqual(relaunched.pendingUpdates(), [update])
+
+        // Recovery completes: intent cleared, queue keeps the update,
+        // and the next save continues at v11 with both versions queued.
+        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: relaunched)
+        XCTAssertNil(relaunched.loadSaveIntent())
+        XCTAssertEqual(relaunched.pendingUpdates(), [update])
+        var next = store.currentPolicy
+        next.movementSettings.maxReps = 60
+        let (update2, _) = try PolicyEditorSave.save(
+            draft: next, adminStore: store, queue: relaunched
+        )
+        XCTAssertEqual(update2.version, 11)
+        XCTAssertEqual(relaunched.pendingUpdates().map(\.version), [10, 11])
+    }
+
+    func testInterruptedSaveBeforePolicyWriteRecoversStoreAndQueue() throws {
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let store = PolicyStore(directory: storeDir)
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let queue = PolicyUpdateQueue(directory: queueDir)
+
+        // Simulate a stop after journaling but before the policy
+        // write: the store never saw v10.
+        var draft = store.currentPolicy
+        draft.movementSettings.maxReps = 50
+        let update = PolicyEditorSave.updatedPolicy(
+            draft: draft, baseVersion: store.storedVersion
+        )
+        try queue.writeSaveIntent(update)
+
+        // Relaunch recovery advances the store first, then the queue.
+        let relaunched = PolicyUpdateQueue(directory: queueDir)
+        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: relaunched)
+        XCTAssertEqual(store.storedVersion, 10)
+        XCTAssertEqual(store.currentPolicy, update)
+        XCTAssertEqual(relaunched.pendingUpdates(), [update])
+        XCTAssertNil(relaunched.loadSaveIntent())
+    }
+
+    // MARK: - Cross-instance queue (Copilot fix round 1, Finding 3)
+
+    func testTwoQueueInstancesInterleavingCannotLoseUndeliveredUpdate() throws {
+        // Copilot's counterexample: A and B both load [v1]; A enqueues
+        // v2; B removes delivered v1. B must write [v2], not [].
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let queueA = PolicyUpdateQueue(directory: queueDir)
+        try queueA.enqueue(fixturePolicy(version: 1))
+        let queueB = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertEqual(queueA.pendingUpdates().map(\.version), [1])
+        XCTAssertEqual(queueB.pendingUpdates().map(\.version), [1])
+
+        try queueA.enqueue(fixturePolicy(version: 2))
+        try queueB.removeDelivered(upToVersion: 1)
+
+        XCTAssertEqual(queueB.pendingUpdates().map(\.version), [2])
+        let reopened = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertEqual(reopened.pendingUpdates().map(\.version), [2])
+    }
 }

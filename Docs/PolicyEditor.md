@@ -39,6 +39,14 @@ T4.6's SyncService will drain via `pendingUpdates()` /
 `removeDelivered(upToVersion:)`. **Discard changes** reloads the last
 saved policy.
 
+Durability: each save journals a save-intent file before touching the
+admin store, requires the store write to report `.applied` before
+queueing (a stale or failed write throws and queues nothing), and
+recovers on relaunch — a version saved to the store but never queued
+is re-merged into the queue without another manual save. Queue
+writes re-read under a cross-instance file lock, so concurrent queue
+owners cannot lose each other's updates.
+
 ## Manual test (human verifier)
 
 Simulator for this task: iPhone 17 "EarnPlay-T41"
