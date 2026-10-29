@@ -50,6 +50,39 @@ and tutor/model text is likewise rendered only as `Text` (never
 executable, never linked). A test drives injection-shaped input
 through the view and asserts the scripted tutor stream is unchanged.
 
+## Fix round 1 (issue #11, PR #57 review)
+
+- Advancing to a new question stops any reading in progress: when
+  `ChatConversationViewModel.apply` appends a new question turn it
+  calls `ReadAloudService.startNewItem()` before
+  `messageDidAppear` (the `SpeakerButton` integration contract).
+  Repeats/updates of a turn already in the thread and new
+  non-question turns leave the current reading alone.
+- Completing the last question is an explicit state, not an empty
+  update behind a live composer: the engine returns
+  `composer: .sessionComplete`, the view renders "Practice
+  complete. Nice work." with a "Start again" restart action instead
+  of the text field/Hint/Send, and the view model refuses further
+  submissions or hint requests so no orphan child bubble can appear.
+  Restart clears the thread and the engine serves the first
+  question again with fresh hint ladders.
+- Probe replies are handled by the engine, not graded: after a
+  non-matching first answer the engine appends its "show me one
+  step" probe and marks a probe pending. The next submission is
+  acknowledged as the child's explanation ("Thanks for showing
+  your thinking…"), is not checked against the answer, is not
+  recorded as an answer submission, and is not labelled a
+  revision; the submission after that is graded normally.
+- New tests in `EarnPlayTests/ChatFixRound1Tests.swift`: one
+  regression test per finding above, plus hosted-view tests that
+  host `ChatConversationView` in a window and assert the rendered
+  surface (OCR of a snapshot in reading order, rendered
+  speaker-symbol layer per tutor bubble, rendered Hint/Send, a
+  speaker action through the shared service, no score-like
+  rendered text, and the rendered completion state). The existing
+  view-model tests in `ChatConversationTests.swift` are unchanged
+  and kept.
+
 ## Automated test
 
 `EarnPlayTests/ChatConversationTests.swift` (XCTest):

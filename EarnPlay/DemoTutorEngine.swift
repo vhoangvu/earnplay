@@ -12,7 +12,11 @@ import EarnPlayCore
 /// tutor lines chosen here, never in the view. Child text is treated
 /// as an answer string (data) and compared by the solver only; it is
 /// never used to build a prompt and never changes this engine's flow
-/// beyond the solver verdict for the current question.
+/// beyond the solver verdict for the current question — except while
+/// a probe is pending, when the next submission is treated as the
+/// child's explanation of their step (acknowledged, not graded).
+/// Finishing the last question reports an explicit session-complete
+/// composer state; `startSession()` after that restarts the session.
 final class DemoTutorEngine: ChatTutorEngine {
     private struct Item {
         let result: QuestionGenerationResult
@@ -25,6 +29,12 @@ final class DemoTutorEngine: ChatTutorEngine {
     private var attempted: Set<Int> = []
     private var lastAnswer: String?
     private var messageSequence = 0
+    /// True while a probe ("show me one step") is waiting for the
+    /// child's explanation. The next submission answers the probe:
+    /// it is acknowledged, never graded as an answer, and never
+    /// labelled a revision. Cleared when the explanation arrives,
+    /// when the question is answered, or on session (re)start.
+    private var awaitingProbeReply = false
 
     init(maxQuestions: Int = 3) {
         // Serve verified fallback questions deterministically. A
@@ -48,6 +58,15 @@ final class DemoTutorEngine: ChatTutorEngine {
     var totalQuestions: Int { items.count }
 
     func startSession() -> ChatEngineUpdate {
+        // Restart after completion: reset the session state and
+        // serve the first question again with fresh hint ladders.
+        if current == nil && !items.isEmpty {
+            index = 0
+            attempted = []
+            lastAnswer = nil
+            awaitingProbeReply = false
+            items = items.map { Item(result: $0.result, ladder: HintLadder(result: $0.result)) }
+        }
         guard let item = current else {
             return ChatEngineUpdate(turns: [.tutor(nextMessage(
                 text: "Let's practise together. Take your time.",
@@ -60,7 +79,28 @@ final class DemoTutorEngine: ChatTutorEngine {
     }
 
     func submitAnswer(_ plainText: String) -> ChatEngineUpdate {
-        guard let item = current else { return ChatEngineUpdate() }
+        guard let item = current else {
+            // Explicit session-complete state, never a silent empty
+            // update behind an editable composer.
+            return ChatEngineUpdate(composer: items.isEmpty ? nil : .sessionComplete)
+        }
+        // A pending probe takes this submission as the child's
+        // explanation: acknowledge the thinking, do not grade it
+        // against the answer, do not record it as an answer
+        // submission, and do not label it a revision. The child is
+        // then back to answering the same question.
+        if awaitingProbeReply {
+            awaitingProbeReply = false
+            let progress = ChatProgress(totalQuestions: items.count,
+                                        attemptedQuestions: attempted.count)
+            return ChatEngineUpdate(
+                turns: [.tutor(nextMessage(
+                    text: "Thanks for showing your thinking. Try the question again when you are ready.",
+                    kind: .encouragement))],
+                progress: progress,
+                composer: composer(for: item),
+                submittedTurnIsRevision: false)
+        }
         let isRevision = lastAnswer.map { $0 != plainText } ?? false
         _ = item.ladder.recordAnswerSubmission(plainText)
         let firstAttempt = !attempted.contains(index)
@@ -70,6 +110,7 @@ final class DemoTutorEngine: ChatTutorEngine {
 
         switch solver.checkAnswer(item.result.question, proposedAnswer: plainText) {
         case .correct:
+            awaitingProbeReply = false
             index += 1
             lastAnswer = nil
             var turns: [ChatTurn] = [.tutor(nextMessage(
@@ -83,7 +124,7 @@ final class DemoTutorEngine: ChatTutorEngine {
             turns = [.tutor(nextMessage(
                 text: "Nice work. That was a good practice session.", kind: .encouragement))]
             return ChatEngineUpdate(turns: turns, progress: progress,
-                                    composer: .text, submittedTurnIsRevision: isRevision)
+                                    composer: .sessionComplete, submittedTurnIsRevision: isRevision)
         case .incorrect, .invalid:
             // No failure state: encouragement, then a probe asking the
             // child to show a step. A hint stays one tap away.
@@ -96,6 +137,9 @@ final class DemoTutorEngine: ChatTutorEngine {
                                    kind: .probe)),
             ]
             if !firstAttempt { turns.removeLast() }
+            // A probe was just appended: the next submission is the
+            // child's explanation, handled at the top of this method.
+            awaitingProbeReply = firstAttempt
             return ChatEngineUpdate(turns: turns, progress: progress,
                                     composer: composer(for: item),
                                     submittedTurnIsRevision: isRevision)
@@ -103,7 +147,12 @@ final class DemoTutorEngine: ChatTutorEngine {
     }
 
     func requestHint() -> ChatEngineUpdate {
-        guard let item = current, let hint = item.ladder.requestHint() else {
+        guard let item = current else {
+            // Finished session: restate the explicit complete state
+            // instead of silently returning nothing.
+            return ChatEngineUpdate(composer: items.isEmpty ? nil : .sessionComplete)
+        }
+        guard let hint = item.ladder.requestHint() else {
             return ChatEngineUpdate()
         }
         return ChatEngineUpdate(turns: [.tutor(hint.tutorMessage)])

@@ -38,6 +38,10 @@ enum ChatComposerSpec: Equatable {
     case text
     case numberPad
     case choices([String])
+    /// The engine reports the session finished: the view renders a
+    /// completion state with a restart action instead of an editable
+    /// composer, and the view model refuses further submissions.
+    case sessionComplete
 }
 
 /// Star progress for the slim header: one star per question, filled as
@@ -135,11 +139,21 @@ final class ChatConversationViewModel: ObservableObject {
     /// Message ids that must carry a speaker button, in thread order.
     var speakerMessageIDs: [String] { tutorMessages.map(\.id) }
 
+    /// True once the engine reports the session complete. The
+    /// composer is then replaced by the completion state and every
+    /// submission path below refuses to run.
+    var isSessionComplete: Bool { composer == .sessionComplete }
+
     /// Every string the screen renders as text, in layout order:
     /// header is graphical (stars only), then message texts, then
     /// composer chrome. Used by tests to prove no score is displayed.
     var visibleTextStrings: [String] {
         var strings = messages.map(\.displayedText)
+        if isSessionComplete {
+            strings.append("Practice complete. Nice work.")
+            strings.append("Start again")
+            return strings
+        }
         strings.append("Hint")
         strings.append("Send")
         if case .choices(let options) = composer { strings.append(contentsOf: options) }
@@ -170,7 +184,21 @@ final class ChatConversationViewModel: ObservableObject {
         submit(text: text)
     }
 
+    /// Starts a fresh session after completion: clears the thread
+    /// and renders the engine's opening update. The engine owns the
+    /// reset of its own question state in `startSession()`.
+    func restartSession() {
+        guard isSessionComplete else { return }
+        messages = []
+        draft = ""
+        childSequence = 0
+        apply(engine.startSession())
+    }
+
     private func submit(text: String) {
+        // A completed session has no editable composer; refuse here
+        // too so no orphan child bubble can appear behind it.
+        guard !isSessionComplete else { return }
         childSequence += 1
         // The child's own words appear in the thread exactly as data.
         // Whether the submission counts as a revision is the engine's
@@ -181,14 +209,28 @@ final class ChatConversationViewModel: ObservableObject {
         apply(update)
     }
 
-    /// Hint button: always visible, never disabled in the view.
+    /// Hint button: always visible beside the composer while the
+    /// session is active, never disabled in the view. Once the
+    /// session is complete the button is not rendered, and a stray
+    /// call here is refused instead of silently doing nothing.
     func requestHint() {
+        guard !isSessionComplete else { return }
         apply(engine.requestHint())
     }
 
     func apply(_ update: ChatEngineUpdate) {
         for turn in update.turns {
             if case .tutor(let message) = turn {
+                // SpeakerButton's integration contract: a NEW
+                // question starts a new item, so any reading of the
+                // previous question or hint stops before this turn
+                // renders. Repeats/updates of a turn already in the
+                // thread, and new non-question turns, leave the
+                // current reading alone.
+                let isNewTurn = !messages.contains(where: { $0.id == turn.id })
+                if isNewTurn && message.kind == .question {
+                    speech.startNewItem()
+                }
                 speech.messageDidAppear(message)
                 if let index = messages.firstIndex(where: { $0.id == turn.id }) {
                     messages[index] = turn
@@ -308,7 +350,35 @@ struct ChatConversationView: View {
         }
     }
 
+    @ViewBuilder
     private var composerBar: some View {
+        if viewModel.isSessionComplete {
+            completionBar
+        } else {
+            activeComposerBar
+        }
+    }
+
+    // Session-complete state: no editable composer, no Hint/Send.
+    // The only action offered starts a fresh session.
+    private var completionBar: some View {
+        VStack(spacing: 8) {
+            Text("Practice complete. Nice work.")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(ChatDesign.text)
+            Button("Start again") { viewModel.restartSession() }
+                .buttonStyle(.borderedProminent)
+                .tint(ChatDesign.primary)
+                .frame(minHeight: 44)
+                .accessibilityIdentifier("chatRestartButton")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(ChatDesign.surface)
+        .accessibilityIdentifier("chatSessionComplete")
+    }
+
+    private var activeComposerBar: some View {
         VStack(spacing: 8) {
             if case .choices(let options) = viewModel.composer {
                 HStack(spacing: 8) {
