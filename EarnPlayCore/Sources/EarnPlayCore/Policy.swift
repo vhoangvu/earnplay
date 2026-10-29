@@ -142,13 +142,34 @@ public struct UnlockDurations: Codable, Equatable, Sendable {
 /// Floor-rule parameters (LLD §2.1), read by EffortScorer.
 public struct EffortFloorSettings: Codable, Equatable, Sendable {
     /// Minimum genuine attempts required before an unlock. Default 1.
+    /// Clamped to at least 1: policy may strengthen the mandatory
+    /// floor, never remove it.
     public var minGenuineAttempts: Int
     /// Minimum real hint or follow-up interactions required. Default 1.
+    /// Clamped to at least 1, like `minGenuineAttempts`.
     public var minHintOrFollowUpInteractions: Int
 
     public init(minGenuineAttempts: Int, minHintOrFollowUpInteractions: Int) {
-        self.minGenuineAttempts = minGenuineAttempts
-        self.minHintOrFollowUpInteractions = minHintOrFollowUpInteractions
+        self.minGenuineAttempts = max(1, minGenuineAttempts)
+        self.minHintOrFollowUpInteractions = max(1, minHintOrFollowUpInteractions)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case minGenuineAttempts
+        case minHintOrFollowUpInteractions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        minGenuineAttempts = max(1, try container.decode(Int.self, forKey: .minGenuineAttempts))
+        minHintOrFollowUpInteractions = max(
+            1, try container.decode(Int.self, forKey: .minHintOrFollowUpInteractions))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(max(1, minGenuineAttempts), forKey: .minGenuineAttempts)
+        try container.encode(max(1, minHintOrFollowUpInteractions), forKey: .minHintOrFollowUpInteractions)
     }
 
     public static let `default` = EffortFloorSettings(

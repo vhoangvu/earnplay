@@ -159,12 +159,20 @@ public final class PolicyStore: @unchecked Sendable {
         guard policy.version > cached.version else {
             return .rejectedStaleVersion(currentVersion: cached.version)
         }
+        // Normalize sub-floor effort minima (e.g. a struct mutated to 0
+        // after construction): policy may strengthen the mandatory
+        // 1+1 floor, never remove it. Decoding already clamps, so this
+        // covers only in-memory structs built around the clamped paths.
+        var sanitized = policy
+        sanitized.effortFloorSettings = EffortFloorSettings(
+            minGenuineAttempts: policy.effortFloorSettings.minGenuineAttempts,
+            minHintOrFollowUpInteractions: policy.effortFloorSettings.minHintOrFollowUpInteractions)
         do {
-            try persist(policy)
+            try persist(sanitized)
         } catch {
             return .persistenceFailed(currentVersion: cached.version)
         }
-        cached = policy
+        cached = sanitized
         return .applied
     }
 
