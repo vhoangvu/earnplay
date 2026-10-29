@@ -36,6 +36,24 @@ tests run without any entitlement.
   an explicit category withholds only that category; built-ins never
   need coverage.
 
+## Default-deny for new apps (T2.5)
+
+- Two enforcement layers. An install observed via `noteInstalledApp`
+  (the host-side simulated install transition, driven after shields
+  apply) is shielded individually in the applied configuration, so the
+  backend itself — the launch gate in the simulated scope — reports
+  blocked until a policy sync classifies the app. An app never observed
+  stays open only when allowlisted or unlocked, so an unknown token or
+  category resolves to locked rather than to allowed.
+- Observations are install facts, not picker state: replacing the
+  enumeration never clears them, so an installed-but-unpicked app stays
+  shielded (including with an empty enumeration). An allowlisted install
+  withholds its category like a picked app, and an unlocked install
+  stays open; category knowledge is sticky and never regresses.
+- T2.2 semantics for classified apps are unchanged, and there is still
+  no per-app exemption over a category shield. Demo scope is the
+  simulated backend; no real device shields.
+
 ## Unlock timers
 
 - Unlocks run on an injected suspend-inclusive monotonic clock
