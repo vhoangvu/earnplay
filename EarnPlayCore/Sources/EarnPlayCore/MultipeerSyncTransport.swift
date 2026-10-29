@@ -13,6 +13,12 @@ import MultipeerConnectivity
 /// (H3); trusted peers are re-invited on rediscovery and on a
 /// dropped session with backoff (H4); pairing stays provisional
 /// until mutual authentication completes on both sides (M6).
+/// Round 5: secret establishment only on a fresh-mutual session
+/// (item 1); data-plane authorization bound to the authenticated
+/// session instance in both directions (item 2); unpair rejects a
+/// pending invitation (item 4); one outstanding invitation and
+/// handshake at a time (item 5); an unanswered challenge restores
+/// the manual request and is answered on acceptance (item 6).
 public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked Sendable {
     public enum Role: Sendable { case browser, advertiser }
     public static let serviceType = "earnplay-sync"
@@ -40,6 +46,17 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
     private var remoteVerified = false
     private var verifiedPeer: PeerIdentity?
     private var dataPlanePeer: PeerIdentity?
+    // Round 5 (items 1-2): the data plane is bound to the exact
+    // session instance that authenticated; a second instance claiming
+    // the same stable identity is held unauthenticated.
+    private var dataPlaneBinding = DataPlaneBinding()
+    // Round 5 (item 5): one outstanding browser-side handshake.
+    private var activeHandshakeHandle: String?
+    // Round 5 (item 6): a challenge this side cannot answer yet (no
+    // corrected code after a mismatch) is stashed, not dropped, so
+    // acceptance can answer it and restart both directions.
+    private var pendingRemoteChallengeNonce: String?
+    private var pendingRemoteChallengeFrom: PeerIdentity?
     private var reconnectWork: DispatchWorkItem?
     private var reconnectAttempt = 0
     private var reconnectGeneration = 0
@@ -146,7 +163,11 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         stateLock.lock(); defer { stateLock.unlock() }
         guard let session, !session.connectedPeers.isEmpty else { return false }
         guard let paired = pairing.pairedPeer, dataPlanePeer == paired else { return false }
-        return session.connectedPeers.contains { identity(for: $0) == paired }
+        // Round 5 (item 2): identity match is not enough — the live
+        // peer instance must be the authenticated session instance.
+        return session.connectedPeers.contains {
+            dataPlaneBinding.authorizes(peer: paired, sessionHandle: handle(for: $0))
+        }
     }
     public func start() {
         let s = MCSession(peer: peerID, securityIdentity: nil, encryptionPreference: .required)
@@ -178,6 +199,8 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         peerBook = DiscoveredPeerBook(); mcPeersByStableID.removeAll()
         issuedChallenge = nil; trustedNonce = nil; trustedPending = false
         remoteVerified = false; verifiedPeer = nil; dataPlanePeer = nil
+        dataPlaneBinding.clear(); activeHandshakeHandle = nil
+        pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
         stateLock.unlock()
         resolver.forgetAll()
         pairing.reset()
@@ -188,11 +211,17 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
     /// retained pairing; the installation identity is kept.
     public func unpair() {
         cancelReconnect()
+        // Round 5 (item 4): reject and clear any pending invitation,
+        // or the advertiser's !hasPending guard would refuse every
+        // later invitation until the app restarts.
+        rejectPendingInvitation()
         stateLock.lock()
         let oldSession = session
         dataPlanePeer = nil; remoteVerified = false; verifiedPeer = nil
         trustedNonce = nil; trustedPending = false; issuedChallenge = nil
         pendingManualPeerID = nil; pendingManualIdentity = nil
+        dataPlaneBinding.clear(); activeHandshakeHandle = nil
+        pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
         stateLock.unlock()
         pairing.unpair()
         oldSession?.disconnect()
@@ -238,7 +267,11 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         guard let currentSession = session, dataPlanePeer == paired else {
             stateLock.unlock(); throw SyncTransportError.notConnected
         }
-        let targets = currentSession.connectedPeers.filter { identity(for: $0) == paired }
+        // Round 5 (item 2): uploads go only to the authenticated
+        // session instance, never to a duplicate claiming its identity.
+        let targets = currentSession.connectedPeers.filter {
+            dataPlaneBinding.authorizes(peer: paired, sessionHandle: handle(for: $0))
+        }
         stateLock.unlock()
         guard !targets.isEmpty else { throw SyncTransportError.notConnected }
         // session.send runs outside the lock: it must never be able
@@ -263,8 +296,11 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         var data = Data(Self.handshakePrefix.utf8); data.append(payload)
         try? currentSession.send(data, toPeers: [mcPeer], with: .reliable)
     }
-    private func openDataPlane(for remote: PeerIdentity, mcPeer: MCPeerID) {
+    private func openDataPlane(for remote: PeerIdentity, mcPeer: MCPeerID, viaFreshPairing: Bool) {
         stateLock.lock(); dataPlanePeer = remote; remoteVerified = true; verifiedPeer = remote
+        dataPlaneBinding.bind(peer: remote, sessionHandle: handle(for: mcPeer),
+                              viaFreshPairing: viaFreshPairing)
+        activeHandshakeHandle = nil
         trustedPending = false; trustedNonce = nil; stateLock.unlock()
         cancelReconnect()
         if let secret = pairing.takeSecretToShare(for: remote) {
@@ -274,6 +310,24 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         onConnectionChange?(true)
     }
     private func beginHandshake(with mcPeer: MCPeerID, identity remote: PeerIdentity) {
+        // Round 5 (items 2+5): one outstanding handshake at a time,
+        // and none while a data plane is bound — a second session
+        // instance claiming an identity already in use is held
+        // unauthenticated and must not overwrite this state.
+        let mcHandle = handle(for: mcPeer)
+        stateLock.lock()
+        if dataPlaneBinding.sessionHandle != nil { stateLock.unlock(); return }
+        if let active = activeHandshakeHandle, active != mcHandle { stateLock.unlock(); return }
+        activeHandshakeHandle = mcHandle
+        let stashedNonce = pendingRemoteChallengeFrom == remote ? pendingRemoteChallengeNonce : nil
+        if stashedNonce != nil { pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil }
+        stateLock.unlock()
+        // Round 5 (item 6): answer a challenge stashed while no code
+        // was entered, so acceptance restarts both directions.
+        if let stashedNonce,
+           let digest = pairing.challengeResponse(toChallenge: stashedNonce, verifier: remote) {
+            sendHandshake(.response(nonce: stashedNonce, digest: digest, from: pairing.localIdentity), to: mcPeer)
+        }
         var fellBackFromTrusted = false
         if pairing.isPaired(to: remote) {
             if pairing.pairingSecret(for: remote) != nil {
@@ -310,18 +364,40 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         stateLock.lock()
         issuedChallenge = nil; trustedNonce = nil; trustedPending = false
         remoteVerified = false; dataPlanePeer = nil
+        dataPlaneBinding.unbind(sessionHandle: handle(for: mcPeer))
+        if activeHandshakeHandle == handle(for: mcPeer) { activeHandshakeHandle = nil }
+        pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
+        // Round 5 (item 6): on the advertiser, restore the manual
+        // request so the user can enter a corrected code on the
+        // still-connected session instead of waiting for a new invite.
+        var restoreManual = false
+        if role == .advertiser, pendingInvitationHandler == nil {
+            pendingManualPeerID = mcPeer; pendingManualIdentity = remote; restoreManual = true
+        }
         stateLock.unlock()
         if wasTrusted { pairing.downgradeTrustedPairing(for: remote) }
         pairing.failProvisionalAttempt(peer: remote)
         if notifyPeer {
             sendHandshake(.pairingFailed(from: pairing.localIdentity), to: mcPeer)
         }
+        if restoreManual { onPairingRequest?(remote) }
         onPairingFailure?(remote)
     }
     private func handleHandshake(_ data: Data, from mcPeer: MCPeerID) -> Bool {
         guard let text = String(data: data, encoding: .utf8), text.hasPrefix(Self.handshakePrefix) else { return false }
         let payload = Data(text.dropFirst(Self.handshakePrefix.count).utf8)
         guard let msg = try? JSONDecoder().decode(HandshakeMessage.self, from: payload) else { return true }
+        // Round 5 (items 2+5): handshake messages are honored only
+        // from the bound data-plane session instance, or from the one
+        // session instance with a handshake outstanding — a duplicate
+        // claiming the same identity cannot disturb either.
+        let senderHandle = handle(for: mcPeer)
+        stateLock.lock()
+        let boundHandle = dataPlaneBinding.sessionHandle
+        let activeHandle = activeHandshakeHandle
+        stateLock.unlock()
+        if let boundHandle, senderHandle != boundHandle { return true }
+        if boundHandle == nil, let activeHandle, senderHandle != activeHandle { return true }
         switch msg {
         case .challenge(let nonce, let from):
             remember(from, mcPeer: mcPeer)
@@ -331,7 +407,23 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
             }
             _ = pairing.beginProvisional(peer: from)
             if let digest = pairing.challengeResponse(toChallenge: nonce, verifier: from) {
+                stateLock.lock()
+                pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
+                stateLock.unlock()
                 sendHandshake(.response(nonce: nonce, digest: digest, from: pairing.localIdentity), to: mcPeer)
+            } else {
+                // Round 5 (item 6): no corrected code yet (the state a
+                // code mismatch leaves behind). Stash the challenge and
+                // restore the manual request instead of dropping it, so
+                // acceptance answers it and restarts both directions.
+                var surfaceManual = false
+                stateLock.lock()
+                pendingRemoteChallengeNonce = nonce; pendingRemoteChallengeFrom = from
+                if role == .advertiser, pendingInvitationHandler == nil, pendingManualPeerID == nil {
+                    pendingManualPeerID = mcPeer; pendingManualIdentity = from; surfaceManual = true
+                }
+                stateLock.unlock()
+                if surfaceManual { onPairingRequest?(from) }
             }
         case .response(let nonce, let digest, let from):
             remember(from, mcPeer: mcPeer)
@@ -343,12 +435,12 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
             }
             sendHandshake(.pairingConfirmed(from: pairing.localIdentity), to: mcPeer)
             if pairing.recordRemoteVerified(peer: from) {
-                openDataPlane(for: from, mcPeer: mcPeer)
+                openDataPlane(for: from, mcPeer: mcPeer, viaFreshPairing: true)
             }
         case .pairingConfirmed(let from):
             remember(from, mcPeer: mcPeer)
             if pairing.recordPeerVerifiedLocal(peer: from) {
-                openDataPlane(for: from, mcPeer: mcPeer)
+                openDataPlane(for: from, mcPeer: mcPeer, viaFreshPairing: true)
             }
         case .pairingFailed(let from):
             remember(from, mcPeer: mcPeer)
@@ -363,12 +455,23 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
                 pairing.failProvisionalAttempt(peer: from)
                 stateLock.lock()
                 issuedChallenge = nil; remoteVerified = false; dataPlanePeer = nil
+                dataPlaneBinding.clear()
+                if activeHandshakeHandle == senderHandle { activeHandshakeHandle = nil }
+                pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
                 stateLock.unlock()
                 onPairingFailure?(from)
             }
         case .pairingSecret(let secret, let from):
             remember(from, mcPeer: mcPeer)
-            if pairing.isPaired(to: from) || pairing.provisionalPeer == from {
+            // Round 5 (item 1): secret establishment ONLY on the
+            // session instance that completed fresh mutual code
+            // authentication — never during unauthenticated
+            // reconnection, where the retained pairing alone used to
+            // suffice for a claimant to replace the secret.
+            stateLock.lock()
+            let allowed = dataPlaneBinding.authorizesSecretEstablishment(peer: from, sessionHandle: senderHandle)
+            stateLock.unlock()
+            if allowed {
                 pairing.adoptSharedSecret(secret, from: from)
             }
         case .trustedChallenge(let nonce, let from):
@@ -393,7 +496,9 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
                 failHandshake(with: mcPeer, identity: from, notifyPeer: true)
                 return true
             }
-            openDataPlane(for: from, mcPeer: mcPeer)
+            // Trusted proof reopens the data plane but NEVER secret
+            // establishment (round 5, item 1).
+            openDataPlane(for: from, mcPeer: mcPeer, viaFreshPairing: false)
         }
         return true
     }
@@ -452,6 +557,16 @@ extension MultipeerSyncTransport: MCSessionDelegate {
             if let paired = pairing.pairedPeer, paired != remote {
                 session.disconnect(); return
             }
+            // Round 5 (items 2+5): hold any additional session
+            // instance while a data plane is bound or a handshake is
+            // outstanding — it gets no handshake and no authorization.
+            let mcHandle = handle(for: mcPeer)
+            stateLock.lock()
+            let boundHandle = dataPlaneBinding.sessionHandle
+            let activeHandle = activeHandshakeHandle
+            stateLock.unlock()
+            if let boundHandle, boundHandle != mcHandle { return }
+            if boundHandle == nil, let activeHandle, activeHandle != mcHandle { return }
             cancelReconnect()
             beginHandshake(with: mcPeer, identity: remote)
             return
@@ -462,8 +577,13 @@ extension MultipeerSyncTransport: MCSessionDelegate {
             peerBook.markFailed(remote)
             if pairing.pairedPeer == remote {
                 verifiedPeer = nil; remoteVerified = false; dataPlanePeer = nil
+                dataPlaneBinding.unbind(sessionHandle: handle(for: mcPeer))
                 trustedNonce = nil; trustedPending = false
                 shouldReconnect = (role == .browser)
+            }
+            if activeHandshakeHandle == handle(for: mcPeer) { activeHandshakeHandle = nil }
+            if pendingRemoteChallengeFrom == remote {
+                pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
             }
             stateLock.unlock()
             if shouldReconnect { scheduleTrustedReconnect() }
@@ -473,8 +593,12 @@ extension MultipeerSyncTransport: MCSessionDelegate {
     public func session(_ session: MCSession, didReceive data: Data, fromPeer mcPeer: MCPeerID) {
         if handleHandshake(data, from: mcPeer) { return }
         let remote = identity(for: mcPeer)
-        stateLock.lock(); let plane = dataPlanePeer; stateLock.unlock()
-        guard plane == remote, pairing.isPaired(to: remote) else { return }
+        stateLock.lock(); let plane = dataPlanePeer
+        let authorized = dataPlaneBinding.authorizes(peer: remote, sessionHandle: handle(for: mcPeer))
+        stateLock.unlock()
+        // Round 5 (item 2): policies/acks are accepted only from the
+        // authenticated session instance, never a duplicate claimant.
+        guard plane == remote, authorized, pairing.isPaired(to: remote) else { return }
         // Outside the lock: the service can re-enter send() (acks).
         onReceive?(data)
     }
@@ -511,6 +635,13 @@ extension MultipeerSyncTransport: MCNearbyServiceAdvertiserDelegate {
             invitationHandler(false, nil); return
         }
         if pairing.isPaired(to: candidate) {
+            // Round 5 (item 2): while a data plane is bound to another
+            // session instance, a duplicate claiming the paired
+            // identity is refused outright, not merely unauthenticated.
+            stateLock.lock(); let boundHandle = dataPlaneBinding.sessionHandle; stateLock.unlock()
+            if let boundHandle, boundHandle != handle(for: mcPeer) {
+                invitationHandler(false, nil); return
+            }
             // Session may establish, but no data flows until the
             // trusted secret proof completes in the handshake (H3).
             invitationHandler(true, currentSession); return
@@ -518,6 +649,8 @@ extension MultipeerSyncTransport: MCNearbyServiceAdvertiserDelegate {
         stateLock.lock()
         pendingPeerID = mcPeer; pendingIdentity = candidate
         pendingInvitationHandler = invitationHandler
+        pendingManualPeerID = nil; pendingManualIdentity = nil
+        pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
         stateLock.unlock()
         if onPairingRequest != nil { onPairingRequest?(candidate) }
         else {

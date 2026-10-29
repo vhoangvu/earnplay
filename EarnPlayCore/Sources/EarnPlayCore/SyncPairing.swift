@@ -123,12 +123,17 @@ public struct DiscoveredPeerBook: Sendable {
     }
     public func invitationCandidates(hasPeerCode: Bool, livePeer: PeerIdentity?,
                                      trustedPairedPeer: PeerIdentity?) -> [PeerIdentity] {
-        peers.filter {
-            !invited.contains($0.stableID) && !failed.contains($0.stableID)
+        // Round 5 (item 5): one outstanding invitation at a time.
+        // While an invitation is outstanding the next candidate waits;
+        // it becomes invitable when the first fails, is retried, is
+        // rediscovered, or reconnect scheduling clears the state.
+        guard invited.isEmpty else { return [] }
+        return Array(peers.filter {
+            !failed.contains($0.stableID)
                 && PeerAdmission.shouldInviteNow(hasPeerCode: hasPeerCode, livePeer: livePeer,
                                                  pendingPeer: nil, candidate: $0,
                                                  trustedPairedPeer: trustedPairedPeer)
-        }
+        }.prefix(1))
     }
     @discardableResult
     public mutating func retryCandidates() -> [PeerIdentity] {
@@ -179,6 +184,38 @@ public final class PeerIdentityResolver: @unchecked Sendable {
     public func forgetAll() {
         lock.lock(); defer { lock.unlock() }
         identityByHandle.removeAll(); handleByStableID.removeAll()
+    }
+}
+
+/// Authorization binding for the data plane (round 5, items 1-2):
+/// pairing identity alone never authorizes traffic. Only the exact
+/// session instance (transport handle) that completed authentication
+/// is authorized, in both the send and receive directions; a second
+/// session instance claiming the same stable identity is held
+/// unauthenticated. Secret establishment additionally requires that
+/// the bound session completed fresh mutual code authentication —
+/// a trusted reconnect (secret proof) never reopens establishment.
+public struct DataPlaneBinding: Equatable, Sendable {
+    public private(set) var peer: PeerIdentity?
+    public private(set) var sessionHandle: String?
+    public private(set) var establishedViaFreshPairing = false
+    public init() {}
+    public mutating func bind(peer: PeerIdentity, sessionHandle: String, viaFreshPairing: Bool) {
+        self.peer = peer; self.sessionHandle = sessionHandle
+        self.establishedViaFreshPairing = viaFreshPairing
+    }
+    public func authorizes(peer: PeerIdentity, sessionHandle: String) -> Bool {
+        self.peer == peer && self.sessionHandle == sessionHandle
+    }
+    public func authorizesSecretEstablishment(peer: PeerIdentity, sessionHandle: String) -> Bool {
+        establishedViaFreshPairing && authorizes(peer: peer, sessionHandle: sessionHandle)
+    }
+    public mutating func unbind(sessionHandle: String) {
+        guard self.sessionHandle == sessionHandle else { return }
+        peer = nil; self.sessionHandle = nil; establishedViaFreshPairing = false
+    }
+    public mutating func clear() {
+        peer = nil; sessionHandle = nil; establishedViaFreshPairing = false
     }
 }
 
@@ -265,6 +302,11 @@ public final class SyncPairingGate: @unchecked Sendable {
     private var _verifiedByPeer = false
     private var _pairingSecrets: [String: String] = [:]
     private var _secretToShare: [String: String] = [:]
+    // Round 5 (item 1): secret establishment is open only between a
+    // fresh mutual promotion and the first adoption decision on that
+    // pairing. A restored/trusted gate never has it open, so a secret
+    // arriving during unauthenticated reconnection is rejected.
+    private var _secretEstablishmentOpen = false
     /// Set once before the gate is shared; called after mutations
     /// that must persist (pairing, secret, unpair).
     public var onStateChange: (() -> Void)?
@@ -400,6 +442,9 @@ public final class SyncPairingGate: @unchecked Sendable {
         if let existing = _pairedPeer, existing != peer { return false }
         _pairedPeer = peer
         _provisionalPeer = nil; _verifiedRemote = false; _verifiedByPeer = false
+        // Fresh mutual code authentication just completed on this
+        // pairing: the one secret-establishment window opens.
+        _secretEstablishmentOpen = true
         return true
     }
 
@@ -437,20 +482,32 @@ public final class SyncPairingGate: @unchecked Sendable {
 
     /// Adopts a secret shared by the peer during pairing. When both
     /// sides generated one, the smaller stableID's secret wins on
-    /// both sides so they converge on a single secret.
+    /// both sides so they converge on a single secret. Round 5
+    /// (item 1): adoption is accepted ONLY inside the establishment
+    /// window opened by a fresh mutual promotion — never during
+    /// unauthenticated reconnection, where a claimant presenting a
+    /// paired stableID could otherwise replace the retained secret
+    /// and then answer trusted challenges with its own replacement.
     public func adoptSharedSecret(_ secret: String, from peer: PeerIdentity) {
         lock.lock()
-        guard _pairedPeer == peer || _provisionalPeer == peer else { lock.unlock(); return }
+        guard _secretEstablishmentOpen,
+              _pairedPeer == peer || _provisionalPeer == peer else { lock.unlock(); return }
         if let existing = _pairingSecrets[peer.stableID], existing != secret {
-            guard peer.stableID < localIdentity.stableID else { lock.unlock(); return }
+            guard peer.stableID < localIdentity.stableID else {
+                _secretEstablishmentOpen = false; lock.unlock(); return
+            }
         }
         _pairingSecrets[peer.stableID] = secret
+        _secretEstablishmentOpen = false
         lock.unlock()
         notifyChanged()
     }
 
     public func trustedResponse(toChallenge challenge: String, peer: PeerIdentity) -> String? {
         lock.lock(); defer { lock.unlock() }
+        // Proving by secret means this connection is a trusted
+        // reconnect, not a fresh pairing: establishment stays closed.
+        _secretEstablishmentOpen = false
         guard let secret = _pairingSecrets[peer.stableID] else { return nil }
         return PairingAuthenticator.trustedResponse(challenge: challenge, prover: localIdentity,
                                                     verifier: peer, secret: secret)
@@ -459,6 +516,7 @@ public final class SyncPairingGate: @unchecked Sendable {
     public func verifyTrustedResponse(_ response: String, toChallenge challenge: String,
                                       prover: PeerIdentity) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        _secretEstablishmentOpen = false
         guard let secret = _pairingSecrets[prover.stableID] else { return false }
         return PairingAuthenticator.verifyTrusted(response: response, challenge: challenge,
                                                   prover: prover, verifier: localIdentity, secret: secret)
@@ -471,6 +529,7 @@ public final class SyncPairingGate: @unchecked Sendable {
         guard _pairedPeer == peer else { lock.unlock(); return }
         _pairedPeer = nil; _provisionalPeer = nil
         _verifiedRemote = false; _verifiedByPeer = false
+        _secretEstablishmentOpen = false
         _pairingSecrets.removeValue(forKey: peer.stableID)
         _secretToShare.removeValue(forKey: peer.stableID)
         _expectedPeerCode = nil
@@ -485,6 +544,7 @@ public final class SyncPairingGate: @unchecked Sendable {
         lock.lock()
         _pairedPeer = nil; _provisionalPeer = nil
         _verifiedRemote = false; _verifiedByPeer = false
+        _secretEstablishmentOpen = false
         _expectedPeerCode = nil; _pairingSecrets.removeAll(); _secretToShare.removeAll()
         lock.unlock()
         notifyChanged()
@@ -494,6 +554,7 @@ public final class SyncPairingGate: @unchecked Sendable {
         lock.lock()
         _pairedPeer = nil; _expectedPeerCode = nil
         _provisionalPeer = nil; _verifiedRemote = false; _verifiedByPeer = false
+        _secretEstablishmentOpen = false
         lock.unlock()
         notifyChanged()
     }

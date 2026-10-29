@@ -60,6 +60,9 @@ struct SyncDebugView: View {
             Button("Retry sync now") { service?.handleReconnect() }
             Button("Reset / Unpair", role: .destructive) {
                 transport?.unpair()
+                // Round 5 (item 3): republish the snapshot now, mirroring
+                // the admin controller, so Paired flips immediately.
+                service?.flushPending()
                 pendingPeer = nil; peerCode = ""
                 status = "Unpaired — pair again from the admin device."
             }
@@ -78,8 +81,14 @@ struct SyncDebugView: View {
         }
         // Round 4 (M6): verification failure resets both sides;
         // surface a retryable status and allow corrected entry.
+        // Round 5 (item 6): the transport restores the manual request
+        // on failure, so keep the code-entry row whenever one is
+        // pending instead of hiding the only way to retry.
         t.onPairingFailure = { _ in
-            DispatchQueue.main.async { pendingPeer = nil; status = "Codes didn't match — ask the admin to re-check the code, then Accept the new request." }
+            DispatchQueue.main.async {
+                status = "Codes didn't match — re-enter the admin code and Accept, or ask the admin to tap Pair again."
+                if !t.hasPendingPairingRequest { pendingPeer = nil }
+            }
         }
         let s = ChildSyncService(policyStore: policyStore, sessionQueue: sessionQueue,
                                  transport: t, pairing: pairing)

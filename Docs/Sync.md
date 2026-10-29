@@ -1,7 +1,16 @@
 # Sync (T4.6)
 
-Bluetooth/local peer-to-peer only via MultipeerConnectivity
-(`earnplay-sync`, encrypted). No account, no server, no internet.
+Local peer-to-peer only via MultipeerConnectivity (`earnplay-sync`,
+encrypted). No account, no server, no internet.
+
+**Actual bearer (round 5, item 8):** MultipeerConnectivity has no
+public Bluetooth-only mode. MPC automatically uses Bluetooth plus
+peer-to-peer (infrastructure-less) Wi-Fi as its bearer. Both are
+offline-capable: pairing and sync work with internet disabled on
+both devices (no account, server, or uplink involved), as long as
+the device radios are on. So "Bluetooth only" in the original
+requirement is realized as "offline MPC" — the honest reading of
+the requirement this implementation satisfies.
 
 - **Down (admin → child):** `PolicyUpdate` (full versioned `Policy`).
   The T4.1 `PolicyUpdateQueue` holds updates until the child acks the
@@ -22,9 +31,13 @@ Bluetooth/local peer-to-peer only via MultipeerConnectivity
 Manual test: (1) edit+save a policy in admin with both apps open →
 child Sync section shows the new version/practice minutes in seconds;
 (2) child → "Run demo session" → admin Sessions tab lists it;
-(3) Airplane Mode on child, run a session, Airplane Mode off with
-both apps open → queued session arrives once in the admin list
-(the trusted child reconnects automatically, no re-pairing);
+(3) internet disabled on BOTH devices (e.g. Wi-Fi uplink off / no
+SIM route — MPC's Bluetooth + peer-to-peer Wi-Fi bearer needs no
+internet), run a session on the child with the admin closed, then
+open both apps → queued session arrives once in the admin list
+(the trusted child reconnects automatically, no re-pairing); also
+verifiable as: Airplane Mode on child, run a session, Airplane Mode
+off with both apps open → same result;
 (4) pairing: admin enters the code shown on the child and taps Pair
 (retries the invitation even if the child was found before the code
 was entered), child enters the code shown on the admin and taps
@@ -72,6 +85,20 @@ Accept → both show paired, then (1)/(2) flow.
   failed verification notifies the peer so both sides reset the
   attempt, show a retryable "codes didn't match" status, and
   accept corrected codes with a fresh handshake.
+- **Session binding (fix round 5, items 1-2):** the data plane is
+  bound to the exact MPC session instance that authenticated.
+  A second instance claiming the same stable identity is held
+  unauthenticated: its policies/acks are not accepted and it is
+  excluded from sends. Pairing-secret establishment is accepted
+  only on a session that completed fresh mutual code
+  authentication, so a claimant cannot replace the retained secret
+  during unauthenticated reconnection and then answer trusted
+  challenges with its own secret. One invitation and one handshake
+  are outstanding at a time (item 5); unpairing rejects any pending
+  invitation (item 4); after a code mismatch the child restores its
+  manual request and acceptance restarts both challenge directions
+  on the live session (item 6); the child Reset/Unpair control
+  republishes its sync snapshot immediately (item 3).
 - **Trusted reconnect proof (fix round 4, H3):** authenticated
   pairing establishes a random per-peer secret, shared once over
   the encrypted session and never equal to a user-entered code or
