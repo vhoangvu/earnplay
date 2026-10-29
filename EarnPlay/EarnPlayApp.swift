@@ -23,6 +23,8 @@ struct ContentView: View {
                 ReadAloudPreviewView()
                 Divider()
                 SpikeView()
+                Divider()
+                ChoreTradeView()
             }
             .padding()
         }
