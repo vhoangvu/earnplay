@@ -370,6 +370,9 @@ public enum OfferReservationResult: Equatable, Sendable {
     case reserved
     /// No weekly slot was free; nothing was recorded.
     case weeklyCapReached
+    /// The session already holds its capped number of offers; nothing
+    /// was recorded.
+    case sessionCapReached
     /// The reservation could not be persisted; nothing was recorded and
     /// the in-memory cache is unchanged — the caller must fail closed.
     case persistenceFailed
@@ -465,14 +468,19 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         }
     }
 
-    /// Atomically reserves one weekly slot for a presented offer: inside
-    /// the cross-instance lock, refuses when trailing-week grants plus
-    /// outstanding offers already fill `weeklyCap`, otherwise appends the
-    /// `.offered` reservation and persists. Overlapping sessions therefore
-    /// cannot both take the last slot. Fails closed when the lock or the
-    /// write is unavailable.
+    /// Atomically reserves one slot for a presented offer: inside the
+    /// cross-instance lock, refuses when trailing-week grants plus
+    /// outstanding offers already fill `weeklyCap` or when the entry's
+    /// session already holds `sessionCap` offers, otherwise appends the
+    /// `.offered` reservation and persists. Overlapping sessions
+    /// therefore cannot both take the last weekly slot, and two
+    /// presentations for the same session cannot both reserve past the
+    /// session cap. Fails closed when the lock or the write is
+    /// unavailable.
     public func tryRecordOffer(_ entry: MovementTradeHistoryEntry,
-                               weeklyCap: Int, now: Date = Date()) -> OfferReservationResult {
+                               weeklyCap: Int,
+                               sessionCap: Int = TradeCaps.default.maxTradesPerSession,
+                               now: Date = Date()) -> OfferReservationResult {
         lock.lock()
         defer { lock.unlock() }
         guard let fd = try? acquireDirectoryLock() else {
@@ -484,6 +492,9 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         }
         guard cached.weeklyUsageInTrailingWeek(now: now) < max(0, weeklyCap) else {
             return .weeklyCapReached
+        }
+        guard cached.offersInSession(entry.sessionId) < max(0, sessionCap) else {
+            return .sessionCapReached
         }
         var next = cached
         next.entries.append(entry)
@@ -552,6 +563,48 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         }
         cached = next
         return .finalized
+    }
+
+    /// Reconciles orphaned `.offered` reservations left by terminated
+    /// sessions (app kill, crash): every outstanding offer whose session
+    /// is NOT in `activeSessionIds` is finalized as `.abandoned`,
+    /// releasing its weekly slot. Entries for currently active sessions
+    /// are untouched. Session-offer history is preserved — reconciled
+    /// entries stay in history (still counted by `offersInSession`), only
+    /// their outcome changes, so they no longer count toward
+    /// `weeklyUsageInTrailingWeek`. The app calls this during session
+    /// recovery with the live session IDs.
+    ///
+    /// Returns the number of reservations reconciled (0 when none were
+    /// orphaned, or when the lock or the write was unavailable — the
+    /// cache is then unchanged).
+    @discardableResult
+    public func reconcileOrphanedOffers(activeSessionIds: Set<String>) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let fd = try? acquireDirectoryLock() else {
+            return 0
+        }
+        defer { releaseDirectoryLock(fd) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+            cached = persisted
+        }
+        var next = cached
+        var count = 0
+        for index in next.entries.indices where next.entries[index].outcome == .offered
+            && !activeSessionIds.contains(next.entries[index].sessionId) {
+            next.entries[index].outcome = .abandoned
+            next.entries[index].completedAt = nil
+            count += 1
+        }
+        guard count > 0 else { return 0 }
+        do {
+            try persist(next)
+        } catch {
+            return 0
+        }
+        cached = next
+        return count
     }
 
     @discardableResult

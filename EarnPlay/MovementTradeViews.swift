@@ -161,10 +161,11 @@ struct MovementTradePreviewView: View {
             case .offer(let offer):
                 let presented = model.presentOffer(
                     offer, sessionId: previewSession.id,
-                    weeklyCap: Policy.defaultPolicy.tradeCaps.weeklyMaxMovementTrades)
+                    weeklyCap: Policy.defaultPolicy.tradeCaps.weeklyMaxMovementTrades,
+                    sessionCap: Policy.defaultPolicy.tradeCaps.maxTradesPerSession)
                 if !presented {
                     refusalText = "Offer could not be presented "
-                        + "(weekly limit reached or save failed)."
+                        + "(weekly/session limit reached or save failed)."
                 }
             case .refuse(let reason):
                 refusalText = "Offer refused by gate: \(reason)."

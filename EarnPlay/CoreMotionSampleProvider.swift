@@ -20,10 +20,24 @@ final class CoreMotionSampleProvider: MotionSampleProvider {
     var isAvailable: Bool { manager.isDeviceMotionAvailable }
 
     func startUpdates(handler: @escaping @Sendable (MotionSample) -> Void) {
+        startUpdates(handler: handler, onFailure: { _ in })
+    }
+
+    func startUpdates(handler: @escaping @Sendable (MotionSample) -> Void,
+                      onFailure: @escaping @Sendable (Error) -> Void) {
         guard manager.isDeviceMotionAvailable else { return }
         manager.deviceMotionUpdateInterval = 1.0 / MotionFixtures.sampleRateHz
-        manager.startDeviceMotionUpdates(to: queue) { motion, _ in
-            guard let motion else { return }
+        manager.startDeviceMotionUpdates(to: queue) { motion, error in
+            if let error {
+                onFailure(error)
+                return
+            }
+            guard let motion else {
+                onFailure(NSError(
+                    domain: "EarnPlayMotion", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Motion sample unavailable"]))
+                return
+            }
             handler(MotionSample(
                 timestamp: motion.timestamp,
                 ax: motion.userAcceleration.x + motion.gravity.x,

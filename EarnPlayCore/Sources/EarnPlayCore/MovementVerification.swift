@@ -73,8 +73,23 @@ public protocol MotionSampleProvider: AnyObject {
     /// The handler may be invoked on any queue; callers marshal to the
     /// queue they need.
     func startUpdates(handler: @escaping @Sendable (MotionSample) -> Void)
+    /// Begins streaming samples to `handler`, reporting a mid-stream
+    /// failure to `onFailure` (also on any queue). Providers backed by
+    /// a fallible sensor (CoreMotion) propagate stream errors here so
+    /// the trade can stop instead of hanging with its reservation held.
+    func startUpdates(handler: @escaping @Sendable (MotionSample) -> Void,
+                      onFailure: @escaping @Sendable (Error) -> Void)
     /// Stops the stream started by `startUpdates(handler:)`.
     func stopUpdates()
+}
+
+public extension MotionSampleProvider {
+    /// Default: starts the sample-only stream and never reports failure.
+    /// Infallible sources (fixture replay, test stubs) inherit this.
+    func startUpdates(handler: @escaping @Sendable (MotionSample) -> Void,
+                      onFailure _: @escaping @Sendable (Error) -> Void) {
+        startUpdates(handler: handler)
+    }
 }
 
 // MARK: - Verified rep counter
@@ -88,6 +103,13 @@ public struct RepCounterConfig: Equatable, Sendable {
     public var armThreshold: Double
     /// Fastest arm-to-complete swing that can verify (shaking is faster).
     public var minRepDuration: TimeInterval
+    /// Sampling tolerance subtracted from `minRepDuration` at the gate:
+    /// one 50 Hz sample interval (0.02s). Either threshold crossing can
+    /// be detected up to one interval late, so a true 0.25s swing can
+    /// measure 0.24s depending on sampling phase (plus floating-point
+    /// rounding); the effective floor is 0.23s. Shaking swings (≈0.1s)
+    /// remain far below it.
+    public var minRepDurationTolerance: TimeInterval
     /// Slowest arm-to-complete swing kept armed (stale arms disarm).
     public var maxRepDuration: TimeInterval
     /// Minimum gap between two counted reps.
@@ -107,6 +129,7 @@ public struct RepCounterConfig: Equatable, Sendable {
 
     public init(armThreshold: Double = 0.35,
                 minRepDuration: TimeInterval = 0.25,
+                minRepDurationTolerance: TimeInterval = 0.02,
                 maxRepDuration: TimeInterval = 2.5,
                 minSeparation: TimeInterval = 0.4,
                 maxRotationRate: Double = 12.0,
@@ -115,6 +138,7 @@ public struct RepCounterConfig: Equatable, Sendable {
                 crossingDeadband: Double = 0.05) {
         self.armThreshold = armThreshold
         self.minRepDuration = minRepDuration
+        self.minRepDurationTolerance = minRepDurationTolerance
         self.maxRepDuration = maxRepDuration
         self.minSeparation = minSeparation
         self.maxRotationRate = maxRotationRate
@@ -196,7 +220,9 @@ public struct VerifiedRepCounter: Equatable, Sendable {
             }
             guard signal <= -config.armThreshold else { return verifiedCount }
             phase = .idle
-            guard now - armedAt >= config.minRepDuration else {
+            // Sampling tolerance: a true min-duration swing can measure
+            // up to one sample interval short depending on phase.
+            guard now - armedAt + config.minRepDurationTolerance >= config.minRepDuration else {
                 rejectedNoiseEvents += 1
                 return verifiedCount
             }
