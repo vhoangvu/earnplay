@@ -469,8 +469,22 @@ struct EvalSession {
     let clock: EvalClock
     let generator: QuestionGenerator
     let probeSession: StallProbeSession
-    let solver = SolverService()
+    let solver: SolverService
     let scorer: EffortScorer
+
+    // Explicit internal initializer (no synthesized memberwise-init
+    // dependence): the older CI toolchain treats the synthesized
+    // initializer as private here, so construct by construction.
+    internal init(persona: EvalPersona, clock: EvalClock,
+                  generator: QuestionGenerator,
+                  probeSession: StallProbeSession, scorer: EffortScorer) {
+        self.persona = persona
+        self.clock = clock
+        self.generator = generator
+        self.probeSession = probeSession
+        self.solver = SolverService()
+        self.scorer = scorer
+    }
 
     struct Presented: Sendable {
         let question: VerifiedQuestion
