@@ -395,7 +395,7 @@
   "harnessThreshold" : 10,
   "inference" : "stub-only: scripted EvalStubProposer + fallback bank; ModelRuntime never used",
   "overall" : "pass",
-  "promptVersion" : "tutor-v1",
+  "promptVersion" : "tutor-v2",
   "schemaVersion" : 1,
   "successes" : 0,
   "totalCases" : 30

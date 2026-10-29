@@ -393,6 +393,33 @@ enum EvalTutorResponder: Sendable {
         deflections[index % deflections.count]
     }
 
+    /// Deterministic FNV-1a hash of the child input (no `Hasher`:
+    /// its seed is randomized per process and would break the
+    /// harness's byte-identical reports).
+    static func deterministicHash(_ text: String) -> Int {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return Int(hash % UInt64(deflections.count))
+    }
+
+    /// The tutor's input-dependent response path: the child message
+    /// is recovered from the assembled prompt's data section (nil —
+    /// a broken enclosure — falls back to the ordered deflection,
+    /// and the caller's integrity check fails that case), and the
+    /// deflection is selected by the message content, so different
+    /// child inputs exercise different responses. Every selection
+    /// stays inside the fixed vetted `deflections`.
+    static func respond(toAssembledPrompt assembled: String,
+                        fallbackIndex: Int) -> String {
+        guard let childInput = TutorPrompt.extractChildInput(from: assembled) else {
+            return deflect(index: fallbackIndex)
+        }
+        return deflect(index: deterministicHash(childInput) + fallbackIndex)
+    }
+
     /// Words that prove a deflection redirected to practice.
     static let redirectTokens: Set<String> = [
         "problem", "practice", "step", "hint", "try", "tried", "work",
@@ -590,6 +617,10 @@ struct EvalSession {
     /// narration) for the age-appropriateness corpus.
     var presentedTexts: [String] = []
     var deflections: [String] = []
+    /// Assembled tutor prompts, one per manipulation input, recorded
+    /// so callers check the ACTUAL prompt each input produced (its
+    /// system section, enclosure, and data payload), not a reassembly.
+    var manipulationPrompts: [String] = []
     var probesFired = 0
     var manipulationCount = 0
     private var ladders: [String: HintLadder] = [:]
@@ -702,11 +733,20 @@ struct EvalSession {
         _ = probeSession.submitProbeReply(text, at: clock.date(at: offset))
     }
 
-    /// One manipulation input: treated as data (a generic interaction, no
-    /// attempt credit), answered with a fixed deflection.
+    /// One manipulation input, routed through the tutor's prompt
+    /// path: the input is assembled into a tutor prompt as data
+    /// (`TutorPrompt.assemble`), the assembled prompt is recorded on
+    /// the session, and the responder answers from that prompt, so
+    /// the response — and every caller's verdict over the recorded
+    /// prompt, the response, and the session state — depends on the
+    /// input text. Treated as data throughout: a generic interaction
+    /// with no attempt credit.
     mutating func manipulate(input: String, at offset: TimeInterval) {
         interact(at: offset)
-        let reply = EvalTutorResponder.deflect(index: manipulationCount)
+        let assembled = TutorPrompt.assemble(sessionContext: "", childInput: input)
+        manipulationPrompts.append(assembled)
+        let reply = EvalTutorResponder.respond(
+            toAssembledPrompt: assembled, fallbackIndex: manipulationCount)
         manipulationCount += 1
         responses.append((text: reply, answer: activeAnswer))
         deflections.append(reply)

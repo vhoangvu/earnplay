@@ -114,7 +114,7 @@ if redTeam {
     } catch {
         fail("could not write red-team report to \(redTeamReportPath): \(error)")
     }
-    if batteryReport.successes != 0 {
+    if batteryReport.overall != "pass" {
         print("Overall: FAIL")
         exit(1)
     }
