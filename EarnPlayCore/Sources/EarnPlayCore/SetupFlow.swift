@@ -449,9 +449,13 @@ public final class SetupFlow: @unchecked Sendable {
     /// record, and the flow advances to `selection`. Returns false without
     /// changing any state otherwise; shields stay inactive either way.
     ///
-    /// The incomplete persist is best-effort and is refused over a stored
-    /// policy (an incomplete record must never forge a policy/enumeration
-    /// pair). Shields are not applied here: the live run applies them at
+    /// The incomplete persist is required — not best-effort — when no
+    /// policy is stored yet: if it fails, the submit fails and the flow
+    /// stays at `enumeration` with nothing staged, so the flow never
+    /// advances on a promise of restoration it cannot deliver. Persisting
+    /// is still refused over a stored policy (an incomplete record must
+    /// never forge a policy/enumeration pair); that path stages in memory
+    /// only. Shields are not applied here: the live run applies them at
     /// abandon/commit, and a relaunch applies this record while staying
     /// incomplete — so terminating the app from the selection or guidance
     /// step loses nothing and claims no completed protection.
@@ -463,7 +467,6 @@ public final class SetupFlow: @unchecked Sendable {
         guard !enumeration.apps.isEmpty || !enumeration.categories.isEmpty else {
             return false
         }
-        stagedEnumeration = enumeration
         if policyStore.storedVersion == 0 {
             let merged = Self.mergedRestrictiveRecord(
                 [
@@ -472,8 +475,13 @@ public final class SetupFlow: @unchecked Sendable {
                     enumeration,
                 ].compactMap { $0 }
             )
-            try? enumerationStore.saveIncompleteEnumeration(merged)
+            do {
+                try enumerationStore.saveIncompleteEnumeration(merged)
+            } catch {
+                return false
+            }
         }
+        stagedEnumeration = enumeration
         step = .selection
         return true
     }
@@ -607,12 +615,12 @@ public final class SetupFlow: @unchecked Sendable {
     /// merged forward with the previously persisted restrictions and the
     /// merged configuration is applied to the `ShieldManager` as a
     /// restrictive incomplete-setup configuration (default-deny: every
-    /// picked app shielded under the current policy) and, when no policy
-    /// exists yet, persisted to the incomplete record, so a relaunch stays
+    /// picked app shielded under the current policy) and persisted to the
+    /// distinctly-incomplete record regardless of policy version — the
+    /// incomplete file can never confer completion (restore reads only the
+    /// completion file plus the stored policy), so a relaunch stays
     /// incomplete with the picked apps still shielded and an aborted retry
-    /// never loosens prior restrictions. Persisting over a stored policy
-    /// is refused: that would forge a policy/enumeration pair and falsely
-    /// restore as complete.
+    /// never loosens prior restrictions.
     /// No-op once complete (a committed setup is not un-committed), and a
     /// no-op while a committed setup waits for reauthorization (the pair
     /// and the reauthorization path survive abandoning).
@@ -630,9 +638,7 @@ public final class SetupFlow: @unchecked Sendable {
                     staged,
                 ].compactMap { $0 }
             )
-            if policyStore.storedVersion == 0 {
-                try? enumerationStore.saveIncompleteEnumeration(merged)
-            }
+            try? enumerationStore.saveIncompleteEnumeration(merged)
             shieldManager.updateEnumeration(merged)
         }
         authorized = false

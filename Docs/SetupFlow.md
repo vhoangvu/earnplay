@@ -54,17 +54,20 @@ Blocked-for-all.
 - Every accepted enumeration is persisted (merged with prior incomplete
   picks) as a distinctly-incomplete restrictive record, so terminating
   the app from the selection or guidance step loses nothing; a relaunch
-  restores those shields while staying incomplete. Abandoning the flow
-  before the commit writes no policy, but picked apps are not left
+  restores those shields while staying incomplete. If that persist fails,
+  the submit itself fails and the flow stays at enumeration — it never
+  advances on a promise of restoration it cannot deliver. Abandoning the
+  flow before the commit writes no policy, but picked apps are not left
   unshielded: abandoning with a staged enumeration merges it forward with
-  the previously persisted restrictions and applies the merged
-  configuration (default-deny), persisting it to the incomplete record
-  when no policy exists yet — an aborted retry never loosens prior
-  restrictions. Abandoning from the picker submits the current selection
-  first, so Start over before Continue still shields the picked apps.
-  Abandoning a completed setup — or one waiting for reauthorization — is
-  a no-op that preserves the pair. Persisting over a stored policy is
-  refused, and the incomplete record can never confer completion.
+  the previously persisted restrictions, persists the merged record to
+  the incomplete file regardless of policy version, and applies the
+  merged configuration (default-deny) — an aborted retry never loosens
+  prior restrictions. Abandoning from the picker submits the current
+  selection first, so Start over before Continue still shields the picked
+  apps. Abandoning a completed setup — or one waiting for
+  reauthorization — is a no-op that preserves the pair. The incomplete
+  record can never confer completion: only the completion file plus a
+  stored policy restores as complete.
 - If the enumeration or the policy cannot be persisted, the commit
   reports `persistenceFailed`, the flow stays on the guidance step, and
   the caller may retry. On a policy failure the just-written completion
@@ -92,10 +95,15 @@ Blocked-for-all.
 
 Picker tokens are opaque, so the view model assigns each picked token a
 stable `AppRef` / `AppCategoryRef` identifier and persists the pairing in
-`SetupTokenStore` (`setup-token-mapping.json`). The mapping renders the
-picked apps' names/icons after a relaunch and will let the v1
-ManagedSettings backend resolve each `AppRef` back to its token. Shields
-and counts never depend on it — only the token-backed labels do.
+`SetupTokenStore` (`setup-token-mapping.json`). Identifiers are stable
+across reselection: deselecting an app never releases its identifier, so
+re-picking reuses the original `AppRef` and can never orphan a retained
+admin override. The mapping renders the picked apps' names/icons after a
+relaunch and will let the v1 ManagedSettings backend resolve each
+`AppRef` back to its token. Shields and counts never depend on it — only
+the token-backed labels do — and the Earn-to-unblock count covers only
+effectively earnable apps (`isChallengeUnlockable`), matching each app's
+displayed choice.
 
 FamilyControls does not reveal which category an app belongs to, so
 per-app categories are recorded as unknown on the real-device path. T2.2's

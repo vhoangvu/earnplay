@@ -401,14 +401,25 @@ final class SetupFlowFixRound3Tests: XCTestCase {
         // The current run shields the picked apps (default-deny) …
         XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
         XCTAssertFalse(backend.currentShieldConfiguration.shieldedApplications.isEmpty)
-        // … but nothing is persisted over the stored policy, so no
-        // policy/enumeration pair is forged: relaunch stays incomplete.
+        // … and the merged restrictions are persisted to the
+        // distinctly-incomplete record despite the stored policy — which
+        // cannot forge completion: no completion file exists.
         XCTAssertNil(FileSetupEnumerationStore(directory: directory).loadEnumeration())
-        let (relaunched, relaunchStore, _, relaunchBackend) = makeSetup()
+        XCTAssertNotNil(
+            FileSetupEnumerationStore(directory: directory).loadIncompleteEnumeration()
+        )
+        let (relaunched, relaunchStore, relaunchManager, relaunchBackend) = makeSetup()
         XCTAssertEqual(relaunched.currentStep, .authorization)
         XCTAssertFalse(relaunched.isComplete)
         XCTAssertFalse(relaunched.claimsProtection)
         XCTAssertEqual(relaunchStore.storedVersion, 1)
-        XCTAssertEqual(relaunchBackend.currentShieldConfiguration, .none)
+        // Fix round 5 (finding 3): relaunch stays incomplete WITH the
+        // picked apps still shielded — the old `.none` expectation
+        // encoded the dropped-restrictions bug.
+        XCTAssertTrue(relaunchManager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertEqual(
+            relaunchBackend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.socialApp, Self.allowedApp]
+        )
     }
 }

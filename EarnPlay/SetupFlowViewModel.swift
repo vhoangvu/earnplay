@@ -110,6 +110,12 @@ public final class SetupFlowViewModel: ObservableObject {
     private let authService: any SetupAuthorizationService
     private let tokenStore: SetupTokenStore
 
+    /// Durable token-to-ref registries: every token ever picked in this
+    /// run (or restored from the persisted mapping) keeps its identifier
+    /// here for the life of the view model. Deselection prunes the current
+    /// selection (`pickedApps` / `pickedCategories`) but NEVER these
+    /// registries, so re-picking can never mint a new `AppRef`, change
+    /// policy identity, or orphan a retained admin override.
     private var appRefsByToken: [ApplicationToken: AppRef] = [:]
     private var categoryRefsByToken: [ActivityCategoryToken: AppCategoryRef] = [:]
 
@@ -338,20 +344,26 @@ public final class SetupFlowViewModel: ObservableObject {
         for app in pickedApps {
             choices[app.id] = Self.choice(for: app.ref, in: policy)
         }
+        // Count only effectively earnable apps with the same predicate
+        // each app's displayed choice uses: an override-covered app shows
+        // Blocked, so it must not be counted as Earn-to-unblock.
+        let earnableCount = Set(policy.unblockable)
+            .filter { policy.isChallengeUnlockable($0) }.count
         summary = CompletionSummary(
             policyVersion: policy.version,
             shieldedCount: config.shieldedApplications.count,
-            unblockableCount: policy.unblockable.count,
+            unblockableCount: earnableCount,
             allowedExtraCount: max(0, policy.alwaysAllowed.count - builtinCount),
             backstopCount: config.shieldedCategories.count
         )
     }
 
-    /// Pairs the current picker selection with identifiers, preserving
-    /// existing identifiers and pruning deselected tokens.
+    /// Pairs the current picker selection with identifiers, reusing the
+    /// durable registries. Deselected tokens leave the current selection
+    /// but keep their registered identifiers, so a re-pick restores the
+    /// original `AppRef` instead of minting a new policy identity.
     private func rebuildMappingFromSelection() {
         let appTokens = selection.applicationTokens
-        appRefsByToken = appRefsByToken.filter { appTokens.contains($0.key) }
         for token in appTokens where appRefsByToken[token] == nil {
             appRefsByToken[token] = AppRef(id: UUID().uuidString)
         }
@@ -367,7 +379,6 @@ public final class SetupFlowViewModel: ObservableObject {
         pickedApps = orderedApps
 
         let categoryTokens = selection.categoryTokens
-        categoryRefsByToken = categoryRefsByToken.filter { categoryTokens.contains($0.key) }
         for token in categoryTokens where categoryRefsByToken[token] == nil {
             categoryRefsByToken[token] = AppCategoryRef(id: UUID().uuidString)
         }
