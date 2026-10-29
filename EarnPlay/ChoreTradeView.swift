@@ -1,4 +1,5 @@
 import EarnPlayCore
+import Foundation
 import SwiftUI
 
 /// Single-chore offer UI (T3.2).
@@ -24,12 +25,33 @@ struct ChoreTradeView: View {
         let caption = policyPool.isEmpty
             ? "Demo chores"
             : "Parent's chores (policy v\(policyStore.currentPolicy.version))"
-        let manager = ShieldManager(
-            policyStore: policyStore,
-            enumeration: .empty,
-            backend: DemoShieldBackend(),
-            unlockStore: FileUnlockWindowStore()
-        )
+        // Configured policy/enumeration pair (fix round 2): the grant
+        // path only unlocks enumerated challenge-unlockable apps, so
+        // `.empty` enumeration could never grant. Demo mode (no sync)
+        // uses an isolated fixture store, leaving the real cache and
+        // the default-deny policy untouched; a synced policy derives
+        // its enumeration from its own app lists.
+        let manager: ShieldManager
+        if policyPool.isEmpty {
+            let demoDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("EarnPlayChoreTradeDemo", isDirectory: true)
+            let demoStore = PolicyStore(directory: demoDirectory)
+            _ = demoStore.apply(ChoreTradeDemoShield.demoPolicy(chorePool: pool))
+            manager = ShieldManager(
+                policyStore: demoStore,
+                enumeration: ChoreTradeDemoShield.demoEnumeration(),
+                backend: DemoShieldBackend(),
+                unlockStore: FileUnlockWindowStore(directory: demoDirectory)
+            )
+        } else {
+            manager = ShieldManager(
+                policyStore: policyStore,
+                enumeration: ChoreTradeDemoShield.enumeration(
+                    for: policyStore.currentPolicy),
+                backend: DemoShieldBackend(),
+                unlockStore: FileUnlockWindowStore()
+            )
+        }
         // No live practice session in this placeholder host: the chat
         // view (T1.8) will inject its EffortSessionRecorder so trade
         // taps count as session interactions.
@@ -189,9 +211,26 @@ final class ChoreTradeViewModel: ObservableObject {
     }
 
     func parentConfirm() {
-        guard let record = session.parentConfirm(at: Date()) else { return }
-        let ok = shieldManager.grantChoreTradeUnlock(minutes: record.grantedUnlockMinutes)
-        grantSucceeded = ok
+        // Commit-on-success (fix round 2): the session replaces itself
+        // with the confirmed copy only when the shield grant succeeds,
+        // so a failed grant leaves confirmation retryable instead of
+        // stranding the session in .granted with no unlock.
+        var grantAttempted: Bool?
+        let record = session.parentConfirmWithGrant(at: Date()) { record in
+            let ok = shieldManager.grantChoreTradeUnlock(
+                minutes: record.grantedUnlockMinutes)
+            grantAttempted = ok
+            return ok
+        }
+        guard record != nil else {
+            if grantAttempted == false {
+                grantSucceeded = false
+                effortRecorder?.recordInteraction()
+                refreshShieldStatus()
+            }
+            return
+        }
+        grantSucceeded = true
         effortRecorder?.recordInteraction()
         refreshShieldStatus()
     }
@@ -201,7 +240,7 @@ final class ChoreTradeViewModel: ObservableObject {
             let remaining = Int(shieldManager.remainingUnlockTime.rounded(.down))
             shieldStatus = "Device unlock active, \(remaining) seconds left."
         } else if grantSucceeded == false {
-            shieldStatus = "Device shields unchanged (no unblockable apps in the demo policy)."
+            shieldStatus = "Device shields unchanged (unlock not granted)."
         } else {
             shieldStatus = ""
         }

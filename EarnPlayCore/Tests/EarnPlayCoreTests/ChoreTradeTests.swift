@@ -195,6 +195,66 @@ final class ChoreTradeTests: XCTestCase {
         XCTAssertNil(session.makeOffer(at: Self.now))
     }
 
+    // MARK: - Accept rejects expired offers (fix round 2)
+
+    func testAcceptOfferRejectsExpiredOfferAndReturnsToIdle() {
+        // Offered while live, accepted after its expiry.
+        var session = ChoreTradeSession(pool: [
+            entry("Wash the car", expiry: Self.now.addingTimeInterval(60)),
+        ])
+        XCTAssertNotNil(session.makeOffer(at: Self.now))
+        XCTAssertFalse(session.acceptOffer(at: Self.now.addingTimeInterval(120)))
+        // Back to idle: no current offer, nothing completed or granted,
+        // and the order still fails closed from here.
+        XCTAssertEqual(session.phase, .idle)
+        XCTAssertNil(session.currentOffer)
+        XCTAssertFalse(session.hasGrantedUnlock)
+        XCTAssertNil(session.grantedMinutes)
+        XCTAssertNil(session.grantedRecord)
+        XCTAssertFalse(session.markDone(at: Self.now.addingTimeInterval(121)))
+        XCTAssertNil(session.parentConfirm(at: Self.now.addingTimeInterval(122)))
+        // The expired chore is not re-offered.
+        XCTAssertNil(session.makeOffer(at: Self.now.addingTimeInterval(120)))
+    }
+
+    func testAcceptOfferAtExactExpiryCountsAsExpired() {
+        var session = ChoreTradeSession(pool: [
+            entry("Wash the car", expiry: Self.now.addingTimeInterval(60)),
+        ])
+        XCTAssertNotNil(session.makeOffer(at: Self.now))
+        XCTAssertFalse(session.acceptOffer(at: Self.now.addingTimeInterval(60)))
+        XCTAssertEqual(session.phase, .idle)
+    }
+
+    func testAcceptOfferJustBeforeExpiryStillAccepts() {
+        var session = ChoreTradeSession(pool: [
+            entry("Wash the car", expiry: Self.now.addingTimeInterval(60)),
+        ])
+        XCTAssertNotNil(session.makeOffer(at: Self.now))
+        XCTAssertTrue(session.acceptOffer(at: Self.now.addingTimeInterval(59)))
+        XCTAssertEqual(session.currentOffer?.entry.chore, "Wash the car")
+    }
+
+    func testExpiredAcceptFreesSessionForAnotherEligibleChore() {
+        // "Paint the fence" was offered in an earlier session, so
+        // rotation offers expiring "Wash the car" first.
+        var session = ChoreTradeSession(
+            pool: [
+                entry("Wash the car", expiry: Self.now.addingTimeInterval(60)),
+                entry("Paint the fence", expiry: Self.future),
+            ],
+            priorHistory: ["Paint the fence"]
+        )
+        let first = session.makeOffer(at: Self.now)
+        XCTAssertEqual(first?.entry.chore, "Wash the car")
+        XCTAssertFalse(session.acceptOffer(at: Self.now.addingTimeInterval(120)))
+        XCTAssertEqual(session.phase, .idle)
+        // Another eligible chore can still be offered and accepted.
+        let second = session.makeOffer(at: Self.now.addingTimeInterval(120))
+        XCTAssertEqual(second?.entry.chore, "Paint the fence")
+        XCTAssertTrue(session.acceptOffer(at: Self.now.addingTimeInterval(121)))
+    }
+
     // MARK: - Rotation and time-of-day fit
 
     func testRotationPrefersNeverOfferedOverPriorHistory() {
@@ -294,6 +354,36 @@ final class ChoreTradeTests: XCTestCase {
         }
     }
 
+    /// Unlock store whose saves fail while `failSaves` is true, so a
+    /// grant can fail and then succeed on retry.
+    private final class FlakyUnlockStore: UnlockWindowStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var window: UnlockWindow?
+        private var failSavesValue = true
+        var failSaves: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return failSavesValue }
+            set { lock.lock(); defer { lock.unlock() }; failSavesValue = newValue }
+        }
+        func loadUnlockWindow() -> UnlockWindow? {
+            lock.lock()
+            defer { lock.unlock() }
+            return window
+        }
+        func saveUnlockWindow(_ window: UnlockWindow) throws {
+            lock.lock()
+            defer { lock.unlock() }
+            if failSavesValue {
+                throw NSError(domain: "ChoreTradeTests", code: 1)
+            }
+            self.window = window
+        }
+        func clearUnlockWindow() throws {
+            lock.lock()
+            defer { lock.unlock() }
+            window = nil
+        }
+    }
+
     private func makeManager() -> ShieldManager {
         let game = AppRef(id: "com.example.game")
         let games = AppCategoryRef(id: "games")
@@ -336,6 +426,36 @@ final class ChoreTradeTests: XCTestCase {
         XCTAssertFalse(manager.isUnlockActive)
     }
 
+    func testEmptyEnumerationCannotGrantEvenWithUnblockablePolicy() {
+        // Mechanism behind fix round 2 finding 1:
+        // `grantUnlockForAllChallengeUnlockable` grants only over
+        // `enumeration.apps`, so `.empty` always yields no apps and
+        // returns false even when the policy lists unblockable apps.
+        let game = AppRef(id: "com.example.game")
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(Policy(
+            version: 1,
+            alwaysAllowed: [.phone],
+            unblockable: [game],
+            neverUnlockableOverrides: [],
+            unlockDurations: .default,
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: [],
+            movementSettings: .default
+        )), .applied)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: .empty,
+            backend: SimulatedShieldBackend(),
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory)
+        )
+        XCTAssertFalse(manager.grantChoreTradeUnlock(minutes: 10))
+        XCTAssertFalse(manager.isUnlockActive)
+        XCTAssertEqual(manager.remainingUnlockTime, 0)
+    }
+
     func testNoShieldUnlockExistsBetweenDoneAndParentConfirm() {
         let manager = makeManager()
         var session = ChoreTradeSession(pool: [entry("Wash the car", minutes: 10)])
@@ -357,5 +477,222 @@ final class ChoreTradeTests: XCTestCase {
         ))
         XCTAssertTrue(manager.isUnlockActive)
         XCTAssertEqual(manager.remainingUnlockTime, 10 * 60, accuracy: 0.001)
+    }
+
+    // MARK: - Demo shield fixture (fix round 2, finding 1)
+
+    func testDemoPolicyKeepsDefaultDenyShape() {
+        let policy = ChoreTradeDemoShield.demoPolicy(chorePool: DemoChorePool.seeded())
+        XCTAssertEqual(policy.alwaysAllowed, Policy.defaultPolicy.alwaysAllowed)
+        XCTAssertEqual(policy.unblockable, [ChoreTradeDemoShield.demoApp])
+        XCTAssertTrue(policy.neverUnlockableOverrides.isEmpty)
+        XCTAssertTrue(policy.isChallengeUnlockable(ChoreTradeDemoShield.demoApp))
+        XCTAssertTrue(ChoreTradeDemoShield.demoEnumeration().apps.contains(
+            EnumeratedApp(
+                app: ChoreTradeDemoShield.demoApp,
+                category: ChoreTradeDemoShield.demoCategory)))
+    }
+
+    func testDemoFixtureConfirmFlowGrantsSimulatedUnlock() {
+        // The pair the demo UI confirms against: isolated demo policy
+        // plus matching enumeration. The full offer -> accept -> done
+        // -> confirm flow grants the promised minutes as a simulated
+        // unlock.
+        let pool = DemoChorePool.seeded()
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(
+            policyStore.apply(ChoreTradeDemoShield.demoPolicy(chorePool: pool)),
+            .applied
+        )
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: ChoreTradeDemoShield.demoEnumeration(),
+            backend: SimulatedShieldBackend(),
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory)
+        )
+        var session = ChoreTradeSession(pool: pool)
+        let offer = session.makeOffer(at: Self.now)
+        XCTAssertNotNil(offer)
+        XCTAssertTrue(session.acceptOffer(at: Self.now))
+        XCTAssertTrue(session.markDone(at: Self.now))
+        XCTAssertFalse(manager.isUnlockActive)
+
+        let record = session.parentConfirmWithGrant(at: Self.now) { record in
+            manager.grantChoreTradeUnlock(minutes: record.grantedUnlockMinutes)
+        }
+
+        XCTAssertNotNil(record)
+        XCTAssertTrue(session.hasGrantedUnlock)
+        XCTAssertTrue(manager.isUnlockActive)
+        XCTAssertEqual(
+            manager.remainingUnlockTime,
+            TimeInterval((offer?.entry.unlockMinutes ?? 0) * 60),
+            accuracy: 0.001
+        )
+    }
+
+    func testSyncedPolicyEnumerationGrantsWhenUnblockablePresent() {
+        let game = AppRef(id: "com.example.game")
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(Policy(
+            version: 1,
+            alwaysAllowed: [.phone],
+            unblockable: [game],
+            neverUnlockableOverrides: [],
+            unlockDurations: .default,
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: [],
+            movementSettings: .default
+        )), .applied)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: ChoreTradeDemoShield.enumeration(
+                for: policyStore.currentPolicy),
+            backend: SimulatedShieldBackend(),
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory)
+        )
+        XCTAssertTrue(manager.grantChoreTradeUnlock(minutes: 10))
+        XCTAssertTrue(manager.isUnlockActive)
+    }
+
+    func testDefaultDenyStillGrantsNothing() {
+        // The fixture work weakens nothing: the default policy keeps
+        // its empty unblockable list and grants nothing through the
+        // derived enumeration.
+        XCTAssertTrue(Policy.defaultPolicy.unblockable.isEmpty)
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.currentPolicy, Policy.defaultPolicy)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: ChoreTradeDemoShield.enumeration(
+                for: policyStore.currentPolicy),
+            backend: SimulatedShieldBackend(),
+            clock: FakeMonotonicClock(),
+            unlockStore: FileUnlockWindowStore(directory: directory)
+        )
+        XCTAssertFalse(manager.grantChoreTradeUnlock(minutes: 10))
+        XCTAssertFalse(manager.isUnlockActive)
+    }
+
+    // MARK: - Commit granted phase only on grant success (fix round 2, finding 2)
+
+    private func makeManagerWithStore(_ store: any UnlockWindowStore) -> ShieldManager {
+        let game = AppRef(id: "com.example.game")
+        let games = AppCategoryRef(id: "games")
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(Policy(
+            version: 1,
+            alwaysAllowed: [.phone],
+            unblockable: [game],
+            neverUnlockableOverrides: [],
+            unlockDurations: .default,
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: [],
+            movementSettings: .default
+        )), .applied)
+        return ShieldManager(
+            policyStore: policyStore,
+            enumeration: ShieldEnumeration(
+                apps: [EnumeratedApp(app: game, category: games)],
+                categories: [games]
+            ),
+            backend: SimulatedShieldBackend(),
+            clock: FakeMonotonicClock(),
+            unlockStore: store
+        )
+    }
+
+    func testFailedGrantLeavesConfirmationRetryable() {
+        let store = FlakyUnlockStore()
+        store.failSaves = true
+        let manager = makeManagerWithStore(store)
+        var session = ChoreTradeSession(pool: [entry("Wash the car", minutes: 10)])
+        XCTAssertNotNil(session.makeOffer(at: Self.now))
+        XCTAssertTrue(session.acceptOffer(at: Self.now))
+        XCTAssertTrue(session.markDone(at: Self.now))
+
+        let failed = session.parentConfirmWithGrant(at: Self.now) { record in
+            manager.grantChoreTradeUnlock(minutes: record.grantedUnlockMinutes)
+        }
+
+        // Failed grant: no granted phase (so no "Unlock granted" UI,
+        // which renders only from .granted), no unlock.
+        XCTAssertNil(failed)
+        guard case .doneAwaitingConfirm = session.phase else {
+            return XCTFail(
+                "failed grant must not commit .granted, got \(session.phase)")
+        }
+        XCTAssertFalse(session.hasGrantedUnlock)
+        XCTAssertFalse(manager.isUnlockActive)
+
+        // Retryable: once persistence works, confirming again grants.
+        store.failSaves = false
+        let record = session.parentConfirmWithGrant(at: Self.now) { record in
+            manager.grantChoreTradeUnlock(minutes: record.grantedUnlockMinutes)
+        }
+        XCTAssertNotNil(record)
+        XCTAssertEqual(record?.grantedUnlockMinutes, 10)
+        XCTAssertTrue(session.hasGrantedUnlock)
+        XCTAssertTrue(manager.isUnlockActive)
+        XCTAssertEqual(manager.remainingUnlockTime, 10 * 60, accuracy: 0.001)
+    }
+
+    func testSuccessfulGrantCommitsGrantedPhaseAsBefore() {
+        let store = FlakyUnlockStore()
+        store.failSaves = false
+        let manager = makeManagerWithStore(store)
+        var session = ChoreTradeSession(pool: [entry("Wash the car", minutes: 10)])
+        XCTAssertNotNil(session.makeOffer(at: Self.now))
+        XCTAssertTrue(session.acceptOffer(at: Self.now))
+        XCTAssertTrue(session.markDone(at: Self.now))
+
+        let record = session.parentConfirmWithGrant(at: Self.now) { record in
+            manager.grantChoreTradeUnlock(minutes: record.grantedUnlockMinutes)
+        }
+
+        XCTAssertNotNil(record)
+        XCTAssertEqual(record?.grantedUnlockMinutes, 10)
+        XCTAssertTrue(session.hasGrantedUnlock)
+        XCTAssertTrue(manager.isUnlockActive)
+        // Still one grant per trade: a second confirm returns nil and
+        // never re-runs the grant.
+        var secondCalls = 0
+        XCTAssertNil(session.parentConfirmWithGrant(at: Self.now) { _ in
+            secondCalls += 1
+            return true
+        })
+        XCTAssertEqual(secondCalls, 0)
+    }
+
+    func testParentConfirmWithGrantCallsGrantOnlyFromDoneAwaitingConfirm() {
+        // The grant never runs from idle, offered, or accepted: the
+        // strict order is unchanged.
+        var calls = 0
+        var idle = ChoreTradeSession(pool: neutralPool())
+        XCTAssertNil(idle.parentConfirmWithGrant(at: Self.now) { _ in
+            calls += 1
+            return true
+        })
+        var offered = ChoreTradeSession(pool: neutralPool())
+        XCTAssertNotNil(offered.makeOffer(at: Self.now))
+        XCTAssertNil(offered.parentConfirmWithGrant(at: Self.now) { _ in
+            calls += 1
+            return true
+        })
+        var accepted = ChoreTradeSession(pool: neutralPool())
+        XCTAssertNotNil(accepted.makeOffer(at: Self.now))
+        XCTAssertTrue(accepted.acceptOffer(at: Self.now))
+        XCTAssertNil(accepted.parentConfirmWithGrant(at: Self.now) { _ in
+            calls += 1
+            return true
+        })
+        XCTAssertEqual(calls, 0)
+        XCTAssertFalse(idle.hasGrantedUnlock)
+        XCTAssertFalse(offered.hasGrantedUnlock)
+        XCTAssertFalse(accepted.hasGrantedUnlock)
     }
 }

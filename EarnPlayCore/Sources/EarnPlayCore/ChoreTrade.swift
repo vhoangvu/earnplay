@@ -188,10 +188,18 @@ public struct ChoreTradeSession: Equatable, Sendable {
         return offer
     }
 
-    /// Accepts the current offer. True only from the offered phase.
+    /// Accepts the current offer. True only from the offered phase with
+    /// a live offer: an offer at or past its expiry (`expiry <= now` is
+    /// expired, matching `eligibleChores`) returns the session to idle
+    /// and false, so another eligible chore can be offered. The expired
+    /// chore itself is never re-offered: `makeOffer` filters it.
     @discardableResult
     public mutating func acceptOffer(at now: Date) -> Bool {
         guard case .offered(let offer) = phase else { return false }
+        if offer.entry.expiry <= now {
+            phase = .idle
+            return false
+        }
         phase = .accepted(offer, acceptedAt: now)
         return true
     }
@@ -236,6 +244,28 @@ public struct ChoreTradeSession: Equatable, Sendable {
             grantedUnlockMinutes: offer.entry.unlockMinutes
         )
         phase = .granted(record)
+        return record
+    }
+
+    /// Parent confirms completion, committing the terminal granted phase
+    /// only when `grant` reports success.
+    ///
+    /// Confirms a copy of the session and runs `grant` with the resulting
+    /// record; the copy replaces the session only when `grant` returns
+    /// true. A failed grant (e.g. persisting the unlock window fails)
+    /// leaves the session in `doneAwaitingConfirm`, so confirmation stays
+    /// retryable instead of losing the reward. Returns nil — without
+    /// calling `grant` — from any other phase, preserving the strict
+    /// order and the one-grant-per-trade guarantee.
+    @discardableResult
+    public mutating func parentConfirmWithGrant(
+        at now: Date,
+        grant: (ChoreTradeRecord) -> Bool
+    ) -> ChoreTradeRecord? {
+        var confirmed = self
+        guard let record = confirmed.parentConfirm(at: now) else { return nil }
+        guard grant(record) else { return nil }
+        self = confirmed
         return record
     }
 
@@ -346,6 +376,65 @@ public enum DemoChorePool {
                 verificationMode: .parentConfirm
             ),
         ]
+    }
+}
+
+// MARK: - Demo shield fixture (fix round 2)
+
+/// Configured policy/enumeration pairs behind the chore-trade demo UI.
+///
+/// `grantUnlockForAllChallengeUnlockable` grants only over enumerated
+/// challenge-unlockable apps, so a manager built with `.empty`
+/// enumeration can never grant — the confirm flow needs a configured
+/// pair. The demo has no FamilyControls picker (T2.3), so the view takes
+/// its pair from here instead. Neither builder touches
+/// `Policy.defaultPolicy`: the default-deny policy keeps its empty
+/// unblockable list, and the demo policy lives only in the view's
+/// isolated store, never in the real on-disk cache.
+public enum ChoreTradeDemoShield {
+    /// The demo fixture's unblockable app (opaque demo key, not a real
+    /// bundle ID — nothing is enforced outside the simulated backend).
+    public static let demoApp = AppRef(id: "com.example.earnplay.demo-play")
+    /// The demo fixture's category.
+    public static let demoCategory = AppCategoryRef(id: "earnplay.demo")
+
+    /// Demo policy: default-deny shape (the default allowlist, no
+    /// overrides) plus the demo unblockable app and the given chore
+    /// pool. Version 1 so it applies over a fresh isolated store.
+    public static func demoPolicy(chorePool: [ChorePoolEntry]) -> Policy {
+        Policy(
+            version: 1,
+            alwaysAllowed: Policy.defaultPolicy.alwaysAllowed,
+            unblockable: [demoApp],
+            neverUnlockableOverrides: [],
+            unlockDurations: .default,
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: chorePool,
+            movementSettings: .default
+        )
+    }
+
+    /// Enumeration matching the demo policy: the demo app under the
+    /// demo category, so a confirm-flow grant creates the simulated
+    /// unlock.
+    public static func demoEnumeration() -> ShieldEnumeration {
+        ShieldEnumeration(
+            apps: [EnumeratedApp(app: demoApp, category: demoCategory)],
+            categories: [demoCategory]
+        )
+    }
+
+    /// Enumeration derived from a synced policy's own app lists (the
+    /// demo stand-in for picker enumeration): every allowlisted and
+    /// unblockable app, deterministically ordered, with no category
+    /// metadata. Grants still gate on `isChallengeUnlockable`, so a
+    /// policy with no unblockable apps grants nothing.
+    public static func enumeration(for policy: Policy) -> ShieldEnumeration {
+        let apps = Set(policy.alwaysAllowed + policy.unblockable)
+            .sorted { $0.id < $1.id }
+            .map { EnumeratedApp(app: $0) }
+        return ShieldEnumeration(apps: apps)
     }
 }
 
