@@ -361,17 +361,19 @@ public final class HintLadder: @unchecked Sendable {
             // one of them ([6,7] renders as six rows of seven).
             return "Look again at \(a) × \(b): picture the equal groups in the problem before you answer."
         case .strategy:
-            return "Strategy: split the second number into two easier parts, multiply \(a) by each part, then add the two parts together."
+            return "Strategy: split the second number into two easier parts, multiply \(a) by each part, then add the two products together."
         case .workedStep:
             // Zero product: the near-complete template would show
             // 0 × 7 = 0 × 6 + 0 = 0 + 0, whose partial already equals
-            // the answer. Use a conceptual step instead, with no group
-            // count or size (word problems render a-groups-of-b while
-            // multiplication facts render b-groups-of-a, so naming
-            // either direction reverses one of them) and no zero
-            // word-form (nothing/empty/zero/none would state the answer).
+            // the answer. Work upward from a neighbor fact instead
+            // (0 × 7 = 1 × 7 − 7 = 7 − 7) and leave the adjustment to
+            // the child, with no group count or size (word problems
+            // render a-groups-of-b while multiplication facts render
+            // b-groups-of-a, so naming either direction reverses one
+            // of them) and no zero word-form (nothing/empty/zero/none
+            // would state the answer).
             if a == 0, b >= 2 {
-                return "Worked step: \(a) × \(b) — picture what each part holds, then count all the parts together. How many is that altogether?"
+                return "Worked step: \(a) × \(b) = 1 × \(b) − \(b) = \(b) − \(b). Now work out \(b) − \(b) yourself — how many is that altogether?"
             }
             // One step short of the answer: the near-complete product,
             // leaving the final addition to the child. The completion
@@ -386,7 +388,13 @@ public final class HintLadder: @unchecked Sendable {
                 return "Worked step: \(a) × 1 means the amount appears just once. How many is that altogether?"
             }
             if b == 0 {
-                return "Worked step: \(a) × 0 — picture what each part holds, then count all the parts together. How many is that altogether?"
+                // 0 × 0: the neighbor above would read 0 × 1 − 0 =
+                // 0 − 0, whose partial already equals the answer, so
+                // step down from 1 × 1 instead.
+                if a == 0 {
+                    return "Worked step: 0 × 0 = 1 × 1 − 1 = 1 − 1. Now work out 1 − 1 yourself — how many is that altogether?"
+                }
+                return "Worked step: \(a) × 0 = \(a) × 1 − \(a) = \(a) − \(a). Now work out \(a) − \(a) yourself — how many is that altogether?"
             }
             return genericText(level)
         }
@@ -612,7 +620,7 @@ public final class HintLadder: @unchecked Sendable {
     ///   addition to the child.
     private static func additionSplitStep(operands: [Int], total: Int, answer: String) -> String {
         if total == 0 {
-            return "Worked step: start with the first amount and add each next amount in turn — how many is that altogether?"
+            return "Worked step: work a neighbor total first — pretend the last round gave one, add the rounds to get that neighbor total, then take that one back away. How many is that altogether?"
         }
         if operands.count >= 3 {
             for index in operands.indices.reversed() where operands[index] > 0 {
@@ -629,7 +637,7 @@ public final class HintLadder: @unchecked Sendable {
             }
         }
         if total > 0, operands.contains(0) {
-            return "Worked step: adding 0 changes nothing — the total is the other amount. Which amount did you start with besides zero?"
+            return "Worked step: adding 0 changes nothing — the total is the other amount. Which amount in the problem is not zero?"
         }
         if operands.count == 2, operands.allSatisfy({ $0 == 1 }) {
             return "Worked step: start at 1 and count one more — what comes next?"

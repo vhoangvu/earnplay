@@ -1193,4 +1193,122 @@ final class HintLadderTests: XCTestCase {
         XCTAssertFalse(worked?.text.contains("point to the exact sentence") == true,
                        "must not fall back to generic instructions: \(worked?.text ?? "")")
     }
+
+    // MARK: - Fix round 6
+
+    func testSplitStrategyAddsProductsNotParts() {
+        // The strategy told the child to "add the two parts together" —
+        // the parts are the split pieces of the second factor, and adding
+        // them gives the factor back, not the product.
+        let proposal = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                       operands: [7, 8], promptText: "7 cartons of 8 eggs. How many eggs?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "56"))
+        let ladder = makeLadder(proposal, questionId: "q-strat-prod")
+        _ = ladder.requestHint()
+        let strategy = ladder.requestHint()
+        XCTAssertEqual(strategy?.level, .strategy)
+        XCTAssertTrue(strategy?.text.contains("products") == true,
+                      "strategy must name the products: \(strategy?.text ?? "")")
+        XCTAssertFalse(strategy?.text.contains("add the two parts") == true,
+                       "strategy must not tell the child to add the parts: \(strategy?.text ?? "")")
+    }
+
+    func testZeroFirstFactorWorkedStepUsesNeighborFact() {
+        // 0 × 7: the worked step repeated the nudge ("picture ... count").
+        // It must work a neighbor fact and leave the adjustment to the child.
+        let proposal = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                       operands: [0, 7], promptText: "0 bags of 7 marbles. How many marbles?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"))
+        let ladder = makeLadder(proposal, questionId: "q-nbr07")
+        let nudge = ladder.requestHint()
+        _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertFalse(worked?.text == nudge?.text, "worked step must differ from the nudge")
+        XCTAssertFalse(worked?.text.contains("picture what each part holds") == true,
+                       "worked step must not repeat the nudge: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("1 × 7") == true,
+                      "must work the neighbor fact: \(worked?.text ?? "")")
+        XCTAssertTrue(worked?.text.contains("7 − 7") == true,
+                      "child must compute the adjustment: \(worked?.text ?? "")")
+        assertHintHidesZeroWords(worked?.text ?? "")
+    }
+
+    func testZeroSecondFactorWorkedStepUsesNeighborFact() {
+        // 6 × 0 (and 0 × 0): same neighbor-fact requirement as 0 × 7.
+        let cases: [(operands: [Int], id: String, neighbor: String, adjustment: String)] = [
+            ([6, 0], "q-nbr60", "6 × 1", "6 − 6"),
+            ([0, 0], "q-nbr00", "1 × 1", "1 − 1"),
+        ]
+        for (operands, id, neighbor, adjustment) in cases {
+            let proposal = ProposedProblem(skill: .multiplicationFacts, form: .story,
+                                           operands: operands,
+                                           promptText: "\(operands[0]) bags, \(operands[1]) marbles each. How many?")
+            XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"), id)
+            let ladder = makeLadder(proposal, questionId: id)
+            let nudge = ladder.requestHint()
+            _ = ladder.requestHint()
+            let worked = ladder.requestHint()
+            XCTAssertEqual(worked?.level, .workedStep, id)
+            XCTAssertFalse(worked?.text == nudge?.text, "\(id): worked step must differ from the nudge")
+            XCTAssertFalse(worked?.text.contains("picture what each part holds") == true,
+                           "\(id): must not repeat the nudge: \(worked?.text ?? "")")
+            XCTAssertTrue(worked?.text.contains(neighbor) == true,
+                          "\(id): must work the neighbor fact: \(worked?.text ?? "")")
+            XCTAssertTrue(worked?.text.contains(adjustment) == true,
+                          "\(id): child must compute the adjustment: \(worked?.text ?? "")")
+            assertHintHidesZeroWords(worked?.text ?? "")
+        }
+    }
+
+    func testAllZeroAdditionWorkedStepUsesNeighborTrial() {
+        // 0 + 0 (+ 0): the worked step repeated the nudge instead of an
+        // intermediate step. Number-free (any "0" would be the answer) and
+        // zero-word-free, so the trial is described in words.
+        let cases: [(operands: [Int], id: String)] = [
+            ([0, 0], "q-nbradd00"),
+            ([0, 0, 0], "q-nbradd000"),
+        ]
+        for (operands, id) in cases {
+            let rounds = operands.map { "\($0)" }.joined(separator: ", ")
+            let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                           operands: operands, operation: .add,
+                                           promptText: "Mia collects shells in rounds of \(rounds). How many shells does she collect in all?")
+            XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "0"), id)
+            let ladder = makeLadder(proposal, questionId: id)
+            let nudge = ladder.requestHint()
+            _ = ladder.requestHint()
+            let worked = ladder.requestHint()
+            XCTAssertEqual(worked?.level, .workedStep, id)
+            XCTAssertFalse(worked?.text == nudge?.text, "\(id): worked step must differ from the nudge")
+            XCTAssertFalse(worked?.text.contains("add each next amount in turn") == true,
+                           "\(id): must not repeat the nudge: \(worked?.text ?? "")")
+            XCTAssertTrue(worked?.text.contains("neighbor") == true,
+                          "\(id): must work a neighbor trial: \(worked?.text ?? "")")
+            XCTAssertTrue(worked?.text.lowercased().contains("how many") == true,
+                          "\(id): child must still determine the total: \(worked?.text ?? "")")
+            assertHintHidesZeroWords(worked?.text ?? "")
+            XCTAssertFalse(worked?.text.contains("0") == true,
+                           "\(id): number-free step, any digit would be the answer: \(worked?.text ?? "")")
+        }
+    }
+
+    func testZeroStartAdditionAsksForNonzeroAmount() {
+        // 0 + 7: "Which amount did you start with besides zero?"
+        // contradicts the problem — the child started with zero.
+        let proposal = ProposedProblem(skill: .wordProblem, form: .story,
+                                       operands: [0, 7], operation: .add,
+                                       promptText: "Mia collects shells in rounds of 0, 7. How many shells does she collect in all?")
+        XCTAssertEqual(solver.solve(proposal), .verified(verifiedAnswer: "7"))
+        let ladder = makeLadder(proposal, questionId: "q-add07nz")
+        _ = ladder.requestHint(); _ = ladder.requestHint()
+        let worked = ladder.requestHint()
+        XCTAssertEqual(worked?.level, .workedStep)
+        XCTAssertTrue(worked?.text.contains("Which amount in the problem is not zero?") == true,
+                      "must ask for the nonzero amount: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("did you start with") == true,
+                       "must not claim the child started with the nonzero amount: \(worked?.text ?? "")")
+        XCTAssertFalse(worked?.text.contains("7") == true,
+                       "must not reveal the total: \(worked?.text ?? "")")
+    }
 }
