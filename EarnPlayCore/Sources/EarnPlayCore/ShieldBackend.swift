@@ -69,7 +69,9 @@ public struct ShieldEnumeration: Codable, Equatable, Sendable {
 /// path accepts that coarse trade-off instead of relying on an
 /// exemption overriding a category shield.
 public struct ShieldConfiguration: Codable, Equatable, Sendable {
-    /// Enumerated, non-allowlist apps to shield individually.
+    /// Enumerated or install-observed, non-allowlist apps to shield
+    /// individually (T2.5 default-deny observations join this set until
+    /// a policy sync classifies them).
     public var shieldedApplications: Set<AppRef>
     /// Categories to shield as a backstop for unenumerated apps.
     public var shieldedCategories: Set<AppCategoryRef>
