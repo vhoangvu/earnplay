@@ -13,12 +13,7 @@ import EarnPlayCore
 struct PolicyEditorView: View {
     @State private var store = PolicyStore()
     @State private var queue = PolicyUpdateQueue()
-    @State private var draft = Policy.defaultPolicy
-    @State private var baseVersion = 0
-    @State private var pendingCount = 0
-    @State private var statusText = ""
-    @State private var errorText = ""
-    @State private var isLoaded = false
+    @State private var state = PolicyEditorState()
 
     var body: some View {
         NavigationStack {
@@ -27,17 +22,17 @@ struct PolicyEditorView: View {
                 appListSection(
                     title: "Always allowed",
                     footnote: "Never blocked. Defaults: Phone, Messages, EarnPlay itself.",
-                    apps: $draft.alwaysAllowed
+                    apps: $state.draft.alwaysAllowed
                 )
                 appListSection(
                     title: "Unblockable",
                     footnote: "Locked by default; the ONLY apps a completed challenge can open.",
-                    apps: $draft.unblockable
+                    apps: $state.draft.unblockable
                 )
                 appListSection(
                     title: "Never-unlockable overrides",
                     footnote: "Stay locked with no challenge offered, even if unblockable.",
-                    apps: $draft.neverUnlockableOverrides
+                    apps: $state.draft.neverUnlockableOverrides
                 )
                 unlockDurationsSection
                 effortFloorSection
@@ -55,10 +50,10 @@ struct PolicyEditorView: View {
 
     private var versionSection: some View {
         Section("Version") {
-            Text("Current version: \(baseVersion)")
-            Text("Saving creates version \(baseVersion + 1)")
+            Text("Current version: \(state.baseVersion)")
+            Text("Saving creates version \(state.baseVersion + 1)")
                 .foregroundStyle(.secondary)
-            Text("Updates queued for sync: \(pendingCount)")
+            Text("Updates queued for sync: \(state.pendingCount)")
                 .foregroundStyle(.secondary)
         }
     }
@@ -78,13 +73,13 @@ struct PolicyEditorView: View {
     private var unlockDurationsSection: some View {
         Section {
             Stepper(
-                "Practice-earned unlock: \(draft.unlockDurations.practiceMinutes) min",
-                value: $draft.unlockDurations.practiceMinutes,
+                "Practice-earned unlock: \(state.draft.unlockDurations.practiceMinutes) min",
+                value: $state.draft.unlockDurations.practiceMinutes,
                 in: 1 ... 240
             )
             Stepper(
-                "Trade unlock: \(draft.unlockDurations.tradeMinutes) min",
-                value: $draft.unlockDurations.tradeMinutes,
+                "Trade unlock: \(state.draft.unlockDurations.tradeMinutes) min",
+                value: $state.draft.unlockDurations.tradeMinutes,
                 in: 1 ... 240
             )
         } header: { Text("Unlock durations") } footer: {
@@ -97,13 +92,13 @@ struct PolicyEditorView: View {
     private var effortFloorSection: some View {
         Section {
             Stepper(
-                "Minimum genuine attempts: \(draft.effortFloorSettings.minGenuineAttempts)",
-                value: $draft.effortFloorSettings.minGenuineAttempts,
+                "Minimum genuine attempts: \(state.draft.effortFloorSettings.minGenuineAttempts)",
+                value: $state.draft.effortFloorSettings.minGenuineAttempts,
                 in: 0 ... 20
             )
             Stepper(
-                "Minimum hint / follow-up interactions: \(draft.effortFloorSettings.minHintOrFollowUpInteractions)",
-                value: $draft.effortFloorSettings.minHintOrFollowUpInteractions,
+                "Minimum hint / follow-up interactions: \(state.draft.effortFloorSettings.minHintOrFollowUpInteractions)",
+                value: $state.draft.effortFloorSettings.minHintOrFollowUpInteractions,
                 in: 0 ... 20
             )
         } header: { Text("Effort floor") } footer: {
@@ -116,18 +111,18 @@ struct PolicyEditorView: View {
     private var tradeCapsSection: some View {
         Section {
             Stepper(
-                "Max trade offers per session: \(draft.tradeCaps.maxTradesPerSession)",
-                value: $draft.tradeCaps.maxTradesPerSession,
+                "Max trade offers per session: \(state.draft.tradeCaps.maxTradesPerSession)",
+                value: $state.draft.tradeCaps.maxTradesPerSession,
                 in: 0 ... 10
             )
             Stepper(
-                "Weekly max movement trades: \(draft.tradeCaps.weeklyMaxMovementTrades)",
-                value: $draft.tradeCaps.weeklyMaxMovementTrades,
+                "Weekly max movement trades: \(state.draft.tradeCaps.weeklyMaxMovementTrades)",
+                value: $state.draft.tradeCaps.weeklyMaxMovementTrades,
                 in: 0 ... 21
             )
             Stepper(
-                "Weekly max chore trades: \(draft.tradeCaps.weeklyMaxChoreTrades)",
-                value: $draft.tradeCaps.weeklyMaxChoreTrades,
+                "Weekly max chore trades: \(state.draft.tradeCaps.weeklyMaxChoreTrades)",
+                value: $state.draft.tradeCaps.weeklyMaxChoreTrades,
                 in: 0 ... 21
             )
         } header: { Text("Trade caps") } footer: {
@@ -139,41 +134,41 @@ struct PolicyEditorView: View {
 
     private var chorePoolSection: some View {
         Section {
-            if draft.chorePool.isEmpty {
+            if state.draft.chorePool.isEmpty {
                 Text("No chores. The AI can only offer parent-stocked chores.")
                     .foregroundStyle(.secondary)
             }
-            ForEach(draft.chorePool.indices, id: \.self) { index in
-                DisclosureGroup(draft.chorePool[index].chore.isEmpty
-                    ? "Chore \(index + 1)" : draft.chorePool[index].chore) {
-                    TextField("Chore", text: $draft.chorePool[index].chore)
+            ForEach(state.draft.chorePool.indices, id: \.self) { index in
+                DisclosureGroup(state.draft.chorePool[index].chore.isEmpty
+                    ? "Chore \(index + 1)" : state.draft.chorePool[index].chore) {
+                    TextField("Chore", text: $state.draft.chorePool[index].chore)
                     Stepper(
-                        "Unlock minutes: \(draft.chorePool[index].unlockMinutes)",
-                        value: $draft.chorePool[index].unlockMinutes,
+                        "Unlock minutes: \(state.draft.chorePool[index].unlockMinutes)",
+                        value: $state.draft.chorePool[index].unlockMinutes,
                         in: 1 ... 240
                     )
                     DatePicker(
                         "Expiry",
-                        selection: $draft.chorePool[index].expiry,
+                        selection: $state.draft.chorePool[index].expiry,
                         displayedComponents: [.date, .hourAndMinute]
                     )
                     Stepper(
-                        "Weekly cap: \(draft.chorePool[index].weeklyCap)",
-                        value: $draft.chorePool[index].weeklyCap,
+                        "Weekly cap: \(state.draft.chorePool[index].weeklyCap)",
+                        value: $state.draft.chorePool[index].weeklyCap,
                         in: 0 ... 21
                     )
                     Picker(
                         "Verification",
-                        selection: $draft.chorePool[index].verificationMode
+                        selection: $state.draft.chorePool[index].verificationMode
                     ) {
                         Text("Parent confirms").tag(ChoreVerificationMode.parentConfirm)
                         Text("Photo proof (async)").tag(ChoreVerificationMode.photoAsync)
                     }
                 }
             }
-            .onDelete { draft.chorePool.remove(atOffsets: $0) }
+            .onDelete { state.draft.chorePool.remove(atOffsets: $0) }
             Button("Add chore") {
-                draft.chorePool.append(ChorePoolEntry(
+                state.draft.chorePool.append(ChorePoolEntry(
                     chore: "",
                     unlockMinutes: 10,
                     expiry: Calendar.current.date(
@@ -199,13 +194,13 @@ struct PolicyEditorView: View {
                 )
             }
             Stepper(
-                "Max repetitions: \(draft.movementSettings.maxReps)",
-                value: $draft.movementSettings.maxReps,
+                "Max repetitions: \(state.draft.movementSettings.maxReps)",
+                value: $state.draft.movementSettings.maxReps,
                 in: 1 ... 500
             )
             Stepper(
-                "Movement trade unlock: \(draft.movementSettings.tradeUnlockDurationMinutes) min",
-                value: $draft.movementSettings.tradeUnlockDurationMinutes,
+                "Movement trade unlock: \(state.draft.movementSettings.tradeUnlockDurationMinutes) min",
+                value: $state.draft.movementSettings.tradeUnlockDurationMinutes,
                 in: 1 ... 240
             )
         } header: { Text("Movement trade") } footer: {
@@ -215,12 +210,12 @@ struct PolicyEditorView: View {
 
     private func activityBinding(for activity: MovementActivity) -> Binding<Bool> {
         Binding(
-            get: { draft.movementSettings.allowedActivities.contains(activity) },
+            get: { state.draft.movementSettings.allowedActivities.contains(activity) },
             set: { enabled in
-                if enabled, !draft.movementSettings.allowedActivities.contains(activity) {
-                    draft.movementSettings.allowedActivities.append(activity)
+                if enabled, !state.draft.movementSettings.allowedActivities.contains(activity) {
+                    state.draft.movementSettings.allowedActivities.append(activity)
                 } else if !enabled {
-                    draft.movementSettings.allowedActivities.removeAll { $0 == activity }
+                    state.draft.movementSettings.allowedActivities.removeAll { $0 == activity }
                 }
             }
         )
@@ -230,17 +225,17 @@ struct PolicyEditorView: View {
 
     private var saveSection: some View {
         Section {
-            Button("Save (creates version \(baseVersion + 1))") { save() }
-                .disabled(!isLoaded)
+            Button("Save (creates version \(state.baseVersion + 1))") { save() }
+                .disabled(!state.isLoaded)
             Button("Discard changes", role: .destructive) { reload() }
-                .disabled(!isLoaded)
-            if !statusText.isEmpty {
-                Text(statusText)
+                .disabled(!state.isLoaded)
+            if !state.statusText.isEmpty {
+                Text(state.statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if !errorText.isEmpty {
-                Text(errorText)
+            if !state.errorText.isEmpty {
+                Text(state.errorText)
                     .font(.caption)
                     .foregroundStyle(.red)
             }
@@ -252,30 +247,11 @@ struct PolicyEditorView: View {
     // MARK: - Load / save
 
     private func reload() {
-        // Deliver a save interrupted between the policy write and the
-        // queue write (relaunch recovery, no manual re-save needed).
-        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: queue)
-        let current = store.currentPolicy
-        draft = current
-        baseVersion = current.version
-        pendingCount = queue.pendingUpdates().count
-        errorText = ""
-        isLoaded = true
+        state.reload(adminStore: store, queue: queue)
     }
 
     private func save() {
-        errorText = ""
-        do {
-            let (update, _) = try PolicyEditorSave.save(
-                draft: draft, adminStore: store, queue: queue
-            )
-            draft = update
-            baseVersion = update.version
-            pendingCount = queue.pendingUpdates().count
-            statusText = "Saved version \(update.version) — queued for sync (\(pendingCount) pending)."
-        } catch {
-            errorText = "Save failed: \(String(describing: error))"
-        }
+        state.save(adminStore: store, queue: queue)
     }
 }
 

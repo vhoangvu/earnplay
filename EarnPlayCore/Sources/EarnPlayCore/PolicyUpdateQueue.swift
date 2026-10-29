@@ -22,8 +22,12 @@ import Foundation
 /// over the same directory cannot clobber each other: an instance
 /// that loaded `[v1]` before another instance enqueued `v2` still
 /// sees `[v1, v2]` when it removes delivered `v1`, and `v2`
-/// survives. Reads (`pendingUpdates`) serve the instance cache
-/// without the file lock, mirroring `PolicyStore.currentPolicy`.
+/// survives. Reads (`pendingUpdates`, and the `isEmpty` /
+/// `latestPendingVersion` helpers built on it) likewise re-read the
+/// persisted queue under the cross-instance lock first, so a
+/// long-lived sync reader discovers updates another instance saved;
+/// only if the lock itself is unavailable is the instance cache
+/// returned as-is.
 ///
 /// Whole saves and recoveries additionally serialize under the
 /// save-transaction lock (see `withSaveTransaction`), so version
@@ -102,9 +106,19 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
     }
 
     /// Pending updates in creation order (oldest first).
+    ///
+    /// Re-reads the persisted queue under the cross-instance lock
+    /// first, so a long-lived instance discovers updates another
+    /// instance saved (or removed) since it last touched the queue. If
+    /// the lock cannot be acquired, the instance cache is returned
+    /// as-is rather than risking a torn unlocked read racing a writer.
     public func pendingUpdates() -> [PolicyUpdate] {
         lock.lock()
         defer { lock.unlock() }
+        if let lockFD = try? acquireDirectoryLock() {
+            defer { releaseDirectoryLock(lockFD) }
+            reloadLocked()
+        }
         return items
     }
 
@@ -130,7 +144,14 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
         defer { releaseDirectoryLock(lockFD) }
         reloadLocked()
         insertLocked(update)
-        try persistLocked()
+        do {
+            try persistLocked()
+        } catch {
+            // The entry above was never persisted: reload so the
+            // cache stays consistent with disk before rethrowing.
+            reloadLocked()
+            throw error
+        }
     }
 
     /// Drops every pending update at or below `version` — the delivery
@@ -146,7 +167,14 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
         defer { releaseDirectoryLock(lockFD) }
         reloadLocked()
         items.removeAll(where: { $0.version <= version })
-        try persistLocked()
+        do {
+            try persistLocked()
+        } catch {
+            // Nothing was removed on disk: reload so the cache stays
+            // consistent with disk before rethrowing.
+            reloadLocked()
+            throw error
+        }
     }
 
     // MARK: - Save-intent journal
