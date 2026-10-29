@@ -140,8 +140,10 @@ final class DemoTutorEngine: ChatTutorEngine {
             // A probe was just appended: the next submission is the
             // child's explanation, handled at the top of this method.
             awaitingProbeReply = firstAttempt
+            // While awaiting the probe explanation the child needs
+            // free text, not the question's number pad / choices.
             return ChatEngineUpdate(turns: turns, progress: progress,
-                                    composer: composer(for: item),
+                                    composer: firstAttempt ? .text : composer(for: item),
                                     submittedTurnIsRevision: isRevision)
         }
     }

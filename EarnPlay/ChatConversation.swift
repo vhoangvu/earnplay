@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import EarnPlayCore
 
 // MARK: - Turn stream (rendering only)
@@ -119,15 +120,20 @@ final class ChatConversationViewModel: ObservableObject {
     @Published private(set) var progress = ChatProgress()
     @Published private(set) var composer: ChatComposerSpec = .text
     @Published var draft = ""
+    /// Mirrors `speech.isVoiceUnavailable` so the thread can show a
+    /// plain notice when no bundled voice is available.
+    @Published private(set) var isVoiceUnavailable = false
 
     let speech: ReadAloudService
     private let engine: any ChatTutorEngine
     private var childSequence = 0
     private var started = false
+    private var cancellable: AnyCancellable?
 
     init(engine: any ChatTutorEngine, speech: ReadAloudService) {
         self.engine = engine
         self.speech = speech
+        cancellable = speech.$isVoiceUnavailable.sink { [weak self] in self?.isVoiceUnavailable = $0 }
     }
 
     // MARK: Rendering state for tests and the view
@@ -149,6 +155,7 @@ final class ChatConversationViewModel: ObservableObject {
     /// composer chrome. Used by tests to prove no score is displayed.
     var visibleTextStrings: [String] {
         var strings = messages.map(\.displayedText)
+        if isVoiceUnavailable { strings.append("Reading is unavailable on this device right now. You can still read the messages.") }
         if isSessionComplete {
             strings.append("Practice complete. Nice work.")
             strings.append("Start again")
@@ -302,6 +309,16 @@ struct ChatConversationView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
+                    if viewModel.isVoiceUnavailable {
+                        Text("Reading is unavailable on this device right now. You can still read the messages.")
+                            .font(.body)
+                            .foregroundStyle(ChatDesign.textSecondary)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(ChatDesign.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: ChatDesign.cardRadius))
+                            .accessibilityIdentifier("chatVoiceUnavailableNotice")
+                    }
                     ForEach(viewModel.messages) { turn in
                         row(for: turn).id(turn.id)
                     }

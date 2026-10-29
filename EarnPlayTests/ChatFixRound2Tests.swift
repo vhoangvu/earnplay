@@ -71,9 +71,18 @@ final class ChatFixRound2Tests: XCTestCase {
         let field = try XCTUnwrap(renderedTextViews(in: host.view).first, "rendered composer field missing")
         XCTAssertLessThan(field.bounds.height, 120,
                           "composer field must stay bounded (lineLimit 1...4), got height \(field.bounds.height)")
-        // Thread (scroll view) must retain most of the screen.
-        let threadHeight = host.view.bounds.height - field.bounds.height
-        XCTAssertGreaterThan(threadHeight, 600, "thread must remain readable with a long draft")
+        // Thread viewport = the rendered message list (UIScrollView
+        // backing chatThread), NOT window-minus-field (round-3 item 4).
+        let scrollViews = renderedScrollViews(in: host.view)
+        let thread = try XCTUnwrap(scrollViews.max(by: { $0.bounds.height < $1.bounds.height }),
+                                   "rendered thread scroll view missing")
+        // Real viewport is 479pt at the 4-line cap (header + bounded
+        // composer take the rest of 844): still >half the window and
+        // several message rows — the honest readable bound.
+        XCTAssertGreaterThan(thread.bounds.height, 400,
+                             "thread viewport must remain readable with a long draft, got \(thread.bounds.height)")
+        XCTAssertGreaterThan(thread.bounds.height, host.view.bounds.height / 2,
+                             "thread viewport must retain most of the screen")
     }
 
     // MARK: Item 2 — fallback reading passage exactly once
@@ -157,8 +166,13 @@ final class ChatFixRound2Tests: XCTestCase {
         collect(host.view)
         for v in views {
             if v.accessibilityIdentifier == id, let el = v as? UIAccessibilityElement { return el }
-            for i in 0..<v.accessibilityElementCount() {
-                if let el = v.accessibilityElement(at: i) as? UIAccessibilityElement, el.accessibilityIdentifier == id { return el }
+            // NSNotFound == Int.max on non-container views: iterating
+            // to it would hang (round-3 item 5). Guard explicitly.
+            let count = v.accessibilityElementCount()
+            if count != NSNotFound && count > 0 {
+                for i in 0..<count {
+                    if let el = v.accessibilityElement(at: i) as? UIAccessibilityElement, el.accessibilityIdentifier == id { return el }
+                }
             }
             if let elems = v.accessibilityElements as? [UIAccessibilityElement],
                let el = elems.first(where: { $0.accessibilityIdentifier == id }) { return el }
@@ -253,6 +267,30 @@ final class ChatFixRound2Tests: XCTestCase {
         window.rootViewController = host
         window.makeKeyAndVisible()
         return (host, window)
+    }
+
+    // Round-3 item 5: guarded iteration terminates on NSNotFound view.
+    final class NotFoundContainerView: UIView {
+        override func accessibilityElementCount() -> Int { NSNotFound }
+    }
+
+    func testAccessibilityIterationTerminatesOnNSNotFoundView() throws {
+        let (speech, _) = makeSpeech()
+        let viewModel = ChatConversationViewModel(engine: ScriptedEngine(), speech: speech)
+        let (host, window) = makeHosted(viewModel: viewModel); _ = window
+        pump(host)
+        host.view.addSubview(NotFoundContainerView(frame: .zero))
+        pump(host)
+        // Would hang pre-fix (0..<Int.max). Completing at all proves
+        // the guard; result must be nil-or-found without trapping.
+        _ = renderedAccessibilityElement(in: host, id: "chatSendButton")
+    }
+
+    private func renderedScrollViews(in view: UIView) -> [UIScrollView] {
+        var result: [UIScrollView] = []
+        if let sv = view as? UIScrollView { result.append(sv) }
+        for s in view.subviews { result.append(contentsOf: renderedScrollViews(in: s)) }
+        return result
     }
 
     private func renderedTextViews(in view: UIView) -> [UITextView] {
