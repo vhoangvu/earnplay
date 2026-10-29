@@ -43,6 +43,9 @@ the idle gap, so a score does not rise while the child is idle.
   1 + 1): at least one genuine attempt **and** at least one real hint
   or follow-up interaction. Below the floor, no amount of elapsed or
   active time unlocks, even when the score exceeds the threshold.
+  Both minima clamp to at least 1 (construction, policy decode, and
+  scoring all enforce it), so policy can strengthen the mandatory
+  floor but never remove it.
 
 ## Interface for T1.5 / T1.6 / T3.1 / T5.1
 
@@ -50,8 +53,12 @@ the idle gap, so a score does not rise while the child is idle.
   `recordHintInteraction()`, `recordFollowUpInteraction()`,
   `recordAnswerRevision()`, `recordExplanation()`, and
   `recordInteraction()` for any other interaction. Every recorded
-  event also resets the idle pause. Or build an `EffortSignals` value
-  directly (its `activeSeconds` must already be idle-paused).
+  event also resets the idle pause. `signals(at:)` scopes both the
+  active time and the event counts to the session evaluation
+  interval (`startedAt...evaluatedAt`): events before the session
+  started or after the evaluation time score nothing. Or build an
+  `EffortSignals` value directly (its `activeSeconds` must already
+  be idle-paused).
 - Score with `EffortScorer.evaluate(_:)` (alias `score(_:)`). The
   returned `EffortScore` carries the required `(score, threshold,
   floorMet)`, the per-signal `breakdown`, `unlockGranted`, and the

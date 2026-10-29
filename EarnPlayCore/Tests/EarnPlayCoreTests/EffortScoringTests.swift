@@ -219,4 +219,85 @@ final class EffortScoringTests: XCTestCase {
         XCTAssertEqual(at30.score, at630.score)
         XCTAssertEqual(recorder.signals().activeSeconds, 20)
     }
+
+    // MARK: Fix round 1 — minima cannot disable the mandatory floor (review #1)
+
+    func testZeroMinimaCannotDisableMandatoryFloor() {
+        let floor = EffortFloorSettings(minGenuineAttempts: 0, minHintOrFollowUpInteractions: 0)
+        let scorer = EffortScorer(threshold: 8, floorSettings: floor)
+        // 480 active seconds = 8 minutes = 8 points: at threshold, but
+        // with no attempt and no hint the mandatory floor must still deny.
+        let result = scorer.evaluate(EffortSignals(activeSeconds: 480))
+        XCTAssertEqual(result.score, 8)
+        XCTAssertFalse(result.floorMet)
+        XCTAssertFalse(result.unlockGranted)
+        XCTAssertEqual(result.decision, .denied)
+    }
+
+    func testMutatedZeroMinimaCannotDisableMandatoryFloor() {
+        var floor = EffortFloorSettings(minGenuineAttempts: 1, minHintOrFollowUpInteractions: 1)
+        floor.minGenuineAttempts = 0
+        floor.minHintOrFollowUpInteractions = 0
+        let scorer = EffortScorer(threshold: 8, floorSettings: floor)
+        let result = scorer.evaluate(EffortSignals(activeSeconds: 480))
+        XCTAssertFalse(result.floorMet)
+        XCTAssertFalse(result.unlockGranted)
+    }
+
+    func testNegativeMinimaCannotDisableMandatoryFloor() {
+        let floor = EffortFloorSettings(minGenuineAttempts: -2, minHintOrFollowUpInteractions: -5)
+        let scorer = EffortScorer(threshold: 8, floorSettings: floor)
+        let result = scorer.evaluate(EffortSignals(activeSeconds: 480))
+        XCTAssertFalse(result.floorMet)
+        XCTAssertFalse(result.unlockGranted)
+    }
+
+    func testFloorSettingsConstructionAndDecodingClampMinimaToOne() {
+        let built = EffortFloorSettings(minGenuineAttempts: 0, minHintOrFollowUpInteractions: -3)
+        XCTAssertEqual(built.minGenuineAttempts, 1)
+        XCTAssertEqual(built.minHintOrFollowUpInteractions, 1)
+        let json = #"{"minGenuineAttempts":0,"minHintOrFollowUpInteractions":-2}"#.data(using: .utf8)!
+        let decoded = try! JSONDecoder().decode(EffortFloorSettings.self, from: json)
+        XCTAssertEqual(decoded.minGenuineAttempts, 1)
+        XCTAssertEqual(decoded.minHintOrFollowUpInteractions, 1)
+    }
+
+    // MARK: Fix round 1 — event counts scoped to the session interval (review #2)
+
+    func testPreSessionEventsDoNotContributeToScoreOrFloor() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let now = start.addingTimeInterval(200)
+        let recorder = EffortSessionRecorder(startedAt: start, now: { now })
+        let before = start.addingTimeInterval(-50)
+        recorder.recordAttempt(at: before)
+        recorder.recordHintInteraction(at: before)
+        recorder.recordHintInteraction(at: before)
+        recorder.recordHintInteraction(at: before)
+        let signals = recorder.signals()
+        XCTAssertEqual(signals.genuineAttempts, 0)
+        XCTAssertEqual(signals.hintInteractions, 0)
+        let result = recorder.evaluate(EffortScorer(threshold: 8))
+        XCTAssertFalse(result.floorMet)
+        XCTAssertEqual(result.decision, .denied)
+    }
+
+    func testEventsAfterEvaluationDoNotContribute() {
+        // Review counterexample: one attempt + three hints at t=100, then
+        // querying at session start must deny, not score 8 with floor met.
+        let start = Date(timeIntervalSince1970: 5_000)
+        let recorder = EffortSessionRecorder(startedAt: start)
+        let later = start.addingTimeInterval(100)
+        recorder.recordAttempt(at: later)
+        recorder.recordHintInteraction(at: later)
+        recorder.recordHintInteraction(at: later)
+        recorder.recordHintInteraction(at: later)
+        let signals = recorder.signals(at: start)
+        XCTAssertEqual(signals.genuineAttempts, 0)
+        XCTAssertEqual(signals.hintInteractions, 0)
+        XCTAssertEqual(signals.activeSeconds, 0)
+        let result = EffortScorer(threshold: 8).evaluate(signals)
+        XCTAssertEqual(result.score, 0)
+        XCTAssertFalse(result.floorMet)
+        XCTAssertEqual(result.decision, .denied)
+    }
 }

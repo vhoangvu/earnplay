@@ -252,10 +252,12 @@ public struct EffortScorer: Equatable, Sendable {
 
     /// Floor rule: at least the configured number of genuine attempts
     /// plus at least the configured number of real hint or follow-up
-    /// interactions. Below the floor no amount of time unlocks.
+    /// interactions. Below the floor no amount of time unlocks. Both
+    /// minima clamp to at least 1: policy may strengthen the mandatory
+    /// attempt-plus-hint/follow-up floor, never remove it.
     public func floorMet(for signals: EffortSignals) -> Bool {
-        signals.genuineAttempts >= max(0, floorSettings.minGenuineAttempts)
-            && signals.hintOrFollowUpInteractions >= max(0, floorSettings.minHintOrFollowUpInteractions)
+        signals.genuineAttempts >= max(1, floorSettings.minGenuineAttempts)
+            && signals.hintOrFollowUpInteractions >= max(1, floorSettings.minHintOrFollowUpInteractions)
     }
 
     /// Scores the signals and returns the full decision record.
@@ -347,11 +349,11 @@ public final class EffortSessionRecorder: HintListenEventSink, @unchecked Sendab
     private let now: () -> Date
     private let lock = NSLock()
     private var interactionDates: [Date] = []
-    private var genuineAttempts = 0
-    private var hintInteractions = 0
-    private var followUpInteractions = 0
-    private var answerRevisions = 0
-    private var explanations = 0
+    private var genuineAttemptDates: [Date] = []
+    private var hintInteractionDates: [Date] = []
+    private var followUpInteractionDates: [Date] = []
+    private var answerRevisionDates: [Date] = []
+    private var explanationDates: [Date] = []
 
     public init(startedAt: Date, idlePauseSeconds: TimeInterval = ActiveTimeTracker.defaultIdlePauseSeconds,
                 now: @escaping () -> Date = Date.init) {
@@ -360,55 +362,67 @@ public final class EffortSessionRecorder: HintListenEventSink, @unchecked Sendab
         self.now = now
     }
 
-    private func record(count: (EffortSessionRecorder) -> Void, at date: Date) {
+    private func record(at date: Date, count: (EffortSessionRecorder, Date) -> Void) {
         lock.lock(); defer { lock.unlock() }
         interactionDates.append(date)
-        count(self)
+        count(self, date)
     }
 
     /// Any interaction (tap, typing, speaking) that resets the idle pause.
     public func recordInteraction(at date: Date? = nil) {
-        record(count: { _ in }, at: date ?? now())
+        record(at: date ?? now(), count: { _, _ in })
     }
 
     /// A genuine answer attempt. Non-genuine events still count as
     /// interaction but never toward the floor or the score.
     public func recordAttempt(isGenuine: Bool = true, at date: Date? = nil) {
-        record(count: { if isGenuine { $0.genuineAttempts += 1 } }, at: date ?? now())
+        record(at: date ?? now(), count: {
+            if isGenuine { $0.genuineAttemptDates.append($1) }
+        })
     }
 
     public func recordHintInteraction(at date: Date? = nil) {
-        record(count: { $0.hintInteractions += 1 }, at: date ?? now())
+        record(at: date ?? now(), count: { $0.hintInteractionDates.append($1) })
     }
 
     /// `HintListenEventSink`: a hint read aloud is a hint interaction.
     public func recordHintListen(_ event: HintListenEvent) {
-        record(count: { $0.hintInteractions += 1 }, at: event.emittedAt)
+        record(at: event.emittedAt, count: { $0.hintInteractionDates.append($1) })
     }
 
     public func recordFollowUpInteraction(at date: Date? = nil) {
-        record(count: { $0.followUpInteractions += 1 }, at: date ?? now())
+        record(at: date ?? now(), count: { $0.followUpInteractionDates.append($1) })
     }
 
     public func recordAnswerRevision(at date: Date? = nil) {
-        record(count: { $0.answerRevisions += 1 }, at: date ?? now())
+        record(at: date ?? now(), count: { $0.answerRevisionDates.append($1) })
     }
 
     public func recordExplanation(at date: Date? = nil) {
-        record(count: { $0.explanations += 1 }, at: date ?? now())
+        record(at: date ?? now(), count: { $0.explanationDates.append($1) })
     }
 
-    /// Signals as of `date` (defaults to the recorder's clock).
+    /// Signals as of `date` (defaults to the recorder's clock). Event
+    /// counts are scoped to the session evaluation interval
+    /// `startedAt...evaluatedAt`, matching the active-time calculation:
+    /// events before the session started or after the evaluation time
+    /// contribute to neither the score nor the floor.
     public func signals(at date: Date? = nil) -> EffortSignals {
         let evaluatedAt = date ?? now()
         lock.lock(); defer { lock.unlock() }
+        let end = max(startedAt, evaluatedAt)
+        func count(_ dates: [Date]) -> Int {
+            dates.filter { $0 >= startedAt && $0 <= end }.count
+        }
         return EffortSignals(
             activeSeconds: ActiveTimeTracker.activeSeconds(
                 interactionDates: interactionDates, startedAt: startedAt,
                 evaluatedAt: evaluatedAt, idlePauseSeconds: idlePauseSeconds),
-            genuineAttempts: genuineAttempts, hintInteractions: hintInteractions,
-            followUpInteractions: followUpInteractions,
-            answerRevisions: answerRevisions, explanations: explanations)
+            genuineAttempts: count(genuineAttemptDates),
+            hintInteractions: count(hintInteractionDates),
+            followUpInteractions: count(followUpInteractionDates),
+            answerRevisions: count(answerRevisionDates),
+            explanations: count(explanationDates))
     }
 
     /// Scores the recorded session as of now.

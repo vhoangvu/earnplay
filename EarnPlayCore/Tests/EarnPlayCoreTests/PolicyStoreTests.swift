@@ -462,4 +462,17 @@ final class PolicyStoreTests: XCTestCase {
         XCTAssertTrue(policy.isNeverUnlockable(AppRef(id: "com.example.browser")))
         XCTAssertFalse(policy.isChallengeUnlockable(AppRef(id: "com.example.browser")))
     }
+
+    func testApplyClampsSubFloorEffortMinimaToOne() {
+        let store = PolicyStore(directory: directory)
+        var next = samplePolicy(version: 1)
+        next.effortFloorSettings.minGenuineAttempts = 0
+        next.effortFloorSettings.minHintOrFollowUpInteractions = -2
+        XCTAssertEqual(store.apply(next), .applied)
+        XCTAssertEqual(store.currentPolicy.effortFloorSettings.minGenuineAttempts, 1)
+        XCTAssertEqual(store.currentPolicy.effortFloorSettings.minHintOrFollowUpInteractions, 1)
+        // The clamped policy survives a relaunch-equivalent reload.
+        XCTAssertEqual(store.reloadFromDisk().effortFloorSettings.minGenuineAttempts, 1)
+        XCTAssertEqual(store.reloadFromDisk().effortFloorSettings.minHintOrFollowUpInteractions, 1)
+    }
 }
