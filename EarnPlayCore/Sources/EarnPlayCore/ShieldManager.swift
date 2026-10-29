@@ -283,7 +283,10 @@ public final class FileObservedInstallStore: ObservedInstallStore, @unchecked Se
 /// `isShielded(app:category:)` — backend state plus the default-deny
 /// backstop — so a newly installed, not-yet-observed app is blocked
 /// before its first launch; `ShieldBackend.isShielded` answers only
-/// the enforced observed/enumerated state and is not the gate.
+/// the enforced observed/enumerated state and is not the gate. The
+/// backstop applies only while shields are active (`shieldsActive`):
+/// before setup completes it stays off and the gate reports backend
+/// state, so an inactive system claims no protection.
 ///
 /// Unlock timers run on an injected suspend-inclusive `MonotonicClock`
 /// (continuous time in production). Changing the device wall clock
@@ -338,6 +341,22 @@ public final class ShieldManager: @unchecked Sendable {
     private let observedInstallStore: (any ObservedInstallStore)?
     private var window: UnlockWindow?
     private var lastConfiguration: ShieldConfiguration = .none
+    /// Latched "shields active" signal for the T2.5 default-deny
+    /// fallback in `isShielded`. Set once this instance applies shields
+    /// from a real enumeration or install observation (or is explicitly
+    /// engaged via `applyShields()` / `updateEnumeration(_:)`), and
+    /// never unset in-instance: an applied configuration that happens
+    /// to shield nothing (e.g. every enumerated app allowlisted, so the
+    /// computed configuration is `.none`) still counts as active,
+    /// while a fresh or not-yet-handed-an-enumeration manager (setup
+    /// incomplete, or a relaunch whose SetupFlow withheld the
+    /// committed enumeration pending reauthorization) stays inactive
+    /// and `isShielded` falls through to backend state. Deliberately
+    /// neither `policyStore.storedVersion > 0` — a revoked relaunch
+    /// still has a stored policy while its shields are not restored —
+    /// nor `lastConfiguration != .none` — an applied-but-empty
+    /// configuration must still default-deny.
+    private var shieldsActive = false
     private var monitorTask: Task<Void, Never>?
     /// True when a reconciliation narrowed or revoked the in-memory
     /// window but persisting that change failed, so the on-disk record
@@ -414,10 +433,14 @@ public final class ShieldManager: @unchecked Sendable {
     // MARK: - Shield application
 
     /// Recomputes shields from the current policy + enumeration and
-    /// applies them, honouring any still-open unlock window.
+    /// applies them, honouring any still-open unlock window. Explicitly
+    /// applying shields engages the shield system: the T2.5
+    /// default-deny fallback in `isShielded` is active from here on,
+    /// even if the applied configuration shields nothing.
     public func applyShields() {
         lock.lock()
         defer { lock.unlock() }
+        shieldsActive = true
         refreshLocked()
     }
 
@@ -436,6 +459,11 @@ public final class ShieldManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         self.enumeration = enumeration
+        // Handing the manager its enumeration engages the shield
+        // system (setup commit, relaunch restore, abandon, re-pick):
+        // the T2.5 default-deny fallback applies from here on, even
+        // if the replacement enumeration is empty.
+        shieldsActive = true
         refreshLocked()
     }
 
@@ -495,13 +523,21 @@ public final class ShieldManager: @unchecked Sendable {
     /// query closes that gap.
     ///
     /// A backend shield always wins — install-observed apps are shielded
-    /// in the applied configuration itself. Otherwise the app stays open
-    /// only when the current policy allowlists it or an open window
-    /// unlocks it; every other app — including one that was never
-    /// observed and presents an unknown token or category — resolves to
-    /// locked until a policy sync classifies it. T2.2 semantics for
-    /// classified apps are unchanged: this only closes the unknown path
-    /// that previously resolved to allowed.
+    /// in the applied configuration itself. Otherwise, while shields are
+    /// active, the app stays open only when the current policy
+    /// allowlists it or an open window unlocks it; every other app —
+    /// including one that was never observed and presents an unknown
+    /// token or category — resolves to locked until a policy sync
+    /// classifies it. T2.2 semantics for classified apps are unchanged:
+    /// this only closes the unknown path that previously resolved to
+    /// allowed.
+    ///
+    /// The default-deny fallback is scoped to active shields (see
+    /// `shieldsActive`): before any policy/configuration has been
+    /// applied — fresh manager, setup incomplete, or a relaunch whose
+    /// committed enumeration was withheld pending reauthorization —
+    /// the query falls through to backend state, so an inactive shield
+    /// system never reports protection it has not applied.
     public func isShielded(app: AppRef, category: AppCategoryRef? = nil) -> Bool {
         if backend.isShielded(app: app, category: category) {
             return true
@@ -511,11 +547,12 @@ public final class ShieldManager: @unchecked Sendable {
         }
         lock.lock()
         let unlocked = window?.unlockedApps.contains(app) ?? false
+        let active = shieldsActive
         lock.unlock()
         if unlocked {
             return false
         }
-        return true
+        return active
     }
 
     // MARK: - Unlock
@@ -733,6 +770,15 @@ public final class ShieldManager: @unchecked Sendable {
             } catch {
                 // Still failing: stay flagged and retry on a later refresh.
             }
+        }
+        // Applying shields from a real enumeration or a restored /
+        // observed install engages the shield system for the T2.5
+        // fallback. A bare refresh of a fresh manager (empty
+        // enumeration, no observations) does not: shields stay
+        // inactive until setup hands over an enumeration.
+        if !enumeration.apps.isEmpty || !enumeration.categories.isEmpty
+            || !observedInstalls.isEmpty {
+            shieldsActive = true
         }
         let configuration = computeConfigurationLocked()
         lastConfiguration = configuration
