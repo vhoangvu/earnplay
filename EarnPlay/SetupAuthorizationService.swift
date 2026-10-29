@@ -46,6 +46,17 @@ public final class FamilyControlsSetupAuthorizationService: SetupAuthorizationSe
         return currentStatus() == .approved
     }
 
+    /// Maps the system status using ONLY `AuthorizationStatus` cases present
+    /// in the CI SDK (runner-default older Xcode / pre-26.4 SDK: `.approved`
+    /// / `.denied` / `.notDetermined`).
+    ///
+    /// Do NOT reference `.approvedWithDataAccess` (introduced iOS 26.4) here,
+    /// not even behind `#available`: the symbol does not exist in the CI SDK,
+    /// so any reference fails CI compilation (a runtime guard cannot declare
+    /// a missing symbol). The Demo has no FamilyControls entitlement, so the
+    /// 26.4 data-access distinction is never load-bearing; unknown future
+    /// cases conservatively map to `.denied` (not authorized), keeping the
+    /// state machine's acceptance behavior identical on all SDKs.
     static func map(_ status: AuthorizationStatus) -> SetupAuthorizationState {
         switch status {
         case .approved:
@@ -55,9 +66,6 @@ public final class FamilyControlsSetupAuthorizationService: SetupAuthorizationSe
         case .notDetermined:
             return .notDetermined
         @unknown default:
-            if #available(iOS 26.4, *), status == .approvedWithDataAccess {
-                return .approved
-            }
             return .denied
         }
     }
