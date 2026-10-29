@@ -833,4 +833,132 @@ final class ShieldManagerTests: XCTestCase {
         XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
         XCTAssertFalse(manager.isShielded(app: missing, category: Self.games))
     }
+
+    // MARK: - Fix round 2 (issue #13): unresolved grant category coverage
+
+    private func unlockOnlyPolicy() -> Policy {
+        Policy(
+            version: 1,
+            alwaysAllowed: [.phone],
+            unblockable: [Self.game, Self.video],
+            neverUnlockableOverrides: [Self.browser],
+            unlockDurations: UnlockDurations(practiceMinutes: 30, tradeMinutes: 15),
+            effortFloorSettings: .default,
+            tradeCaps: .default,
+            chorePool: [],
+            movementSettings: .default
+        )
+    }
+
+    func testGrantWithNilCategoryAndBackstopPreservesAccess() {
+        let backend = SimulatedShieldBackend()
+        let clock = FakeMonotonicClock()
+        let boot = FakeBootSessionProvider()
+        let enumeration = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.game, category: nil)],
+            categories: [Self.games]
+        )
+        let (manager, _) = makeCustomManager(
+            policy: unlockOnlyPolicy(),
+            enumeration: enumeration,
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        // Pre-grant the actual category backstop shields the app.
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.games))
+        XCTAssertTrue(manager.isShielded(app: Self.game, category: Self.games))
+
+        // No explicit category: the grant must not report success while
+        // the app remains shielded via the backstop.
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: nil))
+    }
+
+    func testGrantForAllWithNilCategoryPreservesAccess() {
+        let backend = SimulatedShieldBackend()
+        let clock = FakeMonotonicClock()
+        let boot = FakeBootSessionProvider()
+        let enumeration = ShieldEnumeration(
+            apps: [
+                EnumeratedApp(app: Self.game, category: nil),
+                EnumeratedApp(app: Self.video, category: Self.entertainment),
+            ],
+            categories: [Self.games, Self.entertainment]
+        )
+        let (manager, _) = makeCustomManager(
+            policy: unlockOnlyPolicy(),
+            enumeration: enumeration,
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlockForAllChallengeUnlockable(duration: 60))
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertFalse(manager.isShielded(app: Self.video, category: Self.entertainment))
+    }
+
+    func testReenumerationMetadataLossMidWindowPreservesAccess() {
+        let backend = SimulatedShieldBackend()
+        let clock = FakeMonotonicClock()
+        let boot = FakeBootSessionProvider()
+        let known = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.game, category: Self.games)],
+            categories: [Self.games]
+        )
+        let policyStore = PolicyStore(directory: directory)
+        XCTAssertEqual(policyStore.apply(unlockOnlyPolicy()), .applied)
+        let manager = ShieldManager(
+            policyStore: policyStore,
+            enumeration: known,
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, duration: 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.games))
+
+        // Re-enumeration loses the category mapping mid-window: the app
+        // must stay open until expiry, not re-lock via the backstop.
+        clock.advance(by: 10)
+        manager.updateEnumeration(ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.game, category: nil)],
+            categories: [Self.games]
+        ))
+        XCTAssertTrue(manager.isUnlockActive)
+        XCTAssertGreaterThan(manager.remainingUnlockTime, 0)
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.isEmpty)
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+    }
+
+    func testGrantWithExplicitCategoryKeepsOtherBackstop() {
+        let backend = SimulatedShieldBackend()
+        let clock = FakeMonotonicClock()
+        let boot = FakeBootSessionProvider()
+        let enumeration = ShieldEnumeration(
+            apps: [EnumeratedApp(app: Self.game, category: nil)],
+            categories: [Self.games, Self.social]
+        )
+        let (manager, _) = makeCustomManager(
+            policy: unlockOnlyPolicy(),
+            enumeration: enumeration,
+            backend: backend,
+            clock: clock,
+            unlockStore: FileUnlockWindowStore(directory: directory),
+            bootSession: boot
+        )
+        // Caller-supplied category covers the nil-enumeration app: only
+        // that category is withheld, the rest of the backstop stays.
+        XCTAssertTrue(manager.grantUnlock(for: Self.game, category: Self.games, duration: 60))
+        XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
+        XCTAssertFalse(manager.currentConfiguration.shieldedCategories.contains(Self.games))
+        XCTAssertTrue(manager.currentConfiguration.shieldedCategories.contains(Self.social))
+    }
 }

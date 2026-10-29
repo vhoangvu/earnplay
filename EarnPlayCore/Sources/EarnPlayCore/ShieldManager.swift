@@ -209,7 +209,11 @@ public final class FileUnlockWindowStore: UnlockWindowStore, @unchecked Sendable
 /// and against the current enumeration (category associations follow
 /// the latest mapping). When a real allowlisted app has unknown or
 /// missing category metadata, the category backstop is disabled to
-/// preserve allowlist access.
+/// preserve allowlist access. The same fallback covers unlocks: when a
+/// real unlocked app has unknown or missing category metadata and no
+/// caller-supplied category covers it, the backstop is disabled while
+/// the window is open, so a grant never reports success while the app
+/// remains shielded and re-enumeration cannot re-lock it mid-window.
 ///
 /// All backend access goes through `ShieldBackend`, so T2.4's
 /// simulated backend substitutes without changing this class.
@@ -314,7 +318,12 @@ public final class ShieldManager: @unchecked Sendable {
     /// untouched — when the policy does not allow a challenge unlock
     /// for `app` (always-allowed apps need none; never-unlockable or
     /// unlisted apps get none), when `duration` is not positive, or
-    /// when the new window cannot be durably persisted.
+    /// when the new window cannot be durably persisted. A reported
+    /// success always leaves the app unshielded: when its enumeration
+    /// category is unknown or missing and no explicit `category` is
+    /// supplied, the category backstop is disabled while the window is
+    /// open (mirroring the allowlist fallback) instead of leaving a
+    /// category shield active over the unlock.
     @discardableResult
     public func grantUnlock(
         for app: AppRef,
@@ -342,7 +351,10 @@ public final class ShieldManager: @unchecked Sendable {
 
     /// Grants an unlock for every enumerated challenge-unlockable app
     /// for `duration` seconds (monotonic). Returns false when no app
-    /// qualifies, `duration` is not positive, or persistence fails.
+    /// qualifies, `duration` is not positive, or persistence fails. A
+    /// reported success always leaves every unlocked app unshielded:
+    /// when any unlocked app has unknown or missing category metadata,
+    /// the category backstop is disabled while the window is open.
     @discardableResult
     public func grantUnlockForAllChallengeUnlockable(duration: TimeInterval) -> Bool {
         lock.lock()
@@ -509,8 +521,12 @@ public final class ShieldManager: @unchecked Sendable {
     /// Removes apps that stopped being challenge-unlockable under the
     /// current policy and recomputes category suppression from the
     /// current enumeration plus preserved explicit grant categories.
-    /// Persisting the narrowed window is best-effort: relaunch
-    /// re-reconciles to the same state.
+    /// When re-enumeration loses an unlocked app's category metadata,
+    /// its suppression is dropped here and the configuration disables
+    /// the backstop instead, so the app stays open until its window
+    /// expires rather than re-locking mid-window. Persisting the
+    /// narrowed window is best-effort: relaunch re-reconciles to the
+    /// same state.
     private func reconcileWindowLocked() {
         guard var current = window else { return }
         let policy = policyStore.currentPolicy
@@ -562,18 +578,43 @@ public final class ShieldManager: @unchecked Sendable {
             }
         }
 
+        // Unlock coverage: a real unlocked app whose enumeration
+        // category is unknown or missing — and which no caller-supplied
+        // category covers — cannot have its actual category withheld,
+        // so the backstop must be disabled while its window is open.
+        // Otherwise the grant would report success while a category
+        // shield stays active over the app. A single-app window with an
+        // explicit grant category is covered by that category; built-ins
+        // never need coverage, mirroring the allowlist rule.
+        var unlockCoverageIncomplete = false
+        if let window, !window.unlockedApps.isEmpty {
+            let singleExplicitCovered =
+                window.unlockedApps.count == 1 && !window.explicitCategories.isEmpty
+            if !singleExplicitCovered {
+                for app in window.unlockedApps where !builtIns.contains(app) {
+                    let found = enumeration.apps.first(where: { $0.app == app })?.category
+                    if found == nil {
+                        unlockCoverageIncomplete = true
+                        break
+                    }
+                }
+            }
+        }
+
         // Category backstop: every category seen at setup, withholding
         // only categories that contain an always-allowed app (otherwise
         // the backstop would shield the allowlist, and only a per-app
         // exemption over the category shield could undo that — exactly
         // what this design must not rely on). When a real allowlisted
         // app has unknown or missing category metadata, the backstop is
-        // disabled entirely to preserve allowlist access.
+        // disabled entirely to preserve allowlist access; likewise when
+        // a real unlocked app has unresolved category coverage, so the
+        // unlock takes effect and re-enumeration cannot re-lock it.
         var backstop = enumeration.categories
         for entry in enumeration.apps {
             if let category = entry.category { backstop.insert(category) }
         }
-        if allowlistCoverageIncomplete {
+        if allowlistCoverageIncomplete || unlockCoverageIncomplete {
             backstop = []
         } else {
             backstop.subtract(categoriesOfAllowed)
@@ -582,6 +623,9 @@ public final class ShieldManager: @unchecked Sendable {
         // Open unlock window: remove the unlocked apps individually,
         // and withhold their categories from the backstop so the unlock
         // does not depend on an exemption overriding a category shield.
+        // When unlock coverage is incomplete the backstop is already
+        // empty, so every unlocked app is open regardless of its actual
+        // category.
         if let window {
             shieldedApps.subtract(window.unlockedApps)
             backstop.subtract(window.unlockedCategories)

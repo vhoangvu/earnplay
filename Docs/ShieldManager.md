@@ -28,6 +28,13 @@ tests run without any entitlement.
   enumeration, its actual category cannot be withheld, so the category
   backstop is disabled entirely to preserve allowlist access.
   Individual shields still apply.
+- Unlock fallback: the same rule covers unlocks. When a real unlocked
+  app has an unknown (`nil`) or missing enumeration category and no
+  caller-supplied grant category covers it, the backstop is disabled
+  while its window is open, so a grant never reports success while a
+  category shield stays active over the app. A single-app grant with
+  an explicit category withholds only that category; built-ins never
+  need coverage.
 
 ## Unlock timers
 
@@ -62,7 +69,10 @@ tests run without any entitlement.
   before shields apply: apps that stop being challenge-unlockable are
   removed with their category suppression, and category associations
   follow the latest enumeration mapping (explicit grant categories are
-  preserved). Narrowed windows are re-persisted best-effort; relaunch
+  preserved). When re-enumeration loses an unlocked app's category,
+  its suppression is dropped and the backstop is disabled instead, so
+  the app stays open until expiry rather than re-locking mid-window.
+  Narrowed windows are re-persisted best-effort; relaunch
   re-reconciles to the same state.
 
 ## Backend abstraction and verification status
