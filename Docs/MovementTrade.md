@@ -55,12 +55,16 @@ only when all three hold:
   shaking completes in ~0.1s and is rejected);
 - at least 0.4s since the previous counted rep;
 - the trailing 1s window shows exercise cadence, not vibration: at
-  most 8 deviation zero-crossings per second (measured over observed
+  most 6 deviation zero-crossings per second (measured over observed
   time so early vibration cannot sneak through a cold window).
-  Exercise at ≤2 Hz crosses ~4/s; shaking at ≥4 Hz crosses ≥8/s.
+  Exercise at ≤2 Hz crosses ~4/s; shaking at ≥4 Hz crosses ≥8/s, so
+  the veto sits between them — slow hand sweeps inside a shaking
+  stream still see the surrounding vibration rate and are rejected.
 
 Stillness never arms the detector. Samples rotating faster than
-12 rad/s are ignored, never counted. Rejected swings are tallied as
+12 rad/s are ignored, never counted — and disarm the detector, so a
+spin between an arm and a later valid crossing cannot verify across
+the rejected gap. Rejected swings are tallied as
 `rejectedNoiseEvents` for the record's evidence summary.
 
 ## Motion abstraction and fixtures
@@ -68,7 +72,11 @@ Stillness never arms the detector. Samples rotating faster than
 `MotionSampleProvider` is the seam: the app's
 `CoreMotionSampleProvider` streams `CMDeviceMotion` at 50 Hz
 (userAcceleration + gravity per axis); tests and the simulator
-preview use fixtures. `MotionFixtures` (seeded, exactly replayable):
+preview use fixtures. `MotionProviderFactory` selects the accept-path
+provider: real CoreMotion on a physical device, fixture replay only on
+the simulator or in the explicit DEBUG test mode
+(`--earnplay-fixture-motion` launch argument). `MotionFixtures`
+(seeded, exactly replayable):
 
 - `genuineJumpingJacks` / `genuineRunningInPlace` — rhythmic pocket
   motion that counts exactly to its rep count;
@@ -90,7 +98,11 @@ The offer carries `taperApplied`, and the record carries
 `taperPatternFlagged` for the admin app (T4.x surfaces the flag).
 `sessionOffersUsed` and the weekly count come from
 `MovementTradeHistory`; sessions-since-last-offer comes from the
-session owner (nil when never offered).
+session owner (nil when never offered). The taper input covers ALL
+recent sessions: the session owner passes the full ordered session
+list to `recentSessionCompletions(allSessionsInOrder:)`, and every
+practice-only session reads as false, so practice between grants
+dilutes the pattern and practice after a pattern clears it.
 
 ## Session, record, history
 
@@ -106,8 +118,13 @@ session owner (nil when never offered).
   (`full` for phone-in-pocket; `reduced` records the LLD iPad caveat).
 - `MovementTradeHistoryStore`: append-only JSON history in
   Application Support (`movement-trades.json`, atomic writes,
-  `PolicyStore` precedent). Missing/corrupt file yields empty
-  history; the session cap still bounds every session.
+  `PolicyStore` precedent). Read-modify-writes run inside a
+  cross-instance file lock against the persisted truth, so overlapping
+  stores cannot erase each other's entries. Presenting an offer records
+  an `.offered` reservation immediately (reserving the session quota);
+  completion finalizes it in place to the terminal outcome by trade ID.
+  Missing/corrupt file yields empty history; the session cap still
+  bounds every session.
 
 ## App UI
 
@@ -115,10 +132,12 @@ session owner (nil when never offered).
 precedent) drives `MovementTradeOfferCard` (single take-it-or-leave-it
 offer), `MovementTradeActiveView` (live `verified / target` counter
 with progress and the phone-in-pocket instruction), and the finished
-state. Production entry is `presentOffer` from the tutor only.
-`MovementTradePreviewView` (placeholder-screen harness) simulates the
-AI event through the real gate and replays fixtures; its simulate
-trigger and motion picker are `#if DEBUG` only.
+state. Production entry is `presentOffer` from the tutor only. The app
+passes the device carry confidence into the view model (iPad trades
+record `.reduced`). `MovementTradePreviewView` (placeholder-screen
+harness) simulates the AI event through the real gate with a fresh
+session ID per preview session; its simulate trigger and motion
+picker are `#if DEBUG` only.
 
 ## Manual-only (NOT verified here)
 

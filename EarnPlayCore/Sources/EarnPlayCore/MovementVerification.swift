@@ -98,7 +98,9 @@ public struct RepCounterConfig: Equatable, Sendable {
     public var cadenceWindowSeconds: TimeInterval
     /// Maximum zero crossings per second inside the cadence window for a
     /// candidate rep to verify. Exercise at ≤2 Hz crosses ~4/s (plus
-    /// impact ringing); shaking at ≥4 Hz crosses ≥8/s.
+    /// impact ringing); shaking at ≥4 Hz crosses ≥8/s. The veto sits
+    /// between them at 6/s: slow hand sweeps inside a shaking stream
+    /// still see the surrounding vibration rate and are rejected.
     public var maxZeroCrossingsPerSecond: Double
     /// Deadband around zero for crossing detection, in g.
     public var crossingDeadband: Double
@@ -109,7 +111,7 @@ public struct RepCounterConfig: Equatable, Sendable {
                 minSeparation: TimeInterval = 0.4,
                 maxRotationRate: Double = 12.0,
                 cadenceWindowSeconds: TimeInterval = 1.0,
-                maxZeroCrossingsPerSecond: Double = 8.0,
+                maxZeroCrossingsPerSecond: Double = 6.0,
                 crossingDeadband: Double = 0.05) {
         self.armThreshold = armThreshold
         self.minRepDuration = minRepDuration
@@ -172,7 +174,13 @@ public struct VerifiedRepCounter: Equatable, Sendable {
     public mutating func ingest(_ sample: MotionSample) -> Int {
         ingestedSamples += 1
         if streamStartAt == nil { streamStartAt = sample.timestamp }
-        guard sample.rotationMagnitude <= config.maxRotationRate else { return verifiedCount }
+        guard sample.rotationMagnitude <= config.maxRotationRate else {
+            // A rejected interval must not bridge two endpoints into one
+            // rep: disarm, so a spin between an arm and a later valid
+            // crossing cannot verify across the rejected gap.
+            phase = .idle
+            return verifiedCount
+        }
         let signal = sample.magnitudeDeviation
         let now = sample.timestamp
         trackCrossing(signal: signal, at: now)

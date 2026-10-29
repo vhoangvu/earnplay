@@ -42,18 +42,30 @@ public final class MovementTradeViewModel: ObservableObject {
     private var tradeSession: MovementTradeSession?
     private var provider: MotionSampleProvider?
     private let historyStore: MovementTradeHistoryStore
+    /// Device carry confidence from the app (iPad has no pocket carry).
+    private let verificationConfidence: MovementVerificationConfidence
 
-    public init(historyStore: MovementTradeHistoryStore = MovementTradeHistoryStore()) {
+    public init(historyStore: MovementTradeHistoryStore = MovementTradeHistoryStore(),
+                verificationConfidence: MovementVerificationConfidence = .full) {
         self.historyStore = historyStore
+        self.verificationConfidence = verificationConfidence
     }
 
     /// Presents an AI-initiated offer. Returns false unless idle — one
     /// offer per trade moment; the session cap is enforced by the offer
-    /// gate.
+    /// gate. Presenting reserves the session quota immediately, so a
+    /// recreated UI for the same session sees the pending offer and the
+    /// gate refuses a second one; completion finalizes the reservation
+    /// to its terminal outcome instead of appending a second entry.
     @discardableResult
     public func presentOffer(_ offer: MovementTradeOffer, sessionId: String) -> Bool {
         guard screen == .none else { return false }
-        tradeSession = MovementTradeSession(sessionId: sessionId, offer: offer)
+        let session = MovementTradeSession(sessionId: sessionId, offer: offer)
+        tradeSession = session
+        historyStore.record(MovementTradeHistoryEntry(
+            tradeId: session.tradeId, sessionId: sessionId,
+            activity: offer.activity, offeredAt: session.offeredAt,
+            outcome: .offered, verifiedReps: 0, targetReps: offer.targetReps))
         activityName = Self.displayName(offer.activity)
         targetReps = offer.targetReps
         unlockMinutes = offer.unlockMinutes
@@ -106,9 +118,9 @@ public final class MovementTradeViewModel: ObservableObject {
     private func finish(_ session: MovementTradeSession) {
         provider?.stopUpdates()
         provider = nil
-        lastRecord = session.makeRecord()
+        lastRecord = session.makeRecord(verificationConfidence: verificationConfidence)
         if let entry = session.makeHistoryEntry() {
-            historyStore.record(entry)
+            historyStore.update(entry)
         }
         switch session.outcome {
         case .granted:
@@ -117,7 +129,9 @@ public final class MovementTradeViewModel: ObservableObject {
             statusText = "No problem — back to practice."
         case .abandoned:
             statusText = "Trade ended — no unlock this time. Practice still counts!"
-        case .none:
+        case .offered, .none:
+            // Unreachable: finish runs only for terminal sessions, whose
+            // outcome is never the `.offered` reservation state.
             statusText = ""
         }
         screen = .finished

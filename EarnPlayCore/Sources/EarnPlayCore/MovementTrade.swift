@@ -35,10 +35,16 @@ public enum TradeInitiation: String, Equatable, Sendable {
 public struct MovementOfferContext: Equatable, Sendable {
     public var initiation: TradeInitiation
     public var signals: EffortSignals
+    /// Legacy, ignored by the offer gate: the floor is read from the
+    /// supplied policy's `effortFloorSettings` (the parent's settings),
+    /// so a movement trade cannot bypass stronger practice requirements.
+    /// Kept so existing constructions keep compiling.
     public var floorSettings: EffortFloorSettings
     public var sessionOffersUsed: Int
     public var weeklyCompletions: Int
-    /// Per-session completion flags, chronological oldest-first, up to 5.
+    /// Per-session completion flags, chronological oldest-first, up to 5 —
+    /// over ALL recent sessions, with practice-only sessions as false (see
+    /// `MovementTradeHistory.recentSessionCompletions(allSessionsInOrder:)`).
     public var recentSessionCompletions: [Bool]
     public var sessionsSinceLastMovementOffer: Int?
 
@@ -147,8 +153,9 @@ public enum MovementTradeManager {
         guard context.initiation == .aiLowMotivation else {
             return .refuse(.notAIInitiated)
         }
-        // Threshold is irrelevant here; only the T1.4 floor rule is read.
-        let floor = EffortScorer(threshold: 8, floorSettings: context.floorSettings)
+        // Threshold is irrelevant here; only the T1.4 floor rule is read,
+        // with the POLICY's floor settings — never the context's.
+        let floor = EffortScorer(threshold: 8, floorSettings: policy.effortFloorSettings)
         guard floor.floorMet(for: context.signals) else {
             return .refuse(.floorNotMet)
         }
@@ -181,17 +188,27 @@ public enum MovementTradeManager {
 
 // MARK: - Outcome and history
 
-/// Terminal outcome of a movement trade. Movement unlocks are automatic on
+/// Outcome of a movement trade. Movement unlocks are automatic on
 /// verified completion (no parent approval; LLD §7.1), so completion and
 /// grant are one outcome.
 public enum MovementTradeOutcome: String, Codable, Equatable, Sendable {
+    /// Reservation: the offer was presented and counts toward caps, but no
+    /// terminal outcome is recorded yet. The store replaces it with the
+    /// terminal outcome when the trade completes.
+    case offered
     case granted
     case declined
     case abandoned
 }
 
-/// One offered trade for caps and taper. Append-only, chronological.
+/// One offered trade for caps and taper. Append-only, chronological;
+/// a reservation entry (`.offered`) is updated in place to its terminal
+/// outcome on completion.
 public struct MovementTradeHistoryEntry: Codable, Equatable, Sendable {
+    /// Identifies the trade across its reservation and its terminal
+    /// update, including across store instances (the view model reserves
+    /// at presentation and finalizes at completion).
+    public var tradeId: String
     public var sessionId: String
     public var activity: MovementActivity
     public var offeredAt: Date
@@ -201,9 +218,11 @@ public struct MovementTradeHistoryEntry: Codable, Equatable, Sendable {
     public var verifiedReps: Int
     public var targetReps: Int
 
-    public init(sessionId: String, activity: MovementActivity, offeredAt: Date,
+    public init(tradeId: String = UUID().uuidString, sessionId: String,
+                activity: MovementActivity, offeredAt: Date,
                 outcome: MovementTradeOutcome, completedAt: Date? = nil,
                 verifiedReps: Int, targetReps: Int) {
+        self.tradeId = tradeId
         self.sessionId = sessionId
         self.activity = activity
         self.offeredAt = offeredAt
@@ -211,6 +230,32 @@ public struct MovementTradeHistoryEntry: Codable, Equatable, Sendable {
         self.completedAt = completedAt
         self.verifiedReps = verifiedReps
         self.targetReps = targetReps
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tradeId
+        case sessionId
+        case activity
+        case offeredAt
+        case outcome
+        case completedAt
+        case verifiedReps
+        case targetReps
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Pre-reservation files have no trade ID; mint one so the entry
+        // still decodes and compares by value after a round-trip.
+        tradeId = try container.decodeIfPresent(String.self, forKey: .tradeId)
+            ?? UUID().uuidString
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        activity = try container.decode(MovementActivity.self, forKey: .activity)
+        offeredAt = try container.decode(Date.self, forKey: .offeredAt)
+        outcome = try container.decode(MovementTradeOutcome.self, forKey: .outcome)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        verifiedReps = try container.decode(Int.self, forKey: .verifiedReps)
+        targetReps = try container.decode(Int.self, forKey: .targetReps)
     }
 }
 
@@ -242,7 +287,10 @@ public struct MovementTradeHistory: Codable, Equatable, Sendable {
     }
 
     /// Per-session completion flags, chronological oldest-first, for the
-    /// last `limit` sessions that had offers. Feeds `TaperRule.isPattern`.
+    /// last `limit` sessions that had offers. Feeds `TaperRule.isPattern`
+    /// only when the session owner cannot supply the full session order;
+    /// prefer `recentSessionCompletions(allSessionsInOrder:)` otherwise,
+    /// because this trade-only window cannot see practice-only sessions.
     public func recentSessionCompletions(limit: Int = TaperRule.windowSessions) -> [Bool] {
         var order: [String] = []
         var completed: [String: Bool] = [:]
@@ -257,6 +305,33 @@ public struct MovementTradeHistory: Codable, Equatable, Sendable {
         }
         return order.suffix(max(0, limit)).map { completed[$0] ?? false }
     }
+
+    /// Per-session completion flags over the FULL ordered session list
+    /// (trade sessions and practice-only sessions alike), chronological
+    /// oldest-first, for the last `limit` sessions. Feeds
+    /// `TaperRule.isPattern`, which interprets its input as the last five
+    /// sessions overall: every listed session without a granted trade —
+    /// declined/abandoned offers and practice-only sessions — reads as
+    /// false, so practice between grants dilutes the pattern and practice
+    /// after a pattern clears it.
+    ///
+    /// - Parameter allSessionsInOrder: unique session IDs, chronological
+    ///   oldest-first, supplied by the session owner. The history only
+    ///   records sessions that had offers and cannot enumerate the rest.
+    public func recentSessionCompletions(allSessionsInOrder: [String],
+                                         limit: Int = TaperRule.windowSessions) -> [Bool] {
+        var seen: Set<String> = []
+        var ordered: [String] = []
+        ordered.reserveCapacity(allSessionsInOrder.count)
+        for id in allSessionsInOrder where seen.insert(id).inserted {
+            ordered.append(id)
+        }
+        var granted: Set<String> = []
+        for entry in entries where entry.outcome == .granted {
+            granted.insert(entry.sessionId)
+        }
+        return Array(ordered.suffix(max(0, limit))).map { granted.contains($0) }
+    }
 }
 
 /// File-backed `MovementTradeHistory` on the child device, following the
@@ -266,6 +341,9 @@ public struct MovementTradeHistory: Codable, Equatable, Sendable {
 /// safe because the session cap still bounds any single session.
 public final class MovementTradeHistoryStore: @unchecked Sendable {
     public static let fileName = "movement-trades.json"
+    /// Cross-instance lock file serializing read-modify-write in
+    /// `record`/`update` (the `PolicyStore.apply` precedent).
+    private static let lockFileName = "movement-trades.lock"
 
     private let directory: URL
     private let fileManager: FileManager
@@ -290,12 +368,27 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         return cached
     }
 
-    /// Appends one terminal entry and persists.
+    /// Appends one entry (a reservation or a terminal trade) and persists.
     public func record(_ entry: MovementTradeHistoryEntry) {
         lock.lock()
         defer { lock.unlock() }
-        cached.entries.append(entry)
-        try? persist(cached)
+        mutate { $0.entries.append(entry) }
+    }
+
+    /// Replaces the entry with the same `tradeId` (finalizing a
+    /// reservation to its terminal outcome) and persists. Appends when no
+    /// reservation with that ID is on disk, so a terminal trade is never
+    /// lost when its reservation write was missed.
+    public func update(_ entry: MovementTradeHistoryEntry) {
+        lock.lock()
+        defer { lock.unlock() }
+        mutate {
+            if let index = $0.entries.firstIndex(where: { $0.tradeId == entry.tradeId }) {
+                $0.entries[index] = entry
+            } else {
+                $0.entries.append(entry)
+            }
+        }
     }
 
     @discardableResult
@@ -305,6 +398,60 @@ public final class MovementTradeHistoryStore: @unchecked Sendable {
         cached = Self.load(directory: directory, fileManager: fileManager)
             ?? MovementTradeHistory()
         return cached
+    }
+
+    /// Runs `change` against the persisted truth inside a cross-instance
+    /// file lock, then persists: two stores over one directory can no
+    /// longer erase each other's entries (or undercount the weekly cap).
+    /// When the lock file itself cannot be acquired, falls back to a
+    /// best-effort unsynchronized write; caps fail open by design.
+    private func mutate(_ change: (inout MovementTradeHistory) -> Void) {
+        guard let fd = try? acquireDirectoryLock() else {
+            change(&cached)
+            try? persist(cached)
+            return
+        }
+        defer { releaseDirectoryLock(fd) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+            cached = persisted
+        }
+        change(&cached)
+        try? persist(cached)
+    }
+
+    private func acquireDirectoryLock() throws -> Int32 {
+        try fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let lockURL = directory.appendingPathComponent(Self.lockFileName)
+        while true {
+            do {
+                return try Self.acquireLockFile(at: lockURL)
+            } catch let error as NSError
+                where error.domain == NSPOSIXErrorDomain
+                    && Int32(error.code) == EINTR {
+                continue
+            }
+        }
+    }
+
+    private static func acquireLockFile(at lockURL: URL) throws -> Int32 {
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard flock(fd, LOCK_EX) == 0 else {
+            let code = Int(errno)
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: code)
+        }
+        return fd
+    }
+
+    private func releaseDirectoryLock(_ fd: Int32) {
+        guard fd >= 0 else { return }
+        flock(fd, LOCK_UN)
+        close(fd)
     }
 
     private func persist(_ history: MovementTradeHistory) throws {
@@ -426,12 +573,14 @@ public struct MovementTradeSession: Equatable, Sendable {
         }
     }
 
-    /// History entry for caps/taper. Nil until terminal.
+    /// History entry for caps/taper. Nil until terminal. Carries the
+    /// session's trade ID so the store finalizes the presentation-time
+    /// reservation instead of appending a second entry.
     public func makeHistoryEntry() -> MovementTradeHistoryEntry? {
         guard let outcome else { return nil }
         return MovementTradeHistoryEntry(
-            sessionId: sessionId, activity: offer.activity, offeredAt: offeredAt,
-            outcome: outcome,
+            tradeId: tradeId, sessionId: sessionId, activity: offer.activity,
+            offeredAt: offeredAt, outcome: outcome,
             completedAt: outcome == .granted ? endedAt : nil,
             verifiedReps: counter.verifiedCount, targetReps: offer.targetReps)
     }
@@ -444,6 +593,11 @@ public struct MovementTradeSession: Equatable, Sendable {
         let evidence: String
         let reasoning: String
         switch outcome {
+        case .offered:
+            // Unreachable through a session (its outcome is nil until
+            // terminal); history reservations never produce records.
+            evidence = "Offer presented; outcome not yet recorded."
+            reasoning = "Reservation entry; the terminal outcome is still pending."
         case .granted:
             evidence = "Verified \(counter.verifiedCount)/\(offer.targetReps) \(activityName) reps "
                 + "by motion (\(counter.rejectedNoiseEvents) unverified motion events rejected)."
@@ -489,6 +643,14 @@ public struct MovementTradeSession: Equatable, Sendable {
 public enum MovementVerificationConfidence: String, Codable, Equatable, Sendable {
     case full
     case reduced
+
+    /// Device carry mapping: iPhone trades verify with the phone in the
+    /// pocket (full evidence); iPad has no pocket carry, so its motion
+    /// evidence is weaker (reduced, LLD §7.1). The app passes the result
+    /// into `MovementTradeViewModel`.
+    public static func forDevice(isPad: Bool) -> MovementVerificationConfidence {
+        isPad ? .reduced : .full
+    }
 }
 
 /// Self-contained record of one terminal movement trade.

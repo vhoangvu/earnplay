@@ -1,5 +1,6 @@
 import EarnPlayCore
 import SwiftUI
+import UIKit
 
 /// The single take-it-or-leave-it offer card. Shown only when the AI
 /// initiates; there is no path for the child to summon it.
@@ -58,11 +59,16 @@ struct MovementTradeActiveView: View {
 }
 
 /// T3.1 preview harness: simulates the AI low-motivation event that T3.3 will
-/// produce, runs the real offer gate and session, and replays fixtures for
-/// motion (the simulator has no sensor). The simulate trigger is DEBUG-only;
+/// produce, runs the real offer gate and session, and counts motion from
+/// the `MotionProviderFactory` selection — fixture replay on the simulator
+/// (which has no sensor) or in the DEBUG test mode, the real CoreMotion
+/// sensor on a physical device. The simulate trigger is DEBUG-only;
 /// production offers arrive only via `presentOffer` from the tutor.
 struct MovementTradePreviewView: View {
-    @StateObject private var model = MovementTradeViewModel()
+    @StateObject private var model = MovementTradeViewModel(
+        verificationConfidence: MovementVerificationConfidence.forDevice(
+            isPad: UIDevice.current.userInterfaceIdiom == .pad))
+    @State private var previewSession = PreviewSession()
     @State private var refusalText = ""
     @State private var replayChoice = 0 // 0 genuine, 1 shaking, 2 still
 
@@ -92,7 +98,10 @@ struct MovementTradePreviewView: View {
                     activityName: activityLabel,
                     targetReps: model.targetReps,
                     unlockMinutes: model.unlockMinutes,
-                    onAccept: { model.accept(with: replayProvider()) },
+                    onAccept: {
+                        model.accept(with: MotionProviderFactory.makeAcceptProvider(
+                            replayProvider: replayProvider()))
+                    },
                     onDecline: { model.decline() })
                 #if DEBUG
                     Picker("Preview motion", selection: $replayChoice) {
@@ -145,12 +154,12 @@ struct MovementTradePreviewView: View {
                 initiation: .aiLowMotivation,
                 signals: EffortSignals(activeSeconds: 120, genuineAttempts: 2,
                                        hintInteractions: 1),
-                sessionOffersUsed: history.offersInSession("preview-session"),
+                sessionOffersUsed: history.offersInSession(previewSession.id),
                 weeklyCompletions: history.completionsInTrailingWeek(),
                 recentSessionCompletions: history.recentSessionCompletions())
             switch MovementTradeManager.decide(context: context, policy: .defaultPolicy) {
             case .offer(let offer):
-                model.presentOffer(offer, sessionId: "preview-session")
+                model.presentOffer(offer, sessionId: previewSession.id)
             case .refuse(let reason):
                 refusalText = "Offer refused by gate: \(reason)."
             }
