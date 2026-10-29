@@ -37,6 +37,10 @@ Only the T1.4 unlock path is live:
   texts are distinct.
 - `evaluateAndLog(signals:scorer:...)` scores and logs atomically. Apply the
   unlock effect only when it returns; on throw, no record exists.
+- `EffortSessionRecorder.evaluateAndLog(scorer:logger:...)` is the
+  session-decision boundary: it routes the recorded session through this
+  log, so persistence failure prevents returning a decision. The plain
+  `evaluate` preview must never drive an unlock effect.
 
 ## Test-only seams (no live callers yet)
 

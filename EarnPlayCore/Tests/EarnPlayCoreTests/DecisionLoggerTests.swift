@@ -402,6 +402,100 @@ final class DecisionLoggerTests: XCTestCase {
         XCTAssertEqual(json[0]["type"] as? String, "difficulty-change")
     }
 
+    // MARK: - Fix round 1: cross-instance serialization (review finding 1)
+
+    func testAlternatingWritesThroughTwoLiveInstancesLoseNothing() throws {
+        // Two loggers opened over the same directory, both starting empty.
+        // Alternating appends must all survive: each write reloads the
+        // persisted history under the directory lock before checking IDs
+        // and appending (following PolicyStore.apply).
+        let loggerA = DecisionLogger(directory: directory)
+        let loggerB = DecisionLogger(directory: directory)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        _ = try loggerA.logDifficultyChange(
+            sessionId: "s", outcome: "o1", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base, decisionId: "alt-1")
+        _ = try loggerB.logDifficultyChange(
+            sessionId: "s", outcome: "o2", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(1), decisionId: "alt-2")
+        _ = try loggerA.logDifficultyChange(
+            sessionId: "s", outcome: "o3", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(2), decisionId: "alt-3")
+        _ = try loggerB.logDifficultyChange(
+            sessionId: "s", outcome: "o4", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5,
+            timestamp: base.addingTimeInterval(3), decisionId: "alt-4")
+        // A fresh reader sees all four in order — nothing overwritten.
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["alt-1", "alt-2", "alt-3", "alt-4"])
+        // Both live instances converge after reload.
+        XCTAssertEqual(loggerA.reloadFromDisk().map(\.decisionId),
+                       ["alt-1", "alt-2", "alt-3", "alt-4"])
+        XCTAssertEqual(loggerB.reloadFromDisk().map(\.decisionId),
+                       ["alt-1", "alt-2", "alt-3", "alt-4"])
+    }
+
+    func testDuplicateIdAcrossInstancesThrows() throws {
+        let loggerA = DecisionLogger(directory: directory)
+        let loggerB = DecisionLogger(directory: directory)
+        _ = try loggerA.logDifficultyChange(
+            sessionId: "s", outcome: "o", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5, decisionId: "dup-x")
+        XCTAssertThrowsError(try loggerB.logDifficultyChange(
+            sessionId: "s", outcome: "other", evidenceSummary: "e2", reasoning: "r2",
+            alternativeConsidered: "a2", confidence: 0.6, decisionId: "dup-x")) { error in
+            XCTAssertEqual(error as? DecisionLogError, .duplicateDecisionId)
+        }
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["dup-x"])
+    }
+
+    // MARK: - Fix round 1: session-decision boundary (review finding 2)
+
+    func testRecorderEvaluateAndLogPersistsGrantDecision() throws {
+        let logger = DecisionLogger(directory: directory)
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let now = start.addingTimeInterval(360)
+        let recorder = EffortSessionRecorder(startedAt: start, now: { now })
+        recorder.recordAttempt(at: start.addingTimeInterval(10))
+        recorder.recordAttempt(at: start.addingTimeInterval(20))
+        recorder.recordAttempt(at: start.addingTimeInterval(30))
+        recorder.recordHintInteraction(at: start.addingTimeInterval(40))
+        let result = try recorder.evaluateAndLog(
+            EffortScorer(threshold: 8), logger: logger,
+            sessionId: "s-recorder", appId: "com.example.game", durationMinutes: 30,
+            decisionId: "recorder-grant")
+        XCTAssertEqual(result.score.decision, .granted)
+        XCTAssertEqual(result.decision.type, .grantUnlock)
+        assertComplete(result.decision)
+        // The decision reached disk: a fresh reader sees it.
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["recorder-grant"])
+    }
+
+    func testRecorderEvaluateAndLogPersistenceFailureReturnsNoDecision() {
+        let failing = DecisionLogger(directory: directory, dataWriter: { _, _ in
+            throw NSError(domain: "test", code: 1)
+        })
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let now = start.addingTimeInterval(360)
+        let recorder = EffortSessionRecorder(startedAt: start, now: { now })
+        recorder.recordAttempt(at: start.addingTimeInterval(10))
+        recorder.recordHintInteraction(at: start.addingTimeInterval(20))
+        // Persistence failure prevents the boundary from returning a
+        // decision at all: it throws instead of yielding an unlogged score.
+        XCTAssertThrowsError(try recorder.evaluateAndLog(
+            EffortScorer(threshold: 8), logger: failing,
+            sessionId: "s-recorder", appId: "com.example.game", durationMinutes: 30)) { error in
+            XCTAssertEqual(error as? DecisionLogError, .persistenceFailed)
+        }
+        XCTAssertTrue(failing.decisions.isEmpty)
+        XCTAssertTrue(DecisionLogger(directory: directory).decisions.isEmpty)
+    }
+
     // MARK: - Routine one-line reasons (not Decisions)
 
     func testRoutineReasonCollapsesToOneLineAndLogsNothing() {

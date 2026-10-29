@@ -130,7 +130,10 @@ public enum DecisionLogError: Error, Equatable, Sendable {
 /// `EffortScore` to grant-unlock / deny-unlock with a deterministic
 /// justification built from the actual signals, and `evaluateAndLog` scores
 /// and logs atomically so the unlock path cannot complete without its log
-/// write (if it throws, apply no effect). Difficulty-change, offer-trade,
+/// write (if it throws, apply no effect). The session-decision boundary is
+/// `EffortSessionRecorder.evaluateAndLog`, which routes the recorded
+/// session through this log; the plain `evaluate` preview must never drive
+/// an unlock effect. Difficulty-change, offer-trade,
 /// and session-judgment have no live callers yet — no TutorEngine and no
 /// T3.x trade code exist on this branch, and none is invented here — so
 /// their typed seams (`logDifficultyChange`, `logTradeOffer`,
@@ -146,10 +149,13 @@ public final class DecisionLogger: @unchecked Sendable {
     public static let decisionsFileName = "decisions.json"
     /// Last-good backup file name inside the store directory.
     public static let backupFileName = "decisions-backup.json"
+    /// Cross-instance lock file serializing read/check/write in `log`.
+    private static let lockFileName = "decisions.lock"
 
     private let directory: URL
     private let fileManager: FileManager
     private let dataWriter: (Data, URL) throws -> Void
+    private let lockAcquirer: (URL) throws -> Int32
     private let lock = NSLock()
     private var cached: [Decision]
 
@@ -163,14 +169,22 @@ public final class DecisionLogger: @unchecked Sendable {
     /// a file URL and must throw on failure. Production uses the default
     /// atomic `Data.write`; tests inject a throwing writer to prove a
     /// failed write appends nothing and the decision must not take effect.
+    ///
+    /// `lockAcquirer` is the lock-acquisition seam: given the lock-file
+    /// URL it must return a locked file descriptor or throw an
+    /// `NSPOSIXErrorDomain` error. Production uses the default
+    /// `open` + `flock(LOCK_EX)` implementation; tests inject a failing
+    /// acquirer to exercise that path deterministically.
     public init(directory: URL,
                 fileManager: FileManager = .default,
-                dataWriter: ((Data, URL) throws -> Void)? = nil) {
+                dataWriter: ((Data, URL) throws -> Void)? = nil,
+                lockAcquirer: ((URL) throws -> Int32)? = nil) {
         self.directory = directory
         self.fileManager = fileManager
         self.dataWriter = dataWriter ?? { data, url in
             try data.write(to: url, options: [.atomic])
         }
+        self.lockAcquirer = lockAcquirer ?? Self.acquireLockFile(at:)
         self.cached = Self.load(directory: directory, fileManager: fileManager) ?? []
     }
 
@@ -243,15 +257,39 @@ public final class DecisionLogger: @unchecked Sendable {
                               confidence: confidence, timestamp: timestamp)
         lock.lock()
         defer { lock.unlock() }
+        // Serialize read/check/write across live instances over the same
+        // directory (the instance lock alone cannot), then reload the
+        // persisted history under that lock before checking IDs and
+        // appending — following PolicyStore.apply. Without the reload, a
+        // stale instance would overwrite records another instance wrote.
+        let lockFD: Int32
+        do {
+            lockFD = try acquireDirectoryLock()
+        } catch {
+            // Never proceed unlocked: fail before reading or writing.
+            throw DecisionLogError.persistenceFailed
+        }
+        defer { releaseDirectoryLock(lockFD) }
+        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+            var seen = Set(persisted.map(\.decisionId))
+            var merged = persisted
+            for held in cached where !seen.contains(held.decisionId) {
+                merged.append(held)
+                seen.insert(held.decisionId)
+            }
+            cached = merged
+        }
         if cached.contains(where: { $0.decisionId == record.decisionId }) {
             throw DecisionLogError.duplicateDecisionId
         }
+        let appended: [Decision]
         do {
-            try persist(cached + [record])
+            appended = cached + [record]
+            try persist(appended)
         } catch {
             throw DecisionLogError.persistenceFailed
         }
-        cached.append(record)
+        cached = appended
         return record
     }
 
@@ -496,6 +534,43 @@ public final class DecisionLogger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return try Self.encode(cached)
+    }
+
+    // MARK: - Cross-instance lock (fail-closed; reload above is the guard)
+
+    private func acquireDirectoryLock() throws -> Int32 {
+        try fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let lockURL = directory.appendingPathComponent(Self.lockFileName)
+        while true {
+            do {
+                return try lockAcquirer(lockURL)
+            } catch let error as NSError
+                where error.domain == NSPOSIXErrorDomain
+                    && Int32(error.code) == EINTR {
+                continue
+            }
+        }
+    }
+
+    private static func acquireLockFile(at lockURL: URL) throws -> Int32 {
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard flock(fd, LOCK_EX) == 0 else {
+            let code = Int(errno)
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: code)
+        }
+        return fd
+    }
+
+    private func releaseDirectoryLock(_ fd: Int32) {
+        guard fd >= 0 else { return }
+        flock(fd, LOCK_UN)
+        close(fd)
     }
 
     // MARK: - Persistence (caller holds `lock`, except load at init)

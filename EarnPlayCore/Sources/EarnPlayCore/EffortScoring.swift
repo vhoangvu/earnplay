@@ -429,7 +429,34 @@ public final class EffortSessionRecorder: HintListenEventSink, @unchecked Sendab
     }
 
     /// Scores the recorded session as of now.
+    ///
+    /// Score preview for UI narration and tests only: it returns the
+    /// grant/deny outcome without writing a Decision record, so it must
+    /// never drive an unlock effect. Unlock effects must use
+    /// `evaluateAndLog`, which persists the Decision before returning and
+    /// throws — returning no decision — when the log write fails.
     public func evaluate(_ scorer: EffortScorer) -> EffortScore {
         scorer.evaluate(signals())
+    }
+
+    /// Scores the recorded session and logs the unlock decision atomically.
+    ///
+    /// This is the session-decision boundary for unlock effects: one call
+    /// evaluates the recorded signals and appends the grant/deny Decision
+    /// via `logger`, and the caller applies the unlock effect only when
+    /// this returns. If logging throws (invalid context, duplicate ID, or
+    /// persistence failure), nothing returns and no record exists, so a
+    /// persistence failure prevents the decision from completing — the
+    /// caller cannot mistake an unlogged evaluation for a decided one.
+    /// On success returns both the score and its persisted Decision.
+    public func evaluateAndLog(_ scorer: EffortScorer, logger: DecisionLogger,
+                               sessionId: String, appId: String, durationMinutes: Int,
+                               timestamp: Date = Date(),
+                               decisionId: String = UUID().uuidString)
+    throws -> (score: EffortScore, decision: Decision) {
+        try logger.evaluateAndLog(signals: signals(), scorer: scorer,
+                                  sessionId: sessionId, appId: appId,
+                                  durationMinutes: durationMinutes,
+                                  timestamp: timestamp, decisionId: decisionId)
     }
 }
