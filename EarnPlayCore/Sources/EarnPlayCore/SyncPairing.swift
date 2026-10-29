@@ -558,4 +558,16 @@ public final class SyncPairingGate: @unchecked Sendable {
         lock.unlock()
         notifyChanged()
     }
+
+    /// Ordinary transport teardown (fix round 6, item 6): clears
+    /// only provisional/challenge state. The durable pairing and
+    /// its secret survive `stop()`/`start()` and relaunch; only
+    /// `unpair()` clears them. Nothing durable changes here, so no
+    /// persistence write is needed.
+    public func clearTransientPairingState() {
+        lock.lock(); defer { lock.unlock() }
+        _provisionalPeer = nil; _verifiedRemote = false; _verifiedByPeer = false
+        _secretEstablishmentOpen = false
+        _expectedPeerCode = nil
+    }
 }

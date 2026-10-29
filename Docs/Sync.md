@@ -120,6 +120,30 @@ Accept → both show paired, then (1)/(2) flow.
   reconnects as the same device and queued delivery resumes.
   Reset/Unpair controls in the admin Sessions tab and the child
   sync view clear the pairing and secret (identity is kept).
+- **Known limitation — active relay (fix round 6, item 2):**
+  pairing proofs (`PairingAuthenticator`, fix round 3) authenticate
+  the advertised stable identities and the entered codes, but they
+  are not bound to the encrypted MPC channel itself. A nearby
+  attacker admitted as a peer in two separate MPC sessions (one
+  with each victim, impersonating the other device's stable
+  identity in each) could forward challenges, responses, and
+  confirmations unchanged; both victims' users would see the
+  expected pairing-request and code screens — the codes are read
+  from the genuine devices in the same room — so both sides would
+  authorize the relay's session handle and send it the pairing
+  secret and payloads, without the relay ever learning either
+  displayed code. This cannot be closed with the APIs this
+  implementation uses: the session is created with
+  `securityIdentity: nil`, MultipeerConnectivity exposes no
+  exported channel/session key or peer channel fingerprint to the
+  app that the digests could be bound to, and supplying a
+  verifiable `SecIdentity` would be a transport/identity rewrite
+  beyond Demo scope. Accepted Demo limitation (same standing as
+  the H5 deferral): the relay must be an admitted nearby peer in
+  both sessions, and Demo pairing happens between two known
+  devices held in the same room — pair only with the expected
+  device in hand, and treat an unexpected second pairing request
+  as a stop signal.
 - **Limits:** this is demo/local scope. The 6-digit code is a
   human-compared short secret, not a credential; MPC transport
   encryption (`encryptionPreference: .required`) protects the

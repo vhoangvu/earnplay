@@ -19,6 +19,43 @@ import MultipeerConnectivity
 /// pending invitation (item 4); one outstanding invitation and
 /// handshake at a time (item 5); an unanswered challenge restores
 /// the manual request and is answered on acceptance (item 6).
+/// Round 6: disconnect fails the departing handle's own provisional
+/// attempt and clears only that handle's state (items 1+7); peer
+/// handles are allocated by MCPeerID equality per session
+/// generation (item 5); stop() preserves the durable pairing and
+/// secret, clearing only transient state (item 6).
+/// Allocates transport handles for peer instances (fix round 6,
+/// item 5): by `MCPeerID` equality (`isEqual`), not object
+/// reference. Two separately created `MCPeerID(displayName:)`
+/// instances are unequal (genuinely different peers), but the
+/// framework may vend equal-but-distinct objects for the SAME
+/// remote peer across discovery, delegate callbacks, and
+/// `connectedPeers` (verified: an archived round-trip compares
+/// equal with an equal hash but a different ObjectIdentifier) —
+/// those must share one handle. Allocations are scoped to one
+/// session generation: `reset()` starts a new generation and old
+/// handles are never reused (the counter stays monotonic, so a
+/// stale binding can never collide with a new generation's).
+public final class PeerHandleAllocator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var peers: [MCPeerID] = []
+    private var handles: [String] = []
+    private var counter = 0
+    public init() {}
+    public func handle(for peer: MCPeerID) -> String {
+        lock.lock(); defer { lock.unlock() }
+        if let index = peers.firstIndex(where: { $0.isEqual(peer) }) { return handles[index] }
+        counter += 1
+        let handle = "peer-\(counter)"
+        peers.append(peer); handles.append(handle)
+        return handle
+    }
+    public func reset() {
+        lock.lock(); defer { lock.unlock() }
+        peers.removeAll(); handles.removeAll()
+    }
+}
+
 public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked Sendable {
     public enum Role: Sendable { case browser, advertiser }
     public static let serviceType = "earnplay-sync"
@@ -40,6 +77,7 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
     private var peerBook = DiscoveredPeerBook()
     private var mcPeersByStableID: [String: MCPeerID] = [:]
     private let resolver = PeerIdentityResolver()
+    private let handleAllocator = PeerHandleAllocator()
     private var issuedChallenge: String?
     private var trustedNonce: String?
     private var trustedPending = false
@@ -107,7 +145,7 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
 
     // MARK: - Serialized state helpers (H1, H2)
 
-    private func handle(for mcPeer: MCPeerID) -> String { "\(ObjectIdentifier(mcPeer))" }
+    private func handle(for mcPeer: MCPeerID) -> String { handleAllocator.handle(for: mcPeer) }
     private func identity(for mcPeer: MCPeerID) -> PeerIdentity {
         resolver.identity(forHandle: handle(for: mcPeer), fallbackDisplayName: mcPeer.displayName)
     }
@@ -170,6 +208,9 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         }
     }
     public func start() {
+        // New session generation (fix round 6, item 5): handles and
+        // instance bindings from a previous session never carry over.
+        handleAllocator.reset(); resolver.forgetAll()
         let s = MCSession(peer: peerID, securityIdentity: nil, encryptionPreference: .required)
         s.delegate = self
         var newAdvertiser: MCNearbyServiceAdvertiser?
@@ -202,8 +243,12 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         dataPlaneBinding.clear(); activeHandshakeHandle = nil
         pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
         stateLock.unlock()
-        resolver.forgetAll()
-        pairing.reset()
+        resolver.forgetAll(); handleAllocator.reset()
+        // Fix round 6 (item 6): ordinary teardown clears only
+        // provisional/challenge state. The durable pairing and its
+        // secret are preserved (and stay persisted); only the
+        // explicit unpair() path drops them.
+        pairing.clearTransientPairingState()
         oldAdvertiser?.stopAdvertisingPeer(); oldBrowser?.stopBrowsingForPeers()
         oldSession?.disconnect()
     }
@@ -572,20 +617,37 @@ extension MultipeerSyncTransport: MCSessionDelegate {
             return
         }
         if state == .notConnected {
+            // Fix round 6 (items 1+7): cleanup, provisional failure,
+            // and reconnect scheduling are scoped to the DEPARTING
+            // handle. A duplicate handle claiming the paired identity
+            // (bound only in the resolver, never authorized) must not
+            // clear the genuine peer's verified/data-plane/trusted
+            // state; the genuine or actively-handshaking handle
+            // failing DOES fail its own provisional attempt, so a
+            // verified flag can never survive into a new connection
+            // and promote on pairingConfirmed alone.
+            let departingHandle = handle(for: mcPeer)
             var shouldReconnect = false
+            var provisionalPeerToFail: PeerIdentity?
             stateLock.lock()
-            peerBook.markFailed(remote)
-            if pairing.pairedPeer == remote {
-                verifiedPeer = nil; remoteVerified = false; dataPlanePeer = nil
-                dataPlaneBinding.unbind(sessionHandle: handle(for: mcPeer))
-                trustedNonce = nil; trustedPending = false
-                shouldReconnect = (role == .browser)
-            }
-            if activeHandshakeHandle == handle(for: mcPeer) { activeHandshakeHandle = nil }
-            if pendingRemoteChallengeFrom == remote {
-                pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
+            let ownsAttempt = dataPlaneBinding.sessionHandle == departingHandle
+                || activeHandshakeHandle == departingHandle
+            if ownsAttempt {
+                peerBook.markFailed(remote)
+                if pairing.pairedPeer == remote {
+                    verifiedPeer = nil; remoteVerified = false; dataPlanePeer = nil
+                    dataPlaneBinding.unbind(sessionHandle: departingHandle)
+                    trustedNonce = nil; trustedPending = false
+                    shouldReconnect = (role == .browser)
+                }
+                if activeHandshakeHandle == departingHandle { activeHandshakeHandle = nil }
+                if pendingRemoteChallengeFrom == remote {
+                    pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
+                }
+                if pairing.provisionalPeer == remote { provisionalPeerToFail = remote }
             }
             stateLock.unlock()
+            if let provisionalPeerToFail { pairing.failProvisionalAttempt(peer: provisionalPeerToFail) }
             if shouldReconnect { scheduleTrustedReconnect() }
         }
         onConnectionChange?(false)
