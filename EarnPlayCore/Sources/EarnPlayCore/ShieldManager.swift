@@ -243,6 +243,11 @@ public final class ShieldManager: @unchecked Sendable {
     private var window: UnlockWindow?
     private var lastConfiguration: ShieldConfiguration = .none
     private var monitorTask: Task<Void, Never>?
+    /// Generation counter for the monitor task (guarded by `lock`):
+    /// each `startExpiryMonitoring` call stamps its task, so a task
+    /// that exits on its own only clears `monitorTask` when no newer
+    /// task has since started.
+    private var monitorGeneration: UInt64 = 0
     /// True when a reconciliation narrowed or revoked the in-memory
     /// window but persisting that change failed, so the on-disk record
     /// is stale. Later refreshes retry the write; until one succeeds, a
@@ -459,21 +464,29 @@ public final class ShieldManager: @unchecked Sendable {
     }
 
     /// Starts automatic re-lock: polls the monotonic clock and applies
-    /// shields as soon as the window expires. Idempotent.
+    /// shields as soon as the window expires. Idempotent. The polling
+    /// loop stops itself (and clears its task) once a poll shows the
+    /// window ended and shields re-applied, so no explicit stop call
+    /// is needed after expiry — in particular, a hidden screen with no
+    /// further view events does not poll forever.
     public func startExpiryMonitoring(pollInterval: TimeInterval = 1) {
         lock.lock()
         if monitorTask != nil {
             lock.unlock()
             return
         }
+        monitorGeneration += 1
+        let generation = monitorGeneration
         let task = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(
                     nanoseconds: UInt64(max(0.01, pollInterval) * 1_000_000_000)
                 )
                 if Task.isCancelled { break }
-                self?.refresh()
+                guard let strongSelf = self else { break }
+                if !strongSelf.refreshAndHasOpenWindow() { break }
             }
+            self?.finishExpiryMonitoringIfGeneration(generation)
         }
         monitorTask = task
         lock.unlock()
@@ -485,6 +498,37 @@ public final class ShieldManager: @unchecked Sendable {
         monitorTask?.cancel()
         monitorTask = nil
         lock.unlock()
+    }
+
+    /// True while expiry-monitoring polling is running. Becomes false
+    /// on its own shortly after the window ends (the loop stops
+    /// itself), or immediately when `stopExpiryMonitoring()` is called.
+    public var isExpiryMonitoring: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return monitorTask != nil
+    }
+
+    /// Refreshes expiry state (re-applying shields) and atomically
+    /// reports whether a window remains open. The monitor loop uses
+    /// this single locked step so each tick applies exactly once.
+    private func refreshAndHasOpenWindow() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        refreshLocked()
+        return window != nil
+    }
+
+    /// Clears `monitorTask` when the exiting task is still the current
+    /// generation. A task cancelled by `stopExpiryMonitoring` clears an
+    /// already-nil slot (harmless); a task superseded by a newer start
+    /// leaves the new task alone.
+    private func finishExpiryMonitoringIfGeneration(_ generation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        if monitorGeneration == generation {
+            monitorTask = nil
+        }
     }
 
     // MARK: - Internals (caller holds `lock`, except at init)
