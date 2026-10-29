@@ -56,6 +56,7 @@ targets:
       - package: EarnPlayCore
     settings:
       base:
+        BUNDLE_LOADER: $(TEST_HOST)
         PRODUCT_NAME: EarnPlayTests
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.tests
         GENERATE_INFOPLIST_FILE: YES

@@ -24,7 +24,11 @@ struct ContentView: View {
                 Divider()
                 SimulatedShieldDemoView()
                 Divider()
+                StallProbePreviewView()
+                Divider()
                 SpikeView()
+                Divider()
+                MovementTradePreviewView()
             }
             .padding()
         }
