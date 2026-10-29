@@ -104,3 +104,100 @@ final class StallProbePreviewNoticeTests: XCTestCase {
         XCTAssertEqual(model.replyNotice, "Say a little more about what you tried.")
     }
 }
+
+/// Recording fake at the synthesizer boundary only. The service and model
+/// logic under test (speak/stop, reply handling, card dismissal) is the
+/// real code.
+@MainActor
+private final class ProbeSpeechFakeEngine: SpeechEngine {
+    var onPlaybackFinished: (() -> Void)?
+    private(set) var stopCallCount = 0
+    var isSpeaking = false
+
+    @discardableResult
+    func speak(text: String) -> Bool {
+        isSpeaking = true
+        return true
+    }
+
+    func stopSpeaking() {
+        stopCallCount += 1
+        isSpeaking = false
+    }
+}
+
+/// Fix round 3 (issue #8 review): the speaker button lives inside the
+/// `pendingProbe` card, so a substantive reply — which clears the card —
+/// must stop the probe's read-aloud playback, or it plays on with no stop
+/// control left. Non-substantive replies keep the card and must leave
+/// playback alone; start-over reset keeps its existing stop behavior.
+@MainActor
+final class StallProbePreviewSpeechTests: XCTestCase {
+    private func makeModelWithFiredProbe()
+        -> (model: StallProbePreviewModel, engine: ProbeSpeechFakeEngine) {
+        let engine = ProbeSpeechFakeEngine()
+        let speech = ReadAloudService(band: GradeBand(grade: "4"), engine: engine)
+        let model = StallProbePreviewModel(speech: speech)
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        model.submitAnswer("12")
+        return (model, engine)
+    }
+
+    func testSubstantiveReplyStopsProbePlaybackWhenCardDismisses() {
+        let (model, engine) = makeModelWithFiredProbe()
+        guard let probe = model.pendingProbe else {
+            XCTFail("expected a pending probe after 3 identical wrong answers")
+            return
+        }
+        model.speech.speak(probe.message)
+        XCTAssertTrue(model.speech.isSpeaking)
+        XCTAssertEqual(model.speech.currentMessageID, probe.message.id)
+
+        model.submitReply("I tried adding the tops")
+
+        XCTAssertNil(model.pendingProbe, "substantive reply dismisses the probe card")
+        XCTAssertEqual(model.replyNotice, "Effort recorded — keep going.")
+        XCTAssertFalse(model.speech.isSpeaking,
+                       "dismissing the probe card must stop its playback")
+        XCTAssertNil(model.speech.currentMessageID)
+        XCTAssertEqual(engine.stopCallCount, 1)
+    }
+
+    func testNonSubstantiveReplyKeepsProbePlayback() {
+        let (model, engine) = makeModelWithFiredProbe()
+        guard let probe = model.pendingProbe else {
+            XCTFail("expected a pending probe after 3 identical wrong answers")
+            return
+        }
+        model.speech.speak(probe.message)
+        XCTAssertTrue(model.speech.isSpeaking)
+
+        model.submitReply("...")
+
+        XCTAssertNotNil(model.pendingProbe, "rejected reply keeps the probe card")
+        XCTAssertTrue(model.speech.isSpeaking,
+                      "playback must continue while the card stays")
+        XCTAssertEqual(model.speech.currentMessageID, probe.message.id)
+        XCTAssertEqual(engine.stopCallCount, 0)
+    }
+
+    func testResetStopsProbePlaybackUnchanged() {
+        let (model, engine) = makeModelWithFiredProbe()
+        guard let probe = model.pendingProbe else {
+            XCTFail("expected a pending probe after 3 identical wrong answers")
+            return
+        }
+        model.speech.speak(probe.message)
+        XCTAssertTrue(model.speech.isSpeaking)
+
+        model.reset()
+
+        XCTAssertNil(model.pendingProbe)
+        XCTAssertNil(model.replyNotice)
+        XCTAssertFalse(model.hintVisible)
+        XCTAssertFalse(model.speech.isSpeaking)
+        XCTAssertNil(model.speech.currentMessageID)
+        XCTAssertEqual(engine.stopCallCount, 1)
+    }
+}

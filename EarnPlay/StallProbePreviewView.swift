@@ -166,7 +166,19 @@ final class StallProbePreviewModel: ObservableObject {
     }
 
     private func refresh() {
+        let dismissedMessageID = pendingProbe?.message.id
         pendingProbe = session.pendingProbe
+        if let dismissedMessageID,
+           pendingProbe?.message.id != dismissedMessageID,
+           speech.isSpeaking,
+           speech.currentMessageID == dismissedMessageID {
+            // The probe card carrying the speaker button is gone (a
+            // substantive reply dismissed it, or a new probe replaced it).
+            // Stop its playback: the whole-view onDisappear does not fire
+            // here, and without this the question reads on with no stop
+            // control left. Other playback is untouched.
+            speech.stop()
+        }
         let signals = session.signals()
         // Debug preview: event counts only. The score and threshold are
         // never shown (HLD: the child never sees the number).
