@@ -380,7 +380,12 @@ final class SetupFlowFixRound4Tests: XCTestCase {
             backend.currentShieldConfiguration.shieldedApplications,
             [Self.retryApp]
         )
-        XCTAssertFalse(manager.isShielded(app: Self.socialApp, category: Self.social))
+        // T2.5: setup completed and its policy is active, so the
+        // now-unclassified socialApp (dropped by the replacing commit)
+        // is shielded by the default-deny fallback until a policy sync
+        // classifies it — the backend set above stays [retryApp] only,
+        // but the launch gate denies the unknown app.
+        XCTAssertTrue(manager.isShielded(app: Self.socialApp, category: Self.social))
         XCTAssertTrue(manager.isShielded(app: Self.retryApp, category: Self.games))
 
         let (relaunched, _, relaunchManager, relaunchBackend) = makeSetup(authorized: true)
@@ -389,7 +394,9 @@ final class SetupFlowFixRound4Tests: XCTestCase {
             relaunchBackend.currentShieldConfiguration.shieldedApplications,
             [Self.retryApp]
         )
-        XCTAssertFalse(relaunchManager.isShielded(app: Self.socialApp, category: Self.social))
+        // T2.5, as above: the relaunched completed setup's policy is
+        // active, so unclassified socialApp stays shielded at the gate.
+        XCTAssertTrue(relaunchManager.isShielded(app: Self.socialApp, category: Self.social))
     }
 
     // MARK: - Incomplete record store semantics
