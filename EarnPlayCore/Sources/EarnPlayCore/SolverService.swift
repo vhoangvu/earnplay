@@ -212,10 +212,21 @@ public struct VerifiedQuestion: Equatable, Sendable {
     /// Passage retained for reading questions, so grading and review can
     /// trace the verified answer back to its supporting text.
     public let passage: String?
+    /// Structured values this question was verified from. Binds the
+    /// question to its original proposal: without these, two different
+    /// problems sharing one prompt and answer (6×6 vs 9×4, both 36; 2+2
+    /// vs 2×2, both 4) verify to equal questions, so a re-verification
+    /// check (`rechecked == question`) would accept a mismatched
+    /// question/proposal pair and hint the wrong problem.
+    public let sourceOperands: [Int]
+    public let sourceFractions: [SolverFraction]
+    public let sourceOperation: WordOperation?
 
     fileprivate init(questionId: String, skill: String, formType: SolverForm,
                      promptText: String, verifiedAnswer: String, difficulty: Int,
-                     grade: String, passage: String? = nil) {
+                     grade: String, passage: String? = nil,
+                     sourceOperands: [Int] = [], sourceFractions: [SolverFraction] = [],
+                     sourceOperation: WordOperation? = nil) {
         self.questionId = questionId
         self.skill = skill
         self.formType = formType
@@ -224,6 +235,9 @@ public struct VerifiedQuestion: Equatable, Sendable {
         self.difficulty = difficulty
         self.grade = grade
         self.passage = passage
+        self.sourceOperands = sourceOperands
+        self.sourceFractions = sourceFractions
+        self.sourceOperation = sourceOperation
     }
 }
 
@@ -395,7 +409,10 @@ public struct SolverService: Sendable {
                 verifiedAnswer: answer,
                 difficulty: problem.difficulty,
                 grade: problem.grade,
-                passage: problem.passage))
+                passage: problem.passage,
+                sourceOperands: problem.operands,
+                sourceFractions: problem.fractions,
+                sourceOperation: problem.operation))
         case .rejected(let reason):
             return .failure(reason)
         }

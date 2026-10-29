@@ -25,6 +25,9 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "0.1.0"
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
   EarnPlayAdmin:
     type: application
     platform: iOS
@@ -53,10 +56,12 @@ targets:
       - package: EarnPlayCore
     settings:
       base:
+        BUNDLE_LOADER: $(TEST_HOST)
         PRODUCT_NAME: EarnPlayTests
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.tests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.0"
+        BUNDLE_LOADER: $(TEST_HOST)
 schemes:
   EarnPlay:
     build:
