@@ -496,6 +496,69 @@ final class DecisionLoggerTests: XCTestCase {
         XCTAssertTrue(DecisionLogger(directory: directory).decisions.isEmpty)
     }
 
+    // MARK: - Fix round 2: unreadable store must not be overwritten (review finding 1)
+
+    func testUnreadableStoreAppendThrowsWithoutOverwriting() throws {
+        // Seed one persisted record, then make both files temporarily
+        // unreadable (chmod 000). A fresh logger starts with an empty cache
+        // (init never throws), but its append must throw persistenceFailed
+        // without replacing the unreadable history.
+        let seeded = DecisionLogger(directory: directory)
+        _ = try seeded.logDifficultyChange(
+            sessionId: "s", outcome: "o", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5, decisionId: "unreadable-kept")
+        let primary = directory.appendingPathComponent(DecisionLogger.decisionsFileName)
+        let backup = directory.appendingPathComponent(DecisionLogger.backupFileName)
+        let primaryBefore = try Data(contentsOf: primary)
+        let backupBefore = try Data(contentsOf: backup)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: primary.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: backup.path)
+        let restore = {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: primary.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: backup.path)
+        }
+        defer { restore() }
+        // Precondition: both files are actually unreadable (chmod 000 is a
+        // no-op for root, so skip instead of false-passing there).
+        if (try? Data(contentsOf: primary)) != nil || (try? Data(contentsOf: backup)) != nil {
+            restore()
+            throw XCTSkip("chmod 000 left store readable (running as root?)")
+        }
+
+        let fresh = DecisionLogger(directory: directory)
+        XCTAssertTrue(fresh.decisions.isEmpty)
+        XCTAssertThrowsError(try fresh.logDifficultyChange(
+            sessionId: "s", outcome: "new", evidenceSummary: "e2", reasoning: "r2",
+            alternativeConsidered: "a2", confidence: 0.6, decisionId: "unreadable-new")) { error in
+            XCTAssertEqual(error as? DecisionLogError, .persistenceFailed)
+        }
+        XCTAssertTrue(fresh.decisions.isEmpty)
+
+        // History untouched: bytes identical and no new record persisted.
+        restore()
+        XCTAssertEqual(try Data(contentsOf: primary), primaryBefore)
+        XCTAssertEqual(try Data(contentsOf: backup), backupBefore)
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["unreadable-kept"])
+    }
+
+    func testAbsentStoreInitializesCleanlyAndAppends() throws {
+        // No files at all: init yields an empty log and the first append
+        // succeeds, creating the store.
+        let primary = directory.appendingPathComponent(DecisionLogger.decisionsFileName)
+        let backup = directory.appendingPathComponent(DecisionLogger.backupFileName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: primary.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+        let logger = DecisionLogger(directory: directory)
+        XCTAssertTrue(logger.decisions.isEmpty)
+        _ = try logger.logDifficultyChange(
+            sessionId: "s", outcome: "o", evidenceSummary: "e", reasoning: "r",
+            alternativeConsidered: "a", confidence: 0.5, decisionId: "absent-1")
+        XCTAssertEqual(logger.decisions.map(\.decisionId), ["absent-1"])
+        XCTAssertEqual(DecisionLogger(directory: directory).decisions.map(\.decisionId),
+                       ["absent-1"])
+    }
+
     // MARK: - Routine one-line reasons (not Decisions)
 
     func testRoutineReasonCollapsesToOneLineAndLogsNothing() {

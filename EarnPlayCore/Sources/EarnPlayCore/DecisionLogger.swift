@@ -121,8 +121,11 @@ public enum DecisionLogError: Error, Equatable, Sendable {
 /// `decisions.json` in Application Support `EarnPlay/` (same directory as
 /// `PolicyStore`, different file), with a best-effort backup copy for the
 /// corrupt-primary fallback. Loading tries primary, then backup, then an
-/// empty log. Tests inject an isolated temporary directory; production
-/// uses the default directory and accumulates across launches.
+/// empty log — but an unreadable store (files exist yet neither decodes)
+/// is not an empty log: appends fail closed with `persistenceFailed`
+/// without overwriting, until history is recoverable again. Tests inject
+/// an isolated temporary directory; production uses the default directory
+/// and accumulates across launches.
 ///
 /// ## Which paths are live at this stage
 ///
@@ -161,9 +164,12 @@ public final class DecisionLogger: @unchecked Sendable {
 
     /// Creates a logger over `directory`, loading any persisted records.
     ///
-    /// Loading never throws: a missing file yields an empty log; a corrupt
-    /// primary falls back to the backup; a corrupt backup too yields an
-    /// empty log.
+    /// Loading never throws: a missing store yields an empty log; an
+    /// unreadable/corrupt primary falls back to the backup; an unreadable
+    /// store (files exist yet neither decodes) also yields an empty
+    /// in-memory log, but subsequent appends fail closed with
+    /// `persistenceFailed` until history is recoverable again, so
+    /// unreadable history is never overwritten.
     ///
     /// `dataWriter` is the persistence seam: it writes encoded log data to
     /// a file URL and must throw on failure. Production uses the default
@@ -185,7 +191,15 @@ public final class DecisionLogger: @unchecked Sendable {
             try data.write(to: url, options: [.atomic])
         }
         self.lockAcquirer = lockAcquirer ?? Self.acquireLockFile(at:)
-        self.cached = Self.load(directory: directory, fileManager: fileManager) ?? []
+        switch Self.loadOutcome(directory: directory, fileManager: fileManager) {
+        case .loaded(let decisions):
+            self.cached = decisions
+        case .absent, .unreadable:
+            // Unreadable starts empty in memory (init never throws), but
+            // `log` re-checks under the directory lock and fails closed, so
+            // the unreadable history is never overwritten.
+            self.cached = []
+        }
     }
 
     /// Creates a logger in the default on-device location:
@@ -270,7 +284,8 @@ public final class DecisionLogger: @unchecked Sendable {
             throw DecisionLogError.persistenceFailed
         }
         defer { releaseDirectoryLock(lockFD) }
-        if let persisted = Self.load(directory: directory, fileManager: fileManager) {
+        switch Self.loadOutcome(directory: directory, fileManager: fileManager) {
+        case .loaded(let persisted):
             var seen = Set(persisted.map(\.decisionId))
             var merged = persisted
             for held in cached where !seen.contains(held.decisionId) {
@@ -278,6 +293,13 @@ public final class DecisionLogger: @unchecked Sendable {
                 seen.insert(held.decisionId)
             }
             cached = merged
+        case .absent:
+            break
+        case .unreadable:
+            // History exists but cannot be recovered (both files present
+            // yet neither decodes): fail without writing, so the append
+            // never replaces audit history with only the new record.
+            throw DecisionLogError.persistenceFailed
         }
         if cached.contains(where: { $0.decisionId == record.decisionId }) {
             throw DecisionLogError.duplicateDecisionId
@@ -515,14 +537,23 @@ public final class DecisionLogger: @unchecked Sendable {
     /// Re-reads the log from disk — the relaunch-equivalent reload.
     ///
     /// Uses the same fallback chain as initialization (primary, backup,
-    /// empty) and replaces the in-memory log with the result.
+    /// empty) and replaces the in-memory log with the result — except an
+    /// unreadable store preserves the in-memory log and returns it, so a
+    /// transient read failure never wipes held history.
     @discardableResult
     public func reloadFromDisk() -> [Decision] {
         lock.lock()
         defer { lock.unlock() }
-        let loaded = Self.load(directory: directory, fileManager: fileManager) ?? []
-        cached = loaded
-        return loaded
+        switch Self.loadOutcome(directory: directory, fileManager: fileManager) {
+        case .loaded(let loaded):
+            cached = loaded
+            return loaded
+        case .absent:
+            cached = []
+            return []
+        case .unreadable:
+            return cached
+        }
     }
 
     /// JSON payload of the full log for T4.6 sync (child → admin).
@@ -573,7 +604,7 @@ public final class DecisionLogger: @unchecked Sendable {
         close(fd)
     }
 
-    // MARK: - Persistence (caller holds `lock`, except load at init)
+    // MARK: - Persistence (caller holds `lock`, except loadOutcome at init)
 
     private func persist(_ decisions: [Decision]) throws {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -589,17 +620,44 @@ public final class DecisionLogger: @unchecked Sendable {
         return try encoder.encode(decisions)
     }
 
-    private static func load(directory: URL, fileManager: FileManager) -> [Decision]? {
+    /// Outcome of attempting to read persisted history.
+    private enum LoadOutcome {
+        /// Neither file exists: no history to recover.
+        case absent
+        /// At least one file decoded.
+        case loaded([Decision])
+        /// At least one file exists but neither decoded (unreadable or
+        /// corrupt): history cannot be recovered.
+        case unreadable
+    }
+
+    private static func loadOutcome(directory: URL, fileManager: FileManager) -> LoadOutcome {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .deferredToDate
+        var sawExisting = false
         for name in [decisionsFileName, backupFileName] {
             let url = directory.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: url),
-                  let decisions = try? decoder.decode([Decision].self, from: data)
-            else { continue }
-            return decisions
+            do {
+                let data = try Data(contentsOf: url)
+                if let decisions = try? decoder.decode([Decision].self, from: data) {
+                    return .loaded(decisions)
+                }
+                sawExisting = true
+            } catch let error as NSError
+                where error.domain == NSCocoaErrorDomain
+                    && error.code == NSFileReadNoSuchFileError {
+                continue
+            } catch {
+                // Missing files are handled above; any other failure means
+                // history exists but cannot be recovered — unless the path
+                // is now gone (error-code variance), which counts as missing.
+                if !fileManager.fileExists(atPath: url.path) {
+                    continue
+                }
+                sawExisting = true
+            }
         }
-        return nil
+        return sawExisting ? .unreadable : .absent
     }
 
     private static func count(_ value: Int, singular: String) -> String {
