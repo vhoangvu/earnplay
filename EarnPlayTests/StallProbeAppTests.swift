@@ -1,4 +1,5 @@
 import XCTest
+@testable import EarnPlay
 import EarnPlayCore
 
 /// App-target coverage for T1.5: the stalling-probe path the child app's
@@ -43,5 +44,34 @@ final class StallProbeAppTests: XCTestCase {
                               at: start.addingTimeInterval(60))
         XCTAssertTrue(session.probesFired.isEmpty)
         XCTAssertNil(session.pendingProbe)
+    }
+}
+
+/// Fix round 1 (issue #8 review): changed submissions are forwarded as
+/// attempts. The preview synthesizes no revision from a changed answer —
+/// revisions come only from a separately observed revision/work action —
+/// so rapid varied guesses and hint-then-instant-correct fire through it.
+@MainActor
+final class StallProbePreviewModelTests: XCTestCase {
+    func testRapidVariedGuessesThroughSubmitAnswerFireProbe() {
+        let model = StallProbePreviewModel()
+        model.submitAnswer("10")
+        model.submitAnswer("11")
+        XCTAssertNil(model.pendingProbe)
+        model.submitAnswer("13")
+        XCTAssertNotNil(model.pendingProbe)
+        XCTAssertEqual(model.session.probesFired.count, 1)
+        XCTAssertTrue(model.pendingProbe?.signals.contains(.rapidGuessing) ?? false)
+    }
+
+    func testHintThenImmediateCorrectAnswerThroughViewFiresAnswerKeyProbe() {
+        let model = StallProbePreviewModel()
+        model.submitAnswer("12")
+        XCTAssertNil(model.pendingProbe)
+        model.useHint()
+        model.submitAnswer("56")
+        XCTAssertNotNil(model.pendingProbe)
+        XCTAssertEqual(model.pendingProbe?.signals, [.hintUsedAsAnswerKey])
+        XCTAssertEqual(model.session.probesFired.count, 1)
     }
 }

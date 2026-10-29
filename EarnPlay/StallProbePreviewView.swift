@@ -114,10 +114,6 @@ final class StallProbePreviewModel: ObservableObject {
     @Published private(set) var replyNotice: String?
     @Published private(set) var statusLine = ""
 
-    /// Last submitted answer (normalized), for revision detection: a
-    /// changed resubmission means the child revised their answer.
-    private var lastSubmittedAnswer: String?
-
     init(session: StallProbeSession = StallProbeSession(startedAt: Date()),
          speech: ReadAloudService? = nil) {
         self.session = session
@@ -130,13 +126,14 @@ final class StallProbePreviewModel: ObservableObject {
     func submitAnswer(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let normalized = trimmed.lowercased()
-        if lastSubmittedAnswer != nil, normalized != lastSubmittedAnswer {
-            session.recordRevision()
-        }
-        lastSubmittedAnswer = normalized
+        // Changed submissions are forwarded as attempts only. A revision is
+        // recorded solely from a separately observed revision/work action
+        // (none exists in this preview; T1.8 owns the real signal), never
+        // synthesized from a changed answer: synthesizing one here would
+        // reset the rapid run and clear the pending hint check before the
+        // detector examines the answer.
         session.recordAttempt(answer: trimmed,
-                              isCorrect: normalized == Self.demoVerifiedAnswer)
+                              isCorrect: trimmed.lowercased() == Self.demoVerifiedAnswer)
         replyNotice = nil
         refresh()
     }
@@ -161,7 +158,6 @@ final class StallProbePreviewModel: ObservableObject {
 
     func reset() {
         session = StallProbeSession(startedAt: Date())
-        lastSubmittedAnswer = nil
         hintVisible = false
         replyNotice = nil
         speech.startNewItem()

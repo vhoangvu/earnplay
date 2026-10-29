@@ -152,8 +152,9 @@ public enum StallProbeReplyOutcome: Equatable, Sendable {
 /// Episode rule: a probe fires at most once per stalling episode. After a
 /// probe fires, the episode stays open — further identical or rapid
 /// answers fire nothing — until trying evidence closes it (a substantive
-/// probe reply, an answer revision, a varied answer, or a correct
-/// answer). A later new episode may probe again.
+/// probe reply, an answer revision, a varied answer after a
+/// thinking-range gap, or a correct answer). A later new episode may
+/// probe again.
 public final class StallingDetector: @unchecked Sendable {
     public let configuration: StallDetectorConfiguration
     private let now: () -> Date
@@ -232,11 +233,17 @@ public final class StallingDetector: @unchecked Sendable {
         if !normalized.isEmpty, normalized == lastAnswerNormalized {
             identicalRunLength += 1
         } else {
-            // A varied answer is trying evidence: it closes an open
-            // episode (no spam) and restarts the identical run. The very
-            // first attempt of a session is not evidence of anything yet.
+            // A varied answer is trying evidence — unless it continues the
+            // rapid-guessing pattern, in which case the episode stays open
+            // (no spam). Otherwise it closes an open episode and restarts
+            // the identical run. The very first attempt of a session is not
+            // evidence of anything yet.
             if attemptCount > 1 { tryingEvidenceObserved = true }
-            if episodeOpen { closeEpisodeLocked() }
+            let continuesRapidGuessing = lastAttemptDate.map { previous in
+                let gap = at.timeIntervalSince(previous)
+                return gap >= 0 && gap < configuration.rapidAnswerSeconds
+            } ?? false
+            if episodeOpen, !continuesRapidGuessing { closeEpisodeLocked() }
             identicalRunLength = 1
         }
         lastAnswerNormalized = normalized
@@ -289,10 +296,13 @@ public final class StallingDetector: @unchecked Sendable {
 
     // MARK: Probe replies
 
-    /// True when the reply text counts as substantive effort (LLD 4.1).
+    /// True when the reply text counts as substantive effort (LLD 4.1):
+    /// long enough and containing at least one letter or digit, so
+    /// punctuation-only replies ("...", "???") never count.
     public func isSubstantiveReply(_ text: String) -> Bool {
-        text.trimmingCharacters(in: .whitespacesAndNewlines).count
-            >= configuration.substantiveReplyMinimumCharacters
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.count >= configuration.substantiveReplyMinimumCharacters
+            && trimmed.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
     }
 
     /// Submits the child's reply to the pending probe. A substantive reply
@@ -308,6 +318,9 @@ public final class StallingDetector: @unchecked Sendable {
         tryingEvidenceObserved = true
         closeEpisodeLocked()
         resetRunsLocked()
+        // The reply is shown work between the hint and any later answer,
+        // so it resolves the pending answer-key check.
+        hintPendingAnswerKeyCheck = false
         return .substantive(probeSequenceNumber: pending.sequenceNumber)
     }
 

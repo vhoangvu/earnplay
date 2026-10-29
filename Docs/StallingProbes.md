@@ -28,8 +28,9 @@ gaps only.
 A probe fires at most once per stalling episode. After a probe fires, the
 episode stays open — further identical or rapid answers fire nothing —
 until trying evidence closes it: a substantive probe reply, an answer
-revision, a varied answer, or a correct answer. A later new episode may
-probe again. Prompts alternate across probes in a session, starting with
+revision, a varied answer after a thinking-range gap (a rapid varied
+answer continues the episode), or a correct answer. A later new episode
+may probe again. Prompts alternate across probes in a session, starting with
 "Show me one step — how did you start?", then "What have you tried so
 far?".
 
@@ -43,11 +44,13 @@ Decision evidence trail.
 `EffortSessionRecorder`: attempts, revisions, and hints feed both, so T1.4
 counts are unchanged by the detector's presence. Reply handling:
 
-- Substantive reply (trimmed text ≥ 3 characters): records **one
-  follow-up interaction** (LLD 3.3 — replying to a follow-up question is a
-  real hint-or-follow-up interaction for the floor) **plus one
-  explanation** (LLD 4.1 — the strongest effort signal available), and
-  closes the episode.
+- Substantive reply (trimmed text ≥ 3 characters including at least one
+  letter or digit — punctuation-only replies such as `...` never count):
+  records **one follow-up interaction** (LLD 3.3 — replying to a follow-up
+  question is a real hint-or-follow-up interaction for the floor) **plus
+  one explanation** (LLD 4.1 — the strongest effort signal available), and
+  closes the episode. The reply is shown work, so it also resolves any
+  pending hint answer-key check.
 - Empty/short reply: records only a generic interaction (active-time
   accounting); the probe stays pending and the classification stays
   `.stalling` (LLD: no reply keeps the stalling classification).

@@ -320,4 +320,104 @@ final class StallingDetectionTests: XCTestCase {
         XCTAssertNotNil(probe)
         XCTAssertEqual(probe?.signals, [.repeatedIdenticalAnswers])
     }
+
+    // MARK: Fix round 1 regressions (issue #8 review)
+
+    /// A varied answer that continues the rapid-guessing pattern keeps the
+    /// episode open: fourth and fifth rapid varied answers fire nothing and
+    /// leave the pending probe untouched (at most once per episode).
+    func testContinuedRapidVariedAnswersDoNotReplacePendingProbe() {
+        let start = Date(timeIntervalSince1970: 190_000)
+        let session = session(start: start)
+        XCTAssertNil(session.recordAttempt(
+            answer: "10", isCorrect: false, at: start.addingTimeInterval(5)))
+        XCTAssertNil(session.recordAttempt(
+            answer: "11", isCorrect: false, at: start.addingTimeInterval(5.8)))
+        let probe = session.recordAttempt(
+            answer: "13", isCorrect: false, at: start.addingTimeInterval(6.5))
+        XCTAssertNotNil(probe)
+        XCTAssertEqual(session.probesFired.count, 1)
+        XCTAssertNil(session.recordAttempt(
+            answer: "14", isCorrect: false, at: start.addingTimeInterval(7.2)))
+        XCTAssertNil(session.recordAttempt(
+            answer: "15", isCorrect: false, at: start.addingTimeInterval(7.9)))
+        XCTAssertEqual(session.probesFired.count, 1)
+        XCTAssertEqual(session.pendingProbe, probe)
+        XCTAssertEqual(session.pendingProbe?.sequenceNumber, 1)
+        XCTAssertEqual(session.classification, .stalling)
+    }
+
+    /// A varied answer after a thinking-range gap still closes the episode
+    /// (genuine trying), even mid-rapid-run: only continued rapid guessing
+    /// keeps it open.
+    func testVariedAnswerAfterThinkingGapStillClosesRapidEpisode() {
+        let start = Date(timeIntervalSince1970: 191_000)
+        let session = session(start: start)
+        session.recordAttempt(answer: "10", isCorrect: false,
+                              at: start.addingTimeInterval(5))
+        session.recordAttempt(answer: "11", isCorrect: false,
+                              at: start.addingTimeInterval(5.8))
+        XCTAssertNotNil(session.recordAttempt(
+            answer: "13", isCorrect: false, at: start.addingTimeInterval(6.5)))
+        XCTAssertNotNil(session.pendingProbe)
+        XCTAssertNil(session.recordAttempt(
+            answer: "14", isCorrect: false, at: start.addingTimeInterval(60)))
+        XCTAssertNil(session.pendingProbe)
+        XCTAssertEqual(session.probesFired.count, 1)
+        XCTAssertEqual(session.classification, .trying)
+    }
+
+    /// Punctuation-only replies ("...", "???") are not substantive: no
+    /// follow-up/explanation effort, probe stays pending.
+    func testPunctuationOnlyRepliesAreNotSubstantive() {
+        let start = Date(timeIntervalSince1970: 192_000)
+        let session = session(start: start)
+        for offset in [5, 15, 25] {
+            session.recordAttempt(answer: "12", isCorrect: false,
+                                  at: start.addingTimeInterval(TimeInterval(offset)))
+        }
+        XCTAssertNotNil(session.pendingProbe)
+        XCTAssertFalse(session.detector.isSubstantiveReply("..."))
+        XCTAssertFalse(session.detector.isSubstantiveReply("???"))
+        XCTAssertFalse(session.detector.isSubstantiveReply("!!!"))
+        XCTAssertTrue(session.detector.isSubstantiveReply("yes"))
+        XCTAssertTrue(session.detector.isSubstantiveReply("I counted 7"))
+        for reply in ["...", "???", "!!!", ". . .", "?!?"] {
+            XCTAssertEqual(session.submitProbeReply(
+                reply, at: start.addingTimeInterval(40)), .notSubstantive)
+        }
+        let signals = session.signals(at: start.addingTimeInterval(41))
+        XCTAssertEqual(signals.followUpInteractions, 0)
+        XCTAssertEqual(signals.explanations, 0)
+        XCTAssertNotNil(session.pendingProbe)
+        XCTAssertEqual(session.classification, .stalling)
+        XCTAssertEqual(session.submitProbeReply(
+            "I counted on from 7", at: start.addingTimeInterval(50)),
+            .substantive(probeSequenceNumber: 1))
+        XCTAssertNil(session.pendingProbe)
+    }
+
+    /// A substantive reply clears the pending hint check: hint, then an
+    /// explanation in the probe reply, then a correct answer within the
+    /// window fires no answer-key probe — the reply was the work shown.
+    func testSubstantiveReplyClearsPendingHintCheck() {
+        let start = Date(timeIntervalSince1970: 193_000)
+        let session = session(start: start)
+        for offset in [5, 15, 25] {
+            session.recordAttempt(answer: "12", isCorrect: false,
+                                  at: start.addingTimeInterval(TimeInterval(offset)))
+        }
+        XCTAssertNotNil(session.pendingProbe)
+        session.recordHintInteraction(at: start.addingTimeInterval(40))
+        XCTAssertEqual(session.submitProbeReply(
+            "I multiplied 7 by 4 then doubled",
+            at: start.addingTimeInterval(45)),
+            .substantive(probeSequenceNumber: 1))
+        XCTAssertNil(session.pendingProbe)
+        XCTAssertNil(session.recordAttempt(
+            answer: "56", isCorrect: true, at: start.addingTimeInterval(48)))
+        XCTAssertEqual(session.probesFired.count, 1)
+        XCTAssertNil(session.pendingProbe)
+        XCTAssertEqual(session.classification, .trying)
+    }
 }
