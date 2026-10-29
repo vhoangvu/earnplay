@@ -13,10 +13,11 @@ import Foundation
 /// Consumes T1.2, never re-implements it: the ladder is built from a
 /// `VerifiedQuestion` plus the `ProposedProblem` it was verified from
 /// (both carried by `QuestionGenerationResult`). Hint content is
-/// computed deterministically from the proposal's structured values,
-/// and the worked step is checked against `SolverService`'s answer
-/// for those same values, so a hint can never teach a wrong result.
-/// No model inference is used.
+/// computed deterministically from the proposal's structured values.
+/// The worked step shows one correct intermediate step — cross-checked
+/// against `SolverService`'s answer for those same values — and stops
+/// short of the final answer, so a hint can never teach a wrong result
+/// or give the solution away. No model inference is used.
 ///
 /// Every hint shown is recorded as a `HintEvent` (level shown,
 /// timestamp, question it belongs to). The event also tracks whether
@@ -29,7 +30,7 @@ public enum HintLevel: Int, Codable, Equatable, Sendable, CaseIterable {
     case nudge = 1
     /// Names a strategy for this problem; still no computed result.
     case strategy = 2
-    /// One worked step whose arithmetic lands on the solver's answer.
+    /// One worked intermediate step that stops short of the answer.
     case workedStep = 3
 
     public var next: HintLevel? {
@@ -152,24 +153,40 @@ public final class HintLadder: @unchecked Sendable {
     /// Shows the next ladder level and logs one `HintEvent`.
     ///
     /// Returns nil — logging nothing — when the ladder is already
-    /// exhausted (fourth and later taps) or when the solver cannot
-    /// verify the proposal's values (no hint may teach from values
-    /// the solver rejects; such a question should never have been
+    /// exhausted (fourth and later taps), when the solver cannot
+    /// verify the proposal's values, or when the proposal does not
+    /// re-verify to exactly the supplied question (no hint may teach
+    /// from values the solver rejects, or hint one problem under
+    /// another question's id; such a question should never have been
     /// presented, and the ladder fails closed rather than guessing).
     @discardableResult
     public func requestHint() -> Hint? {
-        lock.lock(); defer { lock.unlock() }
-        guard let level = HintLevel(rawValue: _events.count + 1) else { return nil }
-        guard case .verified(let verifiedAnswer) = solver.solve(proposal) else { return nil }
+        lock.lock()
+        guard let level = HintLevel(rawValue: _events.count + 1) else {
+            lock.unlock()
+            return nil
+        }
+        // Solving the proposal alone would hint a mismatched problem
+        // (a valid 6 × 9 proposal paired with a verified 7 × 8
+        // question): re-verify and require the exact supplied question.
+        guard case .success(let rechecked) = solver.verify(proposal, questionId: question.questionId),
+              rechecked == question else {
+            lock.unlock()
+            return nil
+        }
         let text = Self.hintText(level: level, proposal: proposal,
-                                 verifiedAnswer: verifiedAnswer, solver: solver)
+                                 verifiedAnswer: rechecked.verifiedAnswer, solver: solver)
         let hint = Hint(level: level, questionId: question.questionId, text: text)
         let event = HintEvent(questionId: question.questionId, level: level,
                               hintText: text, shownAt: now(),
                               answerBeforeHint: lastSubmittedAnswer)
         _events.append(event)
         _shownHints.append(hint)
-        eventSink?.recordHintEvent(event)
+        let sink = eventSink
+        lock.unlock()
+        // Delivered after unlocking: a synchronous sink may read ladder
+        // state back, which would deadlock under the non-recursive lock.
+        sink?.recordHintEvent(event)
         return hint
     }
 
@@ -183,31 +200,49 @@ public final class HintLadder: @unchecked Sendable {
     ///   submitted answer; false for the first-ever submission.
     @discardableResult
     public func recordAnswerSubmission(_ answer: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let changed = lastSubmittedAnswer.map { !Self.answersMatch($0, answer) } ?? false
+        lock.lock()
+        let skill = proposal.skill
+        let changed = lastSubmittedAnswer.map { !Self.answersMatch($0, answer, skill: skill) } ?? false
         var resolved: [HintEvent] = []
         for index in _events.indices where _events[index].followedByChangedAnswer == nil {
             _events[index].followedByChangedAnswer =
-                _events[index].answerBeforeHint.map { !Self.answersMatch($0, answer) } ?? false
+                _events[index].answerBeforeHint.map { !Self.answersMatch($0, answer, skill: skill) } ?? false
             _events[index].nextAnswer = answer
             resolved.append(_events[index])
         }
         lastSubmittedAnswer = answer
-        for event in resolved { eventSink?.recordHintEvent(event) }
+        let sink = eventSink
+        lock.unlock()
+        // Delivered after unlocking, in shown order (see requestHint).
+        for event in resolved { sink?.recordHintEvent(event) }
         return changed
     }
 
-    /// Answer equivalence for the changed-answer comparison: same
-    /// value, not just same spelling (an unreduced `2/4` after `1/2`
-    /// is a retype, not a revision).
-    static func answersMatch(_ lhs: String, _ rhs: String) -> Bool {
+    /// Answer equivalence for the changed-answer comparison, mirroring
+    /// the solver's grading for the current skill: same value, not just
+    /// same spelling. Reading ignores case and punctuation (`Maya` vs
+    /// `maya.`), comparison treats `==` as `=` (the grading spelling),
+    /// and addition compares fraction values (an unreduced `2/4` after
+    /// `1/2` is a retype, not a revision). Every other skill compares
+    /// the trimmed text exactly, as grading does.
+    static func answersMatch(_ lhs: String, _ rhs: String, skill: SolverSkill) -> Bool {
         let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
         let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
         if a == b { return true }
-        if let fa = SolverFraction(parsing: a), let fb = SolverFraction(parsing: b) {
-            return fa == fb
+        switch skill {
+        case .readingComprehension:
+            return SolverService.normalizeForSupport(a) == SolverService.normalizeForSupport(b)
+        case .fractionComparison:
+            return a.replacingOccurrences(of: "==", with: "=")
+                == b.replacingOccurrences(of: "==", with: "=")
+        case .fractionAddition:
+            if let fa = SolverFraction(parsing: a), let fb = SolverFraction(parsing: b) {
+                return fa == fb
+            }
+            return false
+        default:
+            return false
         }
-        return false
     }
 
     // MARK: - Hint content (deterministic, from the structured values)
@@ -254,10 +289,22 @@ public final class HintLadder: @unchecked Sendable {
         case .strategy:
             return "Strategy: split the second number into two easier parts, multiply \(a) by each part, then add the two parts together."
         case .workedStep:
+            // One step short of the answer: the near-complete product,
+            // leaving the final addition to the child. The completion
+            // must equal the solver's answer or nothing is shown.
             if b >= 2 {
-                return "Worked step: \(a) × \(b) = \(a) × \(b - 1) + \(a) = \(a * (b - 1)) + \(a) = \(answer)."
+                let (partial, o1) = a.multipliedReportingOverflow(by: b - 1)
+                let (total, o2) = partial.addingReportingOverflow(a)
+                guard !o1, !o2, "\(total)" == answer else { return genericText(level) }
+                return "Worked step: \(a) × \(b) = \(a) × \(b - 1) + \(a) = \(partial) + \(a). Now add \(partial) + \(a) yourself to finish."
             }
-            return "Worked step: \(a) × \(b) = \(answer)."
+            if b == 1 {
+                return "Worked step: \(a) × 1 means a single group of \(a). How many is in that one group?"
+            }
+            if b == 0 {
+                return "Worked step: \(a) × 0 means no groups of \(a) at all. How many is that altogether?"
+            }
+            return genericText(level)
         }
     }
 
@@ -268,46 +315,85 @@ public final class HintLadder: @unchecked Sendable {
         case .strategy:
             return "Strategy: guess a number, multiply it by \(divisor), and check how close you get to \(dividend). Adjust your guess until the leftover is smaller than \(divisor)."
         case .workedStep:
-            let quotient = divisor == 0 ? 0 : dividend / divisor
-            let remainder = divisor == 0 ? dividend : dividend % divisor
-            if remainder == 0 {
-                return "Worked step: \(divisor) × \(quotient) = \(divisor * quotient), so \(dividend) ÷ \(divisor) = \(answer)."
+            guard divisor > 0, dividend >= 0 else { return genericText(level) }
+            let quotient = dividend / divisor
+            let remainder = dividend % divisor
+            // All but the last group is worked; the child counts the
+            // total (products stay within the dividend, so no overflow).
+            if remainder == 0, quotient >= 1 {
+                let shown = quotient - 1
+                let used = divisor * shown
+                guard used + divisor == dividend, "\(quotient)" == answer else {
+                    return genericText(level)
+                }
+                return "Worked step: \(divisor) × \(shown) = \(used), and \(dividend) − \(used) = \(divisor), so exactly one more group of \(divisor) fits. How many groups is that altogether?"
             }
-            return "Worked step: \(divisor) × \(quotient) = \(divisor * quotient) with \(remainder) left over, so \(dividend) ÷ \(divisor) = \(answer)."
+            if remainder != 0, quotient >= 1 {
+                let shown = quotient - 1
+                let used = divisor * shown
+                let left = dividend - used
+                guard used + left == dividend, "\(quotient) r \(remainder)" == answer else {
+                    return genericText(level)
+                }
+                return "Worked step: \(divisor) × \(shown) = \(used), and \(dividend) − \(used) = \(left). \(left) still holds more groups of \(divisor) — how many groups in all, and what is left over?"
+            }
+            guard quotient == 0 else { return genericText(level) }
+            let expected = remainder == 0 ? "\(quotient)" : "\(quotient) r \(remainder)"
+            guard expected == answer else { return genericText(level) }
+            return "Worked step: \(divisor) × 1 = \(divisor), which is already bigger than \(dividend), so not even one full group fits. What is the quotient, and what is left over?"
         }
     }
 
     private static func fractionComparisonText(level: HintLevel, f1: SolverFraction,
-                                               f2: SolverFraction, answer: String) -> String {
-        let common = lcm(f1.denominator, f2.denominator)
-        let c1 = f1.numerator * (common / f1.denominator)
-        let c2 = f2.numerator * (common / f2.denominator)
+                                               f2: SolverFraction, answer _: String) -> String {
+        // Checked LCM: the common denominator can overflow Int on pairs
+        // the solver still verifies (safe comparison cross-products,
+        // huge LCM), so this must never trap — not even on the nudge.
+        // (The solver's answer is not quoted: the step stops short.)
+        if let common = checkedLCM(f1.denominator, f2.denominator),
+           let c1 = checkedConvert(f1, common: common),
+           let c2 = checkedConvert(f2, common: common) {
+            switch level {
+            case .nudge:
+                return "Look again at \(f1) and \(f2): the bottom numbers name the size of each piece. Which pieces are bigger?"
+            case .strategy:
+                return "Strategy: rewrite both fractions with the same bottom number (\(common)), then compare just the top numbers."
+            case .workedStep:
+                // Converted but not compared: the child makes the final
+                // call. No comparison symbol appears anywhere here.
+                return "Worked step: \(f1) with bottom number \(common) is \(c1)/\(common), and \(f2) with bottom number \(common) is \(c2)/\(common). Now compare just the top numbers, \(c1) and \(c2): which is bigger — or are they the same?"
+            }
+        }
+        // LCM overflow: cross-multiplication. The solver verified these
+        // cross-products fit when it solved the proposal.
+        let (p1, o1) = f1.numerator.multipliedReportingOverflow(by: f2.denominator)
+        let (p2, o2) = f2.numerator.multipliedReportingOverflow(by: f1.denominator)
+        guard !o1, !o2 else { return genericText(level) }
         switch level {
         case .nudge:
             return "Look again at \(f1) and \(f2): the bottom numbers name the size of each piece. Which pieces are bigger?"
         case .strategy:
-            return "Strategy: rewrite both fractions with the same bottom number (\(common)), then compare just the top numbers."
+            return "Strategy: cross-multiply — multiply the top of each fraction by the bottom of the other — then compare those two whole numbers."
         case .workedStep:
-            return "Worked step: \(f1) = \(c1)/\(common) and \(f2) = \(c2)/\(common), so \(f1) \(answer) \(f2)."
+            return "Worked step: cross-multiply: \(f1.numerator) × \(f2.denominator) makes \(p1), and \(f2.numerator) × \(f1.denominator) makes \(p2). Now compare \(p1) and \(p2) — which fraction is greater, or are they equal?"
         }
     }
 
     private static func fractionAdditionText(level: HintLevel, f1: SolverFraction,
-                                             f2: SolverFraction, answer: String) -> String {
-        let common = lcm(f1.denominator, f2.denominator)
-        let c1 = f1.numerator * (common / f1.denominator)
-        let c2 = f2.numerator * (common / f2.denominator)
+                                             f2: SolverFraction, answer _: String) -> String {
+        guard let common = checkedLCM(f1.denominator, f2.denominator),
+              let c1 = checkedConvert(f1, common: common),
+              let c2 = checkedConvert(f2, common: common) else {
+            return genericText(level)
+        }
         switch level {
         case .nudge:
             return "Look again at \(f1) + \(f2): you can only add pieces that are the same size."
         case .strategy:
             return "Strategy: rewrite both fractions with the same bottom number (\(common)) first, then add the top numbers and keep that bottom number."
         case .workedStep:
-            let rawSum = "\(c1 + c2)/\(common)"
-            if rawSum == answer {
-                return "Worked step: \(f1) + \(f2) = \(c1)/\(common) + \(c2)/\(common) = \(answer)."
-            }
-            return "Worked step: \(f1) + \(f2) = \(c1)/\(common) + \(c2)/\(common) = \(rawSum) = \(answer)."
+            // Converted but not summed: the child adds the top numbers.
+            return "Worked step: \(f1) + \(f2) = \(c1)/\(common) + \(c2)/\(common). Now add the top numbers (\(c1) + \(c2)) and keep the bottom number \(common)."
         }
     }
 
@@ -323,32 +409,70 @@ public final class HintLadder: @unchecked Sendable {
             return divisionText(level: level, dividend: proposal.operands[0],
                                 divisor: proposal.operands[1], answer: answer)
         case .add:
-            let list = proposal.operands.map { "\($0)" }.joined(separator: " + ")
             switch level {
             case .nudge:
                 return "Look again for the numbers you actually need, and ignore any number the story does not ask about."
             case .strategy:
                 return "Strategy: this problem joins amounts together, so add the amounts the question asks about, one at a time."
             case .workedStep:
-                return "Worked step: \(list) = \(answer)."
+                // Tens and ones separately, checked against the solver's
+                // answer; the child puts the two parts together.
+                var tensSum = 0
+                var onesSum = 0
+                for n in proposal.operands {
+                    let (t, o1) = tensSum.addingReportingOverflow((n / 10) * 10)
+                    let (o, o2) = onesSum.addingReportingOverflow(n % 10)
+                    guard !o1, !o2 else { return genericText(level) }
+                    tensSum = t
+                    onesSum = o
+                }
+                let (total, o3) = tensSum.addingReportingOverflow(onesSum)
+                guard !o3, "\(total)" == answer else { return genericText(level) }
+                let tensList = proposal.operands.map { "\(($0 / 10) * 10)" }.joined(separator: " + ")
+                let onesList = proposal.operands.map { "\($0 % 10)" }.joined(separator: " + ")
+                return "Worked step: add the tens first, \(tensList) = \(tensSum), then the ones, \(onesList) = \(onesSum). Now put \(tensSum) and \(onesSum) together to finish."
             }
         case .subtract:
             let first = proposal.operands[0]
             let rest = proposal.operands.dropFirst()
-            let expression = ([first] + Array(rest)).map { "\($0)" }.joined(separator: " − ")
             switch level {
             case .nudge:
                 return "Look again: something starts at \(first) and some is taken away. What is left?"
             case .strategy:
                 return "Strategy: start from \(first) and subtract each taken-away amount in turn."
             case .workedStep:
-                if rest.count == 1, let taken = rest.first {
+                if rest.count == 1, let taken = rest.first, taken >= 0, first >= taken {
+                    // Split one take-away into two smaller subtractions
+                    // and work only the first; the child finishes.
                     let tens = (taken / 10) * 10
-                    if tens > 0, taken - tens > 0, first - tens >= 0 {
-                        return "Worked step: \(first) − \(tens) = \(first - tens), then \(first - tens) − \(taken - tens) = \(answer), so \(expression) = \(answer)."
+                    let part: Int?
+                    if tens > 0, taken - tens > 0 {
+                        part = tens
+                    } else if taken > 1 {
+                        part = taken / 2
+                    } else {
+                        part = nil
                     }
+                    if let part, part > 0, part < taken {
+                        let mid = first - part
+                        let second = taken - part
+                        guard "\(mid - second)" == answer else { return genericText(level) }
+                        return "Worked step: \(first) − \(part) = \(mid), then subtract \(second) more from \(mid). What do you get?"
+                    }
+                    if taken == 1 {
+                        return "Worked step: count back 1 from \(first) — what number comes just before \(first)?"
+                    }
+                    if taken == 0 {
+                        return "Worked step: taking away 0 leaves the start unchanged — what did you start with?"
+                    }
+                    return genericText(level)
                 }
-                return "Worked step: \(expression) = \(answer)."
+                if rest.count > 1, let firstTaken = rest.first, firstTaken >= 0, first >= firstTaken {
+                    // Work only the first subtraction; the child continues.
+                    let mid = first - firstTaken
+                    return "Worked step: \(first) − \(firstTaken) = \(mid). Now keep subtracting the rest from \(mid), one amount at a time."
+                }
+                return genericText(level)
             }
         }
     }
@@ -361,15 +485,49 @@ public final class HintLadder: @unchecked Sendable {
         case .strategy:
             return "Strategy: find the sentence in the passage that talks about the same thing as the question, then answer using the words from that sentence."
         case .workedStep:
+            // Quote the evidence sentence with the answer blanked out:
+            // the child fills the blank instead of reading the answer.
             if let passage = proposal.passage,
-               case .supported(let evidence) = solver.verifyReadingSupport(passage: passage, proposedAnswer: answer) {
-                return "Worked step: the passage says \u{201C}\(evidence)\u{201D} — so the answer is \(answer)."
+               case .supported(let evidence) = solver.verifyReadingSupport(passage: passage, proposedAnswer: answer),
+               let blanked = Self.blankAnswerSpan(in: evidence, answer: answer) {
+                return "Worked step: re-read this sentence from the passage: \u{201C}\(blanked)\u{201D} Which words go in the blank to answer the question?"
             }
-            return "Worked step: the answer is in the passage: \(answer)."
+            return "Worked step: point to the exact sentence in the passage that answers the question, then read it once more and pick out which words are the answer."
         }
     }
 
-    private static func lcm(_ a: Int, _ b: Int) -> Int {
-        a / SolverFraction.gcd(a, b) * b
+    /// Returns `evidence` with every case-insensitive occurrence of the
+    /// answer replaced by a blank, or nil when the answer span cannot
+    /// be located (the caller falls back instead of quoting it whole).
+    private static func blankAnswerSpan(in evidence: String, answer: String) -> String? {
+        let target = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return nil }
+        var blanked = evidence
+        var searchFrom = blanked.startIndex
+        var replaced = false
+        while let range = blanked.range(of: target, options: .caseInsensitive,
+                                        range: searchFrom..<blanked.endIndex) {
+            blanked.replaceSubrange(range, with: "___")
+            searchFrom = blanked.index(range.lowerBound, offsetBy: 3)
+            replaced = true
+        }
+        return replaced ? blanked : nil
+    }
+
+    /// Least common multiple that returns nil instead of trapping when
+    /// the result overflows Int (denominators are always positive, so
+    /// the division is exact and cannot overflow).
+    private static func checkedLCM(_ a: Int, _ b: Int) -> Int? {
+        let divisor = SolverFraction.gcd(a, b)
+        guard divisor != 0 else { return nil }
+        let (result, overflow) = (a / divisor).multipliedReportingOverflow(by: b)
+        return overflow ? nil : result
+    }
+
+    /// Converts `fraction` to `common` denominator, nil on overflow.
+    private static func checkedConvert(_ fraction: SolverFraction, common: Int) -> Int? {
+        let (scaled, overflow) = fraction.numerator
+            .multipliedReportingOverflow(by: common / fraction.denominator)
+        return overflow ? nil : scaled
     }
 }

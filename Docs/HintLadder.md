@@ -23,11 +23,20 @@ SSOT-canonical-facts-questions-and-hints, APP-how-it-works.
   `.hint` and id `<questionId>-hint-<level>` (T1.8 shape, T1.7
   speaker-button ready).
 - Content is deterministic code from the proposal's structured
-  values — no model inference. Nudge and strategy never reveal the
-  answer; the worked step shows one step whose arithmetic lands
-  exactly on `SolverService`'s answer for the same values. If the
-  solver rejects the proposal's values, no hint is shown and no
+  values — no model inference. No level ever reveals the answer:
+  nudge and strategy never mention it, and the worked step shows
+  one intermediate step (a near-complete product, all but the last
+  group, converted-but-uncompared/unadded fractions, a first
+  subtraction, a blanked evidence sentence) that is cross-checked
+  against `SolverService`'s answer for the same values and stops
+  short of the solution. If the solver rejects the proposal's
+  values — or the proposal does not re-verify to exactly the
+  supplied question (a mismatched pair) — no hint is shown and no
   event is logged (fail closed).
+- Fraction hints use checked arithmetic: when the common
+  denominator overflows `Int` on a pair the solver still verifies,
+  comparison hints switch to a cross-multiplication strategy
+  instead of trapping.
 
 ## HintEvent log
 
@@ -39,23 +48,33 @@ Changed-answer tracking: `recordAnswerSubmission(_:)` is called for
 every answer the child submits. The first submission after a hint
 resolves that hint's event — `followedByChangedAnswer` becomes true
 when the submission differs in value from `answerBeforeHint`
-(equivalent fractions such as `2/4` vs `1/2` count as unchanged),
-false when it matches or when there was no prior answer (a first
-answer is not a revision); `nextAnswer` keeps the resolving answer.
-Hints still awaiting an answer keep `followedByChangedAnswer == nil`.
-An optional `HintEventSink` receives each event on showing and again
+(equivalence follows the current skill's grading: reading ignores
+case and punctuation, comparison treats `==` as `=`, addition
+compares fraction values such as `2/4` vs `1/2`), false when it
+matches or when there was no prior answer (a first answer is not a
+revision); `nextAnswer` keeps the resolving answer. Hints still
+awaiting an answer keep `followedByChangedAnswer == nil`. An
+optional `HintEventSink` receives each event on showing and again
 on resolution (upsert by question + level), mirroring
-`HintListenEventSink`.
+`HintListenEventSink`; notifications are captured under the lock
+and delivered after unlocking, in order, so a synchronous sink
+that reads ladder state back cannot deadlock the Hint tap.
 
 ## Tests
 
-`HintLadderTests` (EarnPlayCoreTests): for 10 fixture problems,
+`HintLadderTests` (EarnPlayCoreTests): for 12 fixture problems,
 hints 1–3 are requested in order; each worked step is asserted
-against a hand-computed fragment ending at the independently
-solver-computed answer (10/10 matches), with exactly one HintEvent
-per level (30 events). Also covered: ordering, fourth-request
+against a hand-computed intermediate fragment (12/12 matches),
+and every level of every fixture is asserted not to reveal the
+independently solver-computed answer (comparison hints must show
+no comparison symbol at all), with exactly one HintEvent per
+level (36 events). Also covered: ordering, fourth-request
 exhaustion with no duplicate event, tutor-message delivery,
-no-answer-leak in levels 1–2, changed/unchanged/equivalent-fraction
-resolution, multi-hint resolution, sink notifications, reading
-worked steps quoting passage evidence, and fail-closed behaviour
-on solver-rejected values.
+changed/unchanged/skill-equivalent resolution (reading,
+comparison, fraction respelling), multi-hint resolution, sink
+notifications including a synchronous sink that reads ladder
+state back, reading worked steps quoting blanked passage
+evidence, fail-closed behaviour on solver-rejected values and
+on mismatched proposal/question pairs, and the
+huge-denominator comparison that takes the cross-multiplication
+path without trapping.
