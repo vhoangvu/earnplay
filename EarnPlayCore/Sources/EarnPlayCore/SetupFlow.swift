@@ -22,24 +22,30 @@ import Foundation
 /// the flow completes.
 ///
 /// Completion is a single atomic commit: the enumeration is persisted,
-/// then the initial policy (version `storedVersion + 1`, keeping every
-/// existing field except the setup selections) is written to
-/// `PolicyStore`, then the enumeration is handed to `ShieldManager`, which
-/// shields every enumerated app except the allowlist (enumeration-first)
-/// with the picked categories as the backstop for newly installed apps.
+/// then the initial policy (version snapshot + 1, keeping every existing
+/// field except the setup selections) is written to `PolicyStore`, then
+/// the enumeration is handed to `ShieldManager`, which shields every
+/// enumerated app except the allowlist (enumeration-first) with the picked
+/// categories as the backstop for newly installed apps. The commit also
+/// clears the incomplete restrictive record below: the staged enumeration
+/// replaces all prior incomplete restrictions.
 /// If the policy write fails, the just-written enumeration is rolled back
 /// (the previous content, if any, is restored), so a failed commit never
 /// leaves a policy/enumeration pair behind that a relaunch could mistake
 /// for a completed setup.
-/// Abandoning the flow before that commit writes no policy, but the picked
-/// apps are NOT left unshielded: abandoning with a staged enumeration
-/// applies it as a restrictive incomplete-setup configuration
-/// (default-deny — every picked app shielded under the current policy)
-/// and persists it when no policy exists yet, so a relaunch stays
-/// incomplete with the picked apps still shielded. An incomplete flow
-/// never claims the protection of a completed one. Once a policy exists,
-/// unknown apps are governed by T2.5's default-deny rule (a later task;
-/// only the handoff is stated here).
+/// Before that commit, every accepted enumeration is persisted (merged
+/// with prior incomplete picks) as a distinctly-incomplete restrictive
+/// record, and abandoning merges the staged enumeration forward into that
+/// record and applies the merged configuration (default-deny — every
+/// picked app shielded under the current policy), so terminating the app
+/// or abandoning mid-flow never loses protection and an aborted retry
+/// never loosens prior restrictions. The incomplete record is restored on
+/// relaunch (shields applied, flow still incomplete) and can never confer
+/// completion: persisting over a stored policy is refused, and completing
+/// still requires the completion enumeration plus a stored policy. An
+/// incomplete flow never claims the protection of a completed one. Once a
+/// policy exists, unknown apps are governed by T2.5's default-deny rule (a
+/// later task; only the handoff is stated here).
 ///
 /// A completed setup survives relaunch, but only while Screen Time access
 /// is still approved: a new `SetupFlow` over the same stores starts at
@@ -95,14 +101,24 @@ public enum SetupFinishResult: Equatable, Sendable {
 
 /// Persistence seam for the enumeration captured at setup.
 ///
-/// The enumeration is written once, at the completion commit, and reloaded
-/// to restore shields after a relaunch without re-running the picker.
+/// The completion enumeration is written once, at the completion commit,
+/// and reloaded to restore shields after a relaunch without re-running
+/// the picker. Separately, every accepted enumeration is also persisted
+/// (merged with prior incomplete picks) as a distinctly-incomplete
+/// restrictive record, so terminating the app before setup finishes loses
+/// nothing: a relaunch restores those shields while staying incomplete.
+/// The incomplete record can never confer completion — completing still
+/// requires the completion enumeration plus a stored policy — and the
+/// commit clears it once the staged enumeration replaces it.
 /// Production uses `FileSetupEnumerationStore`; tests use the same file
 /// store over a temporary directory.
 public protocol SetupEnumerationStore: Sendable {
     func loadEnumeration() -> ShieldEnumeration?
     func saveEnumeration(_ enumeration: ShieldEnumeration) throws
     func clearEnumeration() throws
+    func loadIncompleteEnumeration() -> ShieldEnumeration?
+    func saveIncompleteEnumeration(_ enumeration: ShieldEnumeration) throws
+    func clearIncompleteEnumeration() throws
 }
 
 /// File-backed setup-enumeration store (JSON in a directory, atomic write).
@@ -112,6 +128,9 @@ public protocol SetupEnumerationStore: Sendable {
 /// completed with unknown shielding.
 public final class FileSetupEnumerationStore: SetupEnumerationStore, @unchecked Sendable {
     public static let enumerationFileName = "setup-enumeration.json"
+    /// The distinctly-incomplete restrictive record (fix round 4): merged
+    /// picks of runs that never committed. Never confers completion.
+    public static let incompleteEnumerationFileName = "setup-enumeration-incomplete.json"
 
     private let directory: URL
     private let fileManager: FileManager
@@ -173,6 +192,64 @@ public final class FileSetupEnumerationStore: SetupEnumerationStore, @unchecked 
             throw error
         }
     }
+
+    /// Loads the incomplete restrictive record; a missing or corrupt file
+    /// loads as no record (never as completed protection).
+    public func loadIncompleteEnumeration() -> ShieldEnumeration? {
+        loadFile(named: Self.incompleteEnumerationFileName)
+    }
+
+    public func saveIncompleteEnumeration(_ enumeration: ShieldEnumeration) throws {
+        try saveFile(enumeration, named: Self.incompleteEnumerationFileName)
+    }
+
+    public func clearIncompleteEnumeration() throws {
+        try clearFile(named: Self.incompleteEnumerationFileName)
+    }
+
+    private func loadFile(named fileName: String) -> ShieldEnumeration? {
+        lock.lock()
+        defer { lock.unlock() }
+        let url = directory.appendingPathComponent(fileName)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        return try? decoder.decode(ShieldEnumeration.self, from: data)
+    }
+
+    private func saveFile(_ enumeration: ShieldEnumeration, named fileName: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(enumeration)
+        try data.write(
+            to: directory.appendingPathComponent(fileName),
+            options: [.atomic]
+        )
+    }
+
+    private func clearFile(named fileName: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try fileManager.removeItem(
+                at: directory.appendingPathComponent(fileName)
+            )
+        } catch {
+            let code = (error as NSError).code
+            let domain = (error as NSError).domain
+            if domain == NSCocoaErrorDomain && code == NSFileNoSuchFileError {
+                return
+            }
+            if let cocoa = error as? CocoaError, cocoa.code == .fileNoSuchFile {
+                return
+            }
+            throw error
+        }
+    }
 }
 
 /// The T2.3 setup state machine. See the `SetupStep` documentation for the
@@ -214,12 +291,13 @@ public final class SetupFlow: @unchecked Sendable {
     /// approval, this starts at `authorization` with
     /// `needsReauthorization` true and applies no shields; re-granting
     /// restores completion without re-running the picker.
-    /// A persisted enumeration without a policy is an abandoned run's
-    /// restrictive record: it restores as incomplete and claims no
-    /// completed protection, but the enumeration is applied so the picked
-    /// apps stay shielded (default-deny). Any other combination —
-    /// including a policy without an enumeration — restores as incomplete
-    /// with no shields applied.
+    /// Otherwise the flow restores as incomplete (claiming no completed
+    /// protection) with the merged incomplete restrictive record applied:
+    /// the completion file without a policy (an abandoned run's record
+    /// from before the incomplete file existed, or a commit interrupted
+    /// before its policy write) plus the incomplete file. A policy
+    /// without any persisted record restores as incomplete with no
+    /// shields applied.
     public init(
         policyStore: PolicyStore,
         shieldManager: ShieldManager,
@@ -245,10 +323,40 @@ public final class SetupFlow: @unchecked Sendable {
             }
         } else {
             self.step = .authorization
-            if let persisted, persistedIsNonEmpty {
-                shieldManager.updateEnumeration(persisted)
+            let incomplete = Self.mergedRestrictiveRecord(
+                [persisted, enumerationStore.loadIncompleteEnumeration()].compactMap { $0 }
+            )
+            if !incomplete.apps.isEmpty || !incomplete.categories.isEmpty {
+                shieldManager.updateEnumeration(incomplete)
             }
         }
+    }
+
+    /// Merges enumerations into one restrictive record: the union of apps
+    /// (by id; later arguments win per-app category metadata) and the
+    /// union of categories. Callers pass persisted records first and the
+    /// staged (freshest) enumeration last, so a re-pick's known category
+    /// replaces a stale unknown one. Deterministic: first-seen app order
+    /// with latest metadata.
+    private static func mergedRestrictiveRecord(
+        _ enumerations: [ShieldEnumeration]
+    ) -> ShieldEnumeration {
+        var appsByID: [String: EnumeratedApp] = [:]
+        var appOrder: [String] = []
+        var categories: Set<AppCategoryRef> = []
+        for enumeration in enumerations {
+            for entry in enumeration.apps {
+                if appsByID[entry.app.id] == nil {
+                    appOrder.append(entry.app.id)
+                }
+                appsByID[entry.app.id] = entry
+            }
+            categories.formUnion(enumeration.categories)
+        }
+        return ShieldEnumeration(
+            apps: appOrder.compactMap { appsByID[$0] },
+            categories: categories
+        )
     }
 
     /// The current step. Moves forward only; never skips.
@@ -336,9 +444,17 @@ public final class SetupFlow: @unchecked Sendable {
     /// Requires the `enumeration` step with authorization recorded, and a
     /// non-empty enumeration (at least one app or one category — an empty
     /// pick shields nothing, so it cannot complete setup). On success the
-    /// enumeration is staged in memory (persisted only at the completion
-    /// commit) and the flow advances to `selection`. Returns false without
+    /// enumeration is staged in memory and persisted (merged with any
+    /// prior incomplete picks) as the distinctly-incomplete restrictive
+    /// record, and the flow advances to `selection`. Returns false without
     /// changing any state otherwise; shields stay inactive either way.
+    ///
+    /// The incomplete persist is best-effort and is refused over a stored
+    /// policy (an incomplete record must never forge a policy/enumeration
+    /// pair). Shields are not applied here: the live run applies them at
+    /// abandon/commit, and a relaunch applies this record while staying
+    /// incomplete — so terminating the app from the selection or guidance
+    /// step loses nothing and claims no completed protection.
     @discardableResult
     public func submitEnumeration(_ enumeration: ShieldEnumeration) -> Bool {
         lock.lock()
@@ -348,6 +464,16 @@ public final class SetupFlow: @unchecked Sendable {
             return false
         }
         stagedEnumeration = enumeration
+        if policyStore.storedVersion == 0 {
+            let merged = Self.mergedRestrictiveRecord(
+                [
+                    enumerationStore.loadEnumeration(),
+                    enumerationStore.loadIncompleteEnumeration(),
+                    enumeration,
+                ].compactMap { $0 }
+            )
+            try? enumerationStore.saveIncompleteEnumeration(merged)
+        }
         step = .selection
         return true
     }
@@ -397,12 +523,16 @@ public final class SetupFlow: @unchecked Sendable {
     ///
     /// Requires the `preventDeletingGuidance` step with authorization
     /// recorded and staged enumeration/selections. The commit, in order:
-    /// persist the enumeration, write the policy (version
-    /// `storedVersion + 1`, starting from the current policy so existing
-    /// overrides, chore pool, durations, caps, and settings are preserved;
-    /// only the setup selections change — allowlist = built-in defaults
-    /// plus the staged allowlist, unblockable = the staged set), then hand
-    /// the enumeration to `ShieldManager`, which applies the shields.
+    /// persist the enumeration, write the policy (version snapshot + 1 —
+    /// the bump applies to the snapshot being edited, so a policy that an
+    /// admin sync applied concurrently wins over this stale commit instead
+    /// of being overwritten by it — starting from the current policy so
+    /// existing overrides, chore pool, durations, caps, and settings are
+    /// preserved; only the setup selections change — allowlist = built-in
+    /// defaults plus the staged allowlist, unblockable = the staged set),
+    /// clear the incomplete restrictive record (the staged enumeration
+    /// replaces all prior incomplete restrictions), then hand the
+    /// enumeration to `ShieldManager`, which applies the shields.
     /// Policy construction reads only the policy store and the staged
     /// selections — never the saved enumeration — so the write order is
     /// free; enumeration-first is kept so a failed policy write can roll
@@ -431,7 +561,16 @@ public final class SetupFlow: @unchecked Sendable {
             return .notReady
         }
         var policy = policyStore.currentPolicy
-        policy.version = policyStore.storedVersion + 1
+        // The bump applies to the snapshot being edited — never to a
+        // separately re-read version. A second `storedVersion` read here
+        // could observe a newer policy that an admin sync applied between
+        // the two reads; the stale snapshot would then take (newer + 1)
+        // and `apply` would accept it, destroying the newer overrides,
+        // chore pool, and settings. With `+= 1` a stale snapshot's version
+        // no longer exceeds the newer stored version, so `apply` rejects
+        // it (`.rejectedStaleVersion`) and the caller retries against the
+        // newer policy.
+        policy.version += 1
         policy.alwaysAllowed = [.phone, .messages, .earnPlaySelf]
             + allowlist.sorted(by: { $0.id < $1.id })
         policy.unblockable = unblockable.sorted(by: { $0.id < $1.id })
@@ -449,6 +588,12 @@ public final class SetupFlow: @unchecked Sendable {
             }
             return .persistenceFailed
         }
+        // The merge ends at commit: the staged enumeration replaces all
+        // prior incomplete restrictions. Best-effort: a clear failure
+        // leaves a stale incomplete record next to the completed pair,
+        // which restore ignores (completion reads only the completion
+        // file plus the stored policy).
+        try? enumerationStore.clearIncompleteEnumeration()
         shieldManager.updateEnumeration(enumeration)
         step = .complete
         return .finished
@@ -459,12 +604,15 @@ public final class SetupFlow: @unchecked Sendable {
     /// Clears the in-memory authorization flag, staged enumeration, and
     /// staged selections, and returns to the `authorization` step. No full
     /// policy is committed — but when an enumeration was staged, it is
-    /// applied to the `ShieldManager` as a restrictive incomplete-setup
-    /// configuration (default-deny: every picked app shielded under the
-    /// current policy) and, when no policy exists yet, persisted so a
-    /// relaunch stays incomplete with the picked apps still shielded.
-    /// Persisting over a stored policy is refused: that would forge a
-    /// policy/enumeration pair and falsely restore as complete.
+    /// merged forward with the previously persisted restrictions and the
+    /// merged configuration is applied to the `ShieldManager` as a
+    /// restrictive incomplete-setup configuration (default-deny: every
+    /// picked app shielded under the current policy) and, when no policy
+    /// exists yet, persisted to the incomplete record, so a relaunch stays
+    /// incomplete with the picked apps still shielded and an aborted retry
+    /// never loosens prior restrictions. Persisting over a stored policy
+    /// is refused: that would forge a policy/enumeration pair and falsely
+    /// restore as complete.
     /// No-op once complete (a committed setup is not un-committed), and a
     /// no-op while a committed setup waits for reauthorization (the pair
     /// and the reauthorization path survive abandoning).
@@ -475,10 +623,17 @@ public final class SetupFlow: @unchecked Sendable {
         guard pendingCommittedEnumeration == nil else { return }
         if let staged = stagedEnumeration,
            !staged.apps.isEmpty || !staged.categories.isEmpty {
+            let merged = Self.mergedRestrictiveRecord(
+                [
+                    enumerationStore.loadEnumeration(),
+                    enumerationStore.loadIncompleteEnumeration(),
+                    staged,
+                ].compactMap { $0 }
+            )
             if policyStore.storedVersion == 0 {
-                try? enumerationStore.saveEnumeration(staged)
+                try? enumerationStore.saveIncompleteEnumeration(merged)
             }
-            shieldManager.updateEnumeration(staged)
+            shieldManager.updateEnumeration(merged)
         }
         authorized = false
         stagedEnumeration = nil

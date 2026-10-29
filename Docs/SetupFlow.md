@@ -29,33 +29,50 @@ T2.2 (`ShieldManager`); both are used, neither is modified by this task.
 5. **Complete** — the initial policy is written and shields are applied.
 
 Completion is a single atomic commit, in order: persist the enumeration,
-write the policy (version `storedVersion + 1`, starting from the current
+write the policy (version snapshot + 1 — the bump applies to the
+snapshot being edited, so a concurrently synced newer policy wins over a
+stale commit instead of being overwritten by it — starting from the current
 policy so existing overrides, chore pool, durations, caps, and settings
 are preserved — only the setup selections change: allowlist =
 Phone/Messages/EarnPlay defaults plus the staged allowlist; unblockable =
-the staged set), then hand the enumeration to `ShieldManager`, which shields
+the staged set), clear the incomplete restrictive record below (the staged
+enumeration replaces all prior incomplete restrictions), then hand the
+enumeration to `ShieldManager`, which shields
 every enumerated app except the allowlist (enumeration-first) with the
 picked categories as the backstop for newly installed apps. Finishing
 rechecks live Screen Time authorization first: if access was revoked while
 the user was in Settings, nothing is saved and the flow returns to
 `authorization` with an authorization error. The completion summary
 (including the category-backstop-disabled warning) stays visible until the
-parent taps Continue.
+parent taps Continue, and each picked app's choice is restored from the
+effective policy (always-allowed → Allowed, else challenge-unlockable →
+Earn, else Blocked), so a relaunch shows the saved choices instead of
+Blocked-for-all.
 
 ## No half-open state
 
-- Abandoning the flow before the commit writes no policy, but picked apps
-  are not left unshielded: abandoning with a staged enumeration applies it
-  as a restrictive incomplete-setup configuration (default-deny) and
-  persists it when no policy exists yet, so a relaunch stays incomplete
-  with the picked apps still shielded. Abandoning a completed setup — or
-  one waiting for reauthorization — is a no-op that preserves the pair.
+- Every accepted enumeration is persisted (merged with prior incomplete
+  picks) as a distinctly-incomplete restrictive record, so terminating
+  the app from the selection or guidance step loses nothing; a relaunch
+  restores those shields while staying incomplete. Abandoning the flow
+  before the commit writes no policy, but picked apps are not left
+  unshielded: abandoning with a staged enumeration merges it forward with
+  the previously persisted restrictions and applies the merged
+  configuration (default-deny), persisting it to the incomplete record
+  when no policy exists yet — an aborted retry never loosens prior
+  restrictions. Abandoning from the picker submits the current selection
+  first, so Start over before Continue still shields the picked apps.
+  Abandoning a completed setup — or one waiting for reauthorization — is
+  a no-op that preserves the pair. Persisting over a stored policy is
+  refused, and the incomplete record can never confer completion.
 - If the enumeration or the policy cannot be persisted, the commit
   reports `persistenceFailed`, the flow stays on the guidance step, and
-  the caller may retry. On a policy failure the just-written enumeration
-  is rolled back (the previous content, if any, is restored), so no
-  uncommitted enumeration data survives and a relaunch cannot mistake the
-  failed setup for a completed one.
+  the caller may retry. On a policy failure the just-written completion
+  enumeration is rolled back (the previous content, if any, is restored),
+  so no uncommitted completion data survives and a relaunch cannot
+  mistake the failed setup for a completed one; the incomplete
+  restrictive record (if any) survives and restores as incomplete with
+  shields, by design.
 - A completed setup survives relaunch only while Screen Time access is
   still approved: a new `SetupFlow` over the same stores starts at
   `complete` (policy version > 0 AND a non-empty persisted enumeration)
@@ -63,10 +80,11 @@ parent taps Continue.
   approval. With a committed pair but revoked access, the flow starts at
   `authorization` with reauthorization offered (a re-grant restores
   completion without re-picking) and no shields applied. A policy without
-  an enumeration or a corrupt enumeration file restores as incomplete with
-  nothing applied; a persisted enumeration without a policy (an abandoned
-  run's restrictive record) restores as incomplete with those apps
-  shielded.
+  any persisted record, or a corrupt enumeration file, restores as
+  incomplete with nothing applied; a persisted enumeration without a
+  policy (an abandoned run's record from before the incomplete file
+  existed) plus the incomplete file restore as incomplete with the merged
+  apps shielded.
 - Handoff: once a policy exists, unknown apps are governed by T2.5's
   default-deny rule (a later task; only the handoff is stated here).
 

@@ -337,13 +337,26 @@ final class SetupFlowTests: XCTestCase {
         XCTAssertFalse(manager.isShielded(app: Self.game, category: Self.games))
 
         // Fix round 3 (finding 5): the failed commit leaves no orphan
-        // enumeration behind, so a relaunch cannot mistake it for a
-        // completed setup.
+        // completion enumeration behind, so a relaunch cannot mistake it
+        // for a completed setup.
         XCTAssertNil(FileSetupEnumerationStore(directory: directory).loadEnumeration())
         let (relaunched, _, _, relaunchBackend) = makeSetup()
         XCTAssertEqual(relaunched.currentStep, .authorization)
         XCTAssertFalse(relaunched.isComplete)
-        XCTAssertEqual(relaunchBackend.currentShieldConfiguration, .none)
+        XCTAssertFalse(relaunched.claimsProtection)
+        // Fix round 4 (finding 2): the accepted enumeration was persisted
+        // at submit time as the incomplete restrictive record, so the
+        // relaunch restores the picked apps' shields while staying
+        // incomplete — the old `.none` expectation encoded the finding-2
+        // bug (accepted enumeration lost on termination).
+        XCTAssertEqual(
+            relaunchBackend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.video, Self.socialApp, Self.allowedGame]
+        )
+        XCTAssertEqual(
+            relaunchBackend.currentShieldConfiguration.shieldedCategories,
+            [Self.games, Self.social, Self.entertainment]
+        )
     }
 
     // MARK: - Restore across relaunch

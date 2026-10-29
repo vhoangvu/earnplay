@@ -273,7 +273,23 @@ public final class SetupFlowViewModel: ObservableObject {
     }
 
     /// Abandons an in-progress setup run. No-op once complete.
+    ///
+    /// When the flow is at the enumeration step, the picker's current
+    /// selection is submitted first (mapping rebuilt and saved), so
+    /// tapping Start over before Continue — or after Re-pick apps returns
+    /// to the picker — shields the picked apps via the restrictive
+    /// abandonment path instead of abandoning with no (or a cleared)
+    /// staged enumeration.
     public func abandonSetup() {
+        if flow.currentStep == .enumeration {
+            rebuildMappingFromSelection()
+            let enumeration = currentEnumeration()
+            if !enumeration.apps.isEmpty || !enumeration.categories.isEmpty {
+                if flow.submitEnumeration(enumeration) {
+                    try? tokenStore.saveMapping(currentMapping())
+                }
+            }
+        }
         flow.abandon()
         authorizationError = nil
         progressError = nil
@@ -292,11 +308,36 @@ public final class SetupFlowViewModel: ObservableObject {
         }
     }
 
+    /// Derives one picked app's completion choice from the effective
+    /// policy: always-allowed → Allowed; else challenge-unlockable →
+    /// Earn; else Blocked. `isChallengeUnlockable` already excludes
+    /// always-allowed apps and never-unlockable overrides, so an
+    /// override-covered app shows Blocked even when it was picked as Earn.
+    /// Internal so app tests pin the rule without picker tokens.
+    /// Nonisolated: pure function of its arguments.
+    nonisolated static func choice(for app: AppRef, in policy: Policy) -> AppChoice {
+        if policy.alwaysAllowed.contains(app) {
+            return .allowed
+        }
+        if policy.isChallengeUnlockable(app) {
+            return .unblockable
+        }
+        return .blocked
+    }
+
     private func rebuildSummary() {
         let policy = policyStore.currentPolicy
         let config = backend.currentShieldConfiguration
         let builtinCount = Set(policy.alwaysAllowed)
             .intersection([.phone, .messages, .earnPlaySelf]).count
+        // Restore each picked app's choice from the effective policy: the
+        // completion view reads `choices`, which a relaunch would
+        // otherwise leave empty (Blocked-for-all). This also keeps a fresh
+        // completion honest — the summary matches the saved policy,
+        // including never-unlockable overrides, which never show Earn.
+        for app in pickedApps {
+            choices[app.id] = Self.choice(for: app.ref, in: policy)
+        }
         summary = CompletionSummary(
             policyVersion: policy.version,
             shieldedCount: config.shieldedApplications.count,

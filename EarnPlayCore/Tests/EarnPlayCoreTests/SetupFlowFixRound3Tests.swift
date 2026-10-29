@@ -189,7 +189,7 @@ final class SetupFlowFixRound3Tests: XCTestCase {
         runToGuidance(flow)
         XCTAssertEqual(flow.acknowledgePreventDeletingGuidance(), .persistenceFailed)
 
-        // No orphan enumeration may survive the failed commit.
+        // No orphan completion enumeration may survive the failed commit.
         XCTAssertNil(FileSetupEnumerationStore(directory: directory).loadEnumeration())
 
         // Relaunch restores as incomplete, never as the failed setup.
@@ -197,7 +197,19 @@ final class SetupFlowFixRound3Tests: XCTestCase {
         XCTAssertEqual(relaunched.currentStep, .authorization)
         XCTAssertFalse(relaunched.isComplete)
         XCTAssertFalse(relaunched.claimsProtection)
-        XCTAssertEqual(backend.currentShieldConfiguration, .none)
+        // Fix round 4 (finding 2): the accepted enumeration was persisted
+        // at submit time as the incomplete restrictive record, so the
+        // relaunch restores the picked apps' shields while staying
+        // incomplete — the old `.none` expectation encoded the finding-2
+        // bug (accepted enumeration lost on termination).
+        XCTAssertEqual(
+            backend.currentShieldConfiguration.shieldedApplications,
+            [Self.game, Self.socialApp, Self.allowedApp]
+        )
+        XCTAssertEqual(
+            backend.currentShieldConfiguration.shieldedCategories,
+            [Self.games, Self.social]
+        )
     }
 
     func testPolicyWriteFailureOverExistingPolicyDoesNotRestoreAsComplete() {
