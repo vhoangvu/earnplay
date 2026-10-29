@@ -419,10 +419,17 @@ final class PolicyEditorTests: XCTestCase {
         XCTAssertEqual(queue.pendingUpdates(), [update])
     }
 
-    func testStaleStoreReadDoesNotEnqueueAndReportsFailure() throws {
+    func testStaleCachedStoreHealsFromDurableStateOnSave() throws {
+        // Fix round 2 behavior change: version allocation reads the
+        // durable store under the save-transaction lock, so a stale
+        // in-memory cache can no longer produce a stale stamp for the
+        // store to reject — the save heals and lands one above the
+        // durable version. (The fix-round-1 guarantee stands: a write
+        // the store actually rejects still queues nothing; that path
+        // is now reachable only by writers outside the save pipeline,
+        // and stays covered at the `apply` level in PolicyStoreTests.)
         // Store A caches v5; store B (same directory) advances the
-        // persisted policy to v10. A's save stamps from its stale
-        // cache (v6) and `apply` must reject it: nothing queued.
+        // persisted policy to v10. A's save stamps v11 and succeeds.
         let storeDir = directory.appendingPathComponent("admin-store")
         let storeA = PolicyStore(directory: storeDir)
         XCTAssertEqual(storeA.apply(fixturePolicy(version: 5)), .applied)
@@ -433,17 +440,13 @@ final class PolicyEditorTests: XCTestCase {
 
         var draft = storeA.currentPolicy
         draft.movementSettings.maxReps = 50
-        XCTAssertThrowsError(
-            try PolicyEditorSave.save(draft: draft, adminStore: storeA, queue: queue)
-        ) { error in
-            XCTAssertEqual(
-                error as? PolicyEditorSaveError,
-                .staleVersion(currentVersion: 10, attemptedVersion: 6)
-            )
-        }
-        XCTAssertTrue(queue.isEmpty)
+        let (update, _) = try PolicyEditorSave.save(
+            draft: draft, adminStore: storeA, queue: queue
+        )
+        XCTAssertEqual(update.version, 11)
+        XCTAssertEqual(storeA.storedVersion, 11)
+        XCTAssertEqual(queue.pendingUpdates(), [update])
         XCTAssertNil(queue.loadSaveIntent())
-        XCTAssertEqual(storeA.storedVersion, 10)
     }
 
     // MARK: - Crash recovery (Copilot fix round 1, Finding 2)
@@ -465,13 +468,15 @@ final class PolicyEditorTests: XCTestCase {
         try queue.writeSaveIntent(update)
         XCTAssertEqual(store.apply(update), .applied)
 
-        // Relaunch: a fresh queue over the directory recovers the
-        // saved version with no further manual save.
+        // Relaunch: opening the queue does NOT deliver the intent by
+        // itself (fix round 2: the merge is deferred until store-aware
+        // recovery confirms the durable policy).
         let relaunched = PolicyUpdateQueue(directory: queueDir)
-        XCTAssertEqual(relaunched.pendingUpdates(), [update])
+        XCTAssertTrue(relaunched.pendingUpdates().isEmpty)
 
-        // Recovery completes: intent cleared, queue keeps the update,
-        // and the next save continues at v11 with both versions queued.
+        // Recovery completes with no further manual save: intent
+        // cleared, queue keeps the update, and the next save continues
+        // at v11 with both versions queued.
         PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: relaunched)
         XCTAssertNil(relaunched.loadSaveIntent())
         XCTAssertEqual(relaunched.pendingUpdates(), [update])
@@ -527,5 +532,229 @@ final class PolicyEditorTests: XCTestCase {
         XCTAssertEqual(queueB.pendingUpdates().map(\.version), [2])
         let reopened = PolicyUpdateQueue(directory: queueDir)
         XCTAssertEqual(reopened.pendingUpdates().map(\.version), [2])
+    }
+
+    // MARK: - Crash-consistency (Copilot fix round 2)
+
+    func testEqualVersionConflictingIntentIsDiscardedWithoutMerging() throws {
+        // Finding 1: a stale instance journals payload B at v10 after
+        // another instance saved payload A at v10, then stops before
+        // its store write is rejected. Recovery must NOT replace the
+        // queued A with B: the intent conflicts with the durable store
+        // and is discarded.
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let store = PolicyStore(directory: storeDir)
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let queue = PolicyUpdateQueue(directory: queueDir)
+
+        var draftA = store.currentPolicy
+        draftA.movementSettings.maxReps = 50
+        let (updateA, _) = try PolicyEditorSave.save(
+            draft: draftA, adminStore: store, queue: queue
+        )
+        XCTAssertEqual(queue.pendingUpdates(), [updateA])
+
+        // Stale instance's journal: same version, different payload.
+        var draftB = fixturePolicy(version: 9)
+        draftB.movementSettings.maxReps = 60
+        let updateB = PolicyEditorSave.updatedPolicy(draft: draftB, baseVersion: 9)
+        XCTAssertEqual(updateB.version, 10)
+        XCTAssertNotEqual(updateB, updateA)
+        try queue.writeSaveIntent(updateB)
+
+        // Relaunch: opening the queue must not merge the conflicting
+        // intent over the committed entry.
+        let relaunched = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertEqual(relaunched.pendingUpdates(), [updateA])
+
+        // Store-aware recovery discards the conflicting intent and
+        // keeps the durable policy and its queued entry.
+        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: relaunched)
+        XCTAssertNil(relaunched.loadSaveIntent())
+        XCTAssertEqual(relaunched.pendingUpdates(), [updateA])
+        XCTAssertEqual(store.currentPolicy, updateA)
+    }
+
+    func testNewSaveAbortsWhileEarlierIntentRemainsUnresolved() throws {
+        // Finding 2: v10 is durable in the store but its queue write
+        // keeps failing. A new save must abort with `unresolvedIntent`
+        // instead of overwriting the only v10 intent with v11.
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let store = PolicyStore(directory: storeDir)
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let setupQueue = PolicyUpdateQueue(directory: queueDir)
+
+        // Simulate the crash: intent journaled, policy durable, queue
+        // write never happened.
+        var draft = store.currentPolicy
+        draft.movementSettings.maxReps = 50
+        let update = PolicyEditorSave.updatedPolicy(
+            draft: draft, baseVersion: store.storedVersion
+        )
+        try setupQueue.writeSaveIntent(update)
+        XCTAssertEqual(store.apply(update), .applied)
+
+        // Queue-file writes fail (intent-file writes still work, so a
+        // save that reached journaling WOULD clobber the v10 intent).
+        let failingQueue = PolicyUpdateQueue(
+            directory: queueDir,
+            dataWriter: { data, url in
+                if url.lastPathComponent == PolicyUpdateQueue.queueFileName {
+                    throw NSError(domain: "PolicyEditorTests", code: 2)
+                }
+                try data.write(to: url, options: [.atomic])
+            }
+        )
+        var next = store.currentPolicy
+        next.movementSettings.maxReps = 60
+        XCTAssertThrowsError(
+            try PolicyEditorSave.save(draft: next, adminStore: store, queue: failingQueue)
+        ) { error in
+            XCTAssertEqual(
+                error as? PolicyEditorSaveError,
+                .unresolvedIntent(intentVersion: 10)
+            )
+        }
+        // The v10 intent survives, the store still holds v10 (no v11
+        // was stamped or applied), and no v11 reached the queue file.
+        XCTAssertEqual(failingQueue.loadSaveIntent(), update)
+        XCTAssertEqual(store.storedVersion, 10)
+        let fileCheck = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertTrue(fileCheck.pendingUpdates().isEmpty)
+
+        // Once queue writes work again, the next save recovers v10
+        // first, then saves v11 with both versions queued in order.
+        let healedQueue = PolicyUpdateQueue(directory: queueDir)
+        let (update2, _) = try PolicyEditorSave.save(
+            draft: next, adminStore: store, queue: healedQueue
+        )
+        XCTAssertEqual(update2.version, 11)
+        XCTAssertEqual(healedQueue.pendingUpdates().map(\.version), [10, 11])
+        XCTAssertNil(healedQueue.loadSaveIntent())
+    }
+
+    func testConcurrentSavesSerializeVersionAllocationAndJournaling() throws {
+        // Finding 3: two saves racing version allocation must not both
+        // choose v10 (one stale-rejected, its journal clobbering the
+        // winner's recovery intent). Serialized under the transaction
+        // lock with durable re-reads, both succeed at v10 and v11.
+        final class SaveResults: @unchecked Sendable {
+            private let lock = NSLock()
+            private var values: [Result<PolicyUpdate, Error>] = []
+            func append(_ result: Result<PolicyUpdate, Error>) {
+                lock.lock()
+                defer { lock.unlock() }
+                values.append(result)
+            }
+            var all: [Result<PolicyUpdate, Error>] {
+                lock.lock()
+                defer { lock.unlock() }
+                return values
+            }
+        }
+        for round in 0 ..< 10 {
+            let storeDir = directory.appendingPathComponent("store-\(round)")
+            let queueDir = directory.appendingPathComponent("queue-\(round)")
+            let seeder = PolicyStore(directory: storeDir)
+            XCTAssertEqual(seeder.apply(fixturePolicy(version: 9)), .applied)
+            // Both instances cache v9 before the race starts.
+            let storeA = PolicyStore(directory: storeDir)
+            let storeB = PolicyStore(directory: storeDir)
+            let queueA = PolicyUpdateQueue(directory: queueDir)
+            let queueB = PolicyUpdateQueue(directory: queueDir)
+            var draftA = storeA.currentPolicy
+            draftA.movementSettings.maxReps = 50
+            var draftB = storeB.currentPolicy
+            draftB.movementSettings.maxReps = 60
+            // Immutable copies for the @Sendable worker blocks below.
+            let finalDraftA = draftA
+            let finalDraftB = draftB
+
+            let results = SaveResults()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                results.append(Result {
+                    try PolicyEditorSave.save(
+                        draft: finalDraftA, adminStore: storeA, queue: queueA
+                    ).update
+                })
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                results.append(Result {
+                    try PolicyEditorSave.save(
+                        draft: finalDraftB, adminStore: storeB, queue: queueB
+                    ).update
+                })
+                group.leave()
+            }
+            XCTAssertEqual(group.wait(timeout: .now() + 30), .success)
+
+            let updates = try results.all.map { try $0.get() }
+            XCTAssertEqual(
+                Set(updates.map(\.version)), [10, 11],
+                "round \(round): concurrent saves must land on distinct versions"
+            )
+            let reopenedQueue = PolicyUpdateQueue(directory: queueDir)
+            XCTAssertEqual(
+                reopenedQueue.pendingUpdates().map(\.version), [10, 11],
+                "round \(round): both versions queued in creation order"
+            )
+            let reopenedStore = PolicyStore(directory: storeDir)
+            XCTAssertEqual(reopenedStore.storedVersion, 11, "round \(round)")
+            XCTAssertEqual(
+                reopenedStore.currentPolicy,
+                reopenedQueue.pendingUpdates().last,
+                "round \(round): durable policy matches queued v11"
+            )
+            XCTAssertNil(reopenedQueue.loadSaveIntent(), "round \(round)")
+        }
+    }
+
+    func testUnpersistedIntentIsNotDeliverableUntilStoreRecoveryPersists() throws {
+        // Finding 4: after a crash between journaling v10 and applying
+        // it, opening the queue must NOT make v10 deliverable while the
+        // store still holds v9 — and a store recovery that fails to
+        // persist must leave nothing queued.
+        let storeDir = directory.appendingPathComponent("admin-store")
+        let queueDir = directory.appendingPathComponent("pending-queue")
+        let store = PolicyStore(directory: storeDir)
+        XCTAssertEqual(store.apply(fixturePolicy(version: 9)), .applied)
+        let queue = PolicyUpdateQueue(directory: queueDir)
+
+        var draft = store.currentPolicy
+        draft.movementSettings.maxReps = 50
+        let update = PolicyEditorSave.updatedPolicy(
+            draft: draft, baseVersion: store.storedVersion
+        )
+        try queue.writeSaveIntent(update)
+
+        // Relaunch: the intent is not yet committed, so nothing is
+        // pending until store-aware recovery persists it.
+        let relaunched = PolicyUpdateQueue(directory: queueDir)
+        XCTAssertTrue(relaunched.pendingUpdates().isEmpty)
+
+        // Store recovery that cannot persist leaves nothing queued and
+        // keeps the intent for a later attempt.
+        let failingStore = PolicyStore(directory: storeDir, dataWriter: { _, _ in
+            throw NSError(domain: "PolicyEditorTests", code: 3)
+        })
+        PolicyEditorSave.recoverInterruptedSave(
+            adminStore: failingStore, queue: relaunched
+        )
+        XCTAssertTrue(relaunched.pendingUpdates().isEmpty)
+        XCTAssertEqual(relaunched.loadSaveIntent(), update)
+        XCTAssertEqual(failingStore.storedVersion, 9)
+
+        // Once the store write works, recovery persists first and only
+        // then delivers.
+        PolicyEditorSave.recoverInterruptedSave(adminStore: store, queue: relaunched)
+        XCTAssertEqual(store.storedVersion, 10)
+        XCTAssertEqual(relaunched.pendingUpdates(), [update])
+        XCTAssertNil(relaunched.loadSaveIntent())
     }
 }

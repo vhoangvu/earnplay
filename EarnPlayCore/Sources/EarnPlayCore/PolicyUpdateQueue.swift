@@ -17,23 +17,30 @@ import Foundation
 /// ## Cross-instance safety
 ///
 /// Like `PolicyStore.apply`, every reload–modify–persist operation
-/// (`enqueue`, `removeDelivered`, intent recovery) runs under a
-/// cross-instance file lock and re-reads the queue file first, so two
-/// live instances over the same directory cannot clobber each other:
-/// an instance that loaded `[v1]` before another instance enqueued
-/// `v2` still sees `[v1, v2]` when it removes delivered `v1`, and
-/// `v2` survives. Reads (`pendingUpdates`) serve the instance cache
+/// (`enqueue`, `removeDelivered`) runs under a cross-instance file
+/// lock and re-reads the queue file first, so two live instances
+/// over the same directory cannot clobber each other: an instance
+/// that loaded `[v1]` before another instance enqueued `v2` still
+/// sees `[v1, v2]` when it removes delivered `v1`, and `v2`
+/// survives. Reads (`pendingUpdates`) serve the instance cache
 /// without the file lock, mirroring `PolicyStore.currentPolicy`.
+///
+/// Whole saves and recoveries additionally serialize under the
+/// save-transaction lock (see `withSaveTransaction`), so version
+/// allocation, journaling, the store write, enqueueing, and cleanup
+/// run as one atomic sequence across live instances.
 ///
 /// ## Save-intent journal (Finding 2 recovery)
 ///
 /// `PolicyEditorSave.save` writes the update to the intent file
 /// *before* advancing the admin `PolicyStore`, and deletes it after
 /// the update is queued. If the app stops between the policy write
-/// and the queue write, the next queue opened over the directory
-/// re-merges the intent (recovery without another manual save), and
-/// `PolicyEditorSave.recoverInterruptedSave` advances a store that
-/// missed the policy write, then clears the intent. The merge is
+/// and the queue write, the next `recoverInterruptedSave` (run at
+/// editor launch and at the start of every save) merges the intent —
+/// but only after the admin store confirms the policy — so a saved
+/// version is delivered without another manual save. Opening the
+/// queue never merges the intent by itself: an intent whose store
+/// write never persisted must not become deliverable. The merge is
 /// idempotent (same-version entries replace in place), so a crash
 /// between the merge and the intent delete safely re-merges.
 public final class PolicyUpdateQueue: @unchecked Sendable {
@@ -43,34 +50,54 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
     public static let saveIntentFileName = "policy-save-intent.json"
     /// Cross-instance lock file serializing reload–modify–persist.
     private static let lockFileName = "pending-policy-updates.lock"
+    /// Cross-instance lock file serializing whole save transactions.
+    private static let transactionLockFileName = "policy-save-transaction.lock"
 
     private let directory: URL
     private let fileManager: FileManager
+    private let dataWriter: (Data, URL) throws -> Void
     private let lock = NSLock()
     private var items: [PolicyUpdate]
 
     /// Opens the queue stored in `directory`, loading pending updates.
     ///
-    /// Best-effort recovery runs here too: a save-intent journal left
-    /// by an interrupted save is merged into the pending queue (under
-    /// the cross-instance lock), so a version saved to the admin store
-    /// but never queued is deliverable after relaunch. The intent file
-    /// itself is left for `PolicyEditorSave.recoverInterruptedSave`,
-    /// which clears it once the admin store is confirmed to hold it.
-    public init(directory: URL, fileManager: FileManager = .default) {
+    /// Opening never merges the save-intent journal: an intent
+    /// becomes deliverable only after
+    /// `PolicyEditorSave.recoverInterruptedSave` confirms the admin
+    /// store holds it. A journaled update whose store write never
+    /// persisted must not become deliverable at open, and a
+    /// same-version intent with different content is a stale save to
+    /// discard, not to merge. The editor runs that recovery at launch
+    /// and at the start of every save.
+    ///
+    /// `dataWriter` is the persistence seam, mirroring `PolicyStore`:
+    /// it writes encoded data to a file URL and must throw on failure.
+    /// Production uses the default atomic `Data.write`; tests inject
+    /// a throwing writer to exercise the queue-failure path.
+    public init(
+        directory: URL,
+        fileManager: FileManager = .default,
+        dataWriter: ((Data, URL) throws -> Void)? = nil
+    ) {
         self.directory = directory
         self.fileManager = fileManager
+        self.dataWriter = dataWriter ?? { data, url in
+            try data.write(to: url, options: [.atomic])
+        }
         self.items = Self.load(directory: directory, fileManager: fileManager) ?? []
-        try? recoverSaveIntentLocked()
     }
 
     /// Opens the queue in the default on-device location:
     /// `Application Support/EarnPlay/` inside the app's container
     /// (shared with the admin-local `PolicyStore`).
-    public convenience init(fileManager: FileManager = .default) {
+    public convenience init(
+        fileManager: FileManager = .default,
+        dataWriter: ((Data, URL) throws -> Void)? = nil
+    ) {
         self.init(
             directory: PolicyStore.defaultDirectory(fileManager: fileManager),
-            fileManager: fileManager
+            fileManager: fileManager,
+            dataWriter: dataWriter
         )
     }
 
@@ -134,10 +161,7 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
             at: directory, withIntermediateDirectories: true
         )
         let data = try PolicyUpdateCodec.encode(update)
-        try data.write(
-            to: directory.appendingPathComponent(Self.saveIntentFileName),
-            options: [.atomic]
-        )
+        try dataWriter(data, directory.appendingPathComponent(Self.saveIntentFileName))
     }
 
     /// Reads the save-intent journal, if any. A missing or corrupt
@@ -162,21 +186,38 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
         )
     }
 
-    // MARK: - Internals (caller holds `lock` + file lock unless noted)
+    // MARK: - Save-transaction support (used by PolicyEditorSave)
 
-    /// Merges the save-intent journal into the pending queue (init and
-    /// recovery path). Idempotent: re-merging replaces in place.
-    private func recoverSaveIntentLocked() throws {
+    /// Runs `body` under the cross-instance save-transaction lock,
+    /// held across the whole recovery → version allocation → journal
+    /// → store apply → enqueue → cleanup sequence. Every save and
+    /// recovery over this directory takes this lock first, so two
+    /// live instances cannot stamp the same version or clobber each
+    /// other's journal; the per-operation locks nest inside it (it is
+    /// a different file precisely so its holder can re-acquire those).
+    /// The lock is not re-entrant: `save` and `recoverInterruptedSave`
+    /// each take it once and share locked internals.
+    func withSaveTransaction<T>(_ body: () throws -> T) throws -> T {
+        let lockFD = try acquireLockFile(named: Self.transactionLockFileName)
+        defer { releaseDirectoryLock(lockFD) }
+        return try body()
+    }
+
+    /// Highest version in the persisted queue file, re-read under the
+    /// cross-instance lock. `PolicyEditorSave` stamps new versions
+    /// from this (never the instance cache) inside the save
+    /// transaction, so a save cannot reuse a version another instance
+    /// already queued.
+    func latestDurablePendingVersion() throws -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
         let lockFD = try acquireDirectoryLock()
         defer { releaseDirectoryLock(lockFD) }
         reloadLocked()
-        guard let intent = loadSaveIntent() else { return }
-        let before = items
-        insertLocked(intent)
-        if items != before {
-            try persistLocked()
-        }
+        return items.map(\.version).max()
     }
+
+    // MARK: - Internals (caller holds `lock` + file lock unless noted)
 
     /// Inserts an update in ascending version order, replacing any
     /// entry with the same version in place.
@@ -199,10 +240,14 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
     // MARK: - Cross-instance lock (fail-closed; mirrors PolicyStore)
 
     private func acquireDirectoryLock() throws -> Int32 {
+        try acquireLockFile(named: Self.lockFileName)
+    }
+
+    private func acquireLockFile(named name: String) throws -> Int32 {
         try fileManager.createDirectory(
             at: directory, withIntermediateDirectories: true
         )
-        let lockURL = directory.appendingPathComponent(Self.lockFileName)
+        let lockURL = directory.appendingPathComponent(name)
         while true {
             do {
                 let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
@@ -236,10 +281,7 @@ public final class PolicyUpdateQueue: @unchecked Sendable {
             at: directory, withIntermediateDirectories: true
         )
         let data = try PolicyUpdateCodec.encode(items)
-        try data.write(
-            to: directory.appendingPathComponent(Self.queueFileName),
-            options: [.atomic]
-        )
+        try dataWriter(data, directory.appendingPathComponent(Self.queueFileName))
     }
 
     private static func load(directory: URL, fileManager: FileManager) -> [PolicyUpdate]? {
