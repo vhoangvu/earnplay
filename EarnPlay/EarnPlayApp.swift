@@ -29,7 +29,7 @@ struct ContentView: View {
             }
         }
         .task {
-            downloadModel.refresh()
+            downloadModel.refreshIfNeeded()
         }
     }
 

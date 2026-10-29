@@ -80,6 +80,20 @@ final class ModelDownloadViewModel: ObservableObject {
         self.readiness = readiness
     }
 
+    /// Initial readiness check for the root view's `.task`. The task
+    /// sits on the container whose content switches between the
+    /// download screen and the setup/main screens once the model is
+    /// ready; if the task re-runs on that switch, an unconditional
+    /// `refresh()` would evict the ready screen back to `.checking`
+    /// and restart readiness checks. The guard makes re-entry a
+    /// no-op: `.checking` still refreshes normally, and any resolved
+    /// phase is left untouched.
+    func refreshIfNeeded() {
+        if phase == .checking {
+            refresh()
+        }
+    }
+
     /// Re-resolves the model through the production readiness gate.
     func refresh() {
         refreshEpoch += 1
