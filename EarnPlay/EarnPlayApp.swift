@@ -11,7 +11,17 @@ struct EarnPlayApp: App {
 }
 
 struct ContentView: View {
+    @StateObject private var setup = SetupFlowViewModel.makeDefault()
+
     var body: some View {
+        if setup.step == .complete {
+            mainPlaceholder
+        } else {
+            SetupFlowView(viewModel: setup)
+        }
+    }
+
+    private var mainPlaceholder: some View {
         ScrollView {
             VStack(spacing: 12) {
                 Text("EarnPlay")
