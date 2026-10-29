@@ -11,20 +11,33 @@ struct EarnPlayApp: App {
 }
 
 struct ContentView: View {
+    @StateObject private var downloadModel = ModelDownloadViewModel()
+
     var body: some View {
-        ScrollView {
-            VStack(spacing: 12) {
-                Text("EarnPlay")
-                    .font(.largeTitle.bold())
-                Text("Tutor chat placeholder — core v\(EarnPlayCore.version)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Divider()
-                ReadAloudPreviewView()
-                Divider()
-                SpikeView()
+        Group {
+            if downloadModel.isReady {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        Text("EarnPlay")
+                            .font(.largeTitle.bold())
+                        Text("Tutor chat placeholder — core v\(EarnPlayCore.version)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Divider()
+                        ReadAloudPreviewView()
+                        Divider()
+                        SpikeView()
+                        Divider()
+                        AboutView()
+                    }
+                    .padding()
+                }
+            } else {
+                ModelDownloadView(viewModel: downloadModel)
             }
-            .padding()
+        }
+        .task {
+            downloadModel.refresh()
         }
     }
 }
