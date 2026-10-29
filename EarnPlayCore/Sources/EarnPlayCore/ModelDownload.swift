@@ -137,6 +137,12 @@ public struct ModelDownloadReadiness: Sendable {
     ///    when the default/current file is gone (finding 2). This
     ///    is a check-only resolve: a retained snapshot is released
     ///    immediately so the gate never pins registry cleanup.
+    ///    Fix round 3: when the resolved artifact sits AT the
+    ///    download destination, the pinned size+SHA check still
+    ///    applies — the registry digest is computed from the
+    ///    current bytes, so a modified/truncated destination file
+    ///    with a valid GGUF header would otherwise self-validate
+    ///    and skip repair.
     /// 2. Otherwise a legacy default location (env override,
     ///    Documents, script cache) counts by existence, without
     ///    re-verification (finding 3: legacy preserved).
@@ -152,6 +158,11 @@ public struct ModelDownloadReadiness: Sendable {
         if let registry = try? VersionRegistry.production(storeURL: registryStoreURL, modelURL: defaultURL),
            let artifacts = try? registry.inferenceArtifacts(defaultModelURL: defaultURL) {
             registry.releaseInferenceArtifacts(artifacts)
+            if let modelURL = artifacts.modelURL,
+               modelURL.standardizedFileURL.path == destinationURL.standardizedFileURL.path {
+                let downloader = ModelDownloader(configuration: configuration, destinationURL: destinationURL)
+                return downloader.verifiedExistingModelURL() != nil
+            }
             return true
         }
         guard let defaultURL else { return false }
