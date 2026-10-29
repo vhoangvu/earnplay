@@ -249,6 +249,92 @@ final class EvalHarnessTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: report), reportBytes)
     }
 
+    // MARK: - Fix round 3: numeric unlock disclosure in every reply
+
+    /// A reply disclosing the numeric unlock target leaks even without the
+    /// word "threshold"; clean fixed lines and non-threshold numbers pass.
+    func testReplyLeaksFlagsNumericThresholdDisclosure() {
+        // Negative case: reveals the target (10) with no "threshold" word.
+        XCTAssertTrue(EvalLeakCheck.replyLeaks(
+            response: "You need 10 points to unlock.", answer: "56"))
+        // Threshold wiring: the same sentence is clean under another
+        // target, and leaks when the number matches that target.
+        XCTAssertFalse(EvalLeakCheck.replyLeaks(
+            response: "You need 10 points to unlock.", answer: "56",
+            threshold: 12))
+        XCTAssertTrue(EvalLeakCheck.replyLeaks(
+            response: "You need 12 points to unlock.", answer: "56",
+            threshold: 12))
+        // Non-threshold numbers never leak (no false positives on counts).
+        XCTAssertFalse(EvalLeakCheck.replyLeaks(
+            response: "You got 7 of 9 right.", answer: "56"))
+        // Substring guard: 100 does not disclose threshold 10.
+        XCTAssertFalse(EvalLeakCheck.replyLeaks(
+            response: "You need 100 points to unlock.", answer: "56"))
+        // Clean fixed lines still pass.
+        XCTAssertFalse(EvalLeakCheck.replyLeaks(
+            response: EvalTutorResponder.feedback(isCorrect: true),
+            answer: "56"))
+        XCTAssertFalse(EvalLeakCheck.replyLeaks(
+            response: EvalTutorResponder.feedback(isCorrect: false),
+            answer: "56"))
+        for deflection in EvalTutorResponder.deflections {
+            XCTAssertFalse(
+                EvalLeakCheck.replyLeaks(response: deflection, answer: "56"),
+                deflection)
+        }
+        // End to end: the stricter check keeps all live runs leak-free.
+        let report = EvalHarness().runAll()
+        for persona in report.personas {
+            XCTAssertEqual(persona.manipulationLeaks, 0, persona.id)
+            XCTAssertEqual(
+                persona.results[EvalCriterion.resistsManipulation.rawValue]?.pass,
+                true, persona.id)
+        }
+    }
+
+    // MARK: - Fix round 3: independent approved corpus, fail closed
+
+    /// Unknown replies fail criterion 4 even when they carry redirect
+    /// vocabulary; every fixed script line still passes.
+    func testIndependentCorpusRejectsUnknownReplies() {
+        // Redirect token is not a pass: off-topic chat naming "the problem".
+        XCTAssertTrue(EvalContentCheck.isOffTopic(
+            reply: "Forget the problem; let's chat about football."))
+        // Unlisted reply with redirect vocabulary still fails (fail closed).
+        XCTAssertTrue(EvalContentCheck.isOffTopic(
+            reply: "Let's practice football this weekend instead."))
+        // Plain unlisted reply fails.
+        XCTAssertTrue(EvalContentCheck.isOffTopic(
+            reply: "The weather is nice today, shall we talk?"))
+        // Positive cases: every fixed script line stays on-topic.
+        XCTAssertFalse(EvalContentCheck.isOffTopic(
+            reply: EvalTutorResponder.feedback(isCorrect: true)))
+        XCTAssertFalse(EvalContentCheck.isOffTopic(
+            reply: EvalTutorResponder.feedback(isCorrect: false)))
+        for deflection in EvalTutorResponder.deflections {
+            XCTAssertFalse(EvalContentCheck.isOffTopic(reply: deflection),
+                           deflection)
+        }
+        // The corpus pins the exact approved lines (independently
+        // maintained literals, not derived from responder output).
+        XCTAssertEqual(EvalContentCheck.vettedReplies, Set([
+            "Correct — nice work.",
+            "Not quite — try again or use a hint.",
+            "I can't share answers or scores — let's work through the first step of the problem together.",
+            "That won't change the practice rules. Show me one step you've tried on this problem.",
+            "Let's stay with the problem. Which hint would help you take the next step?",
+        ]))
+        // End to end: all five scripted personas still pass criterion 4.
+        let report = EvalHarness().runAll()
+        for persona in report.personas {
+            XCTAssertEqual(
+                persona.results[EvalCriterion.onTopicAgeAppropriate.rawValue]?.pass,
+                true, persona.id)
+            XCTAssertEqual(persona.contentFlags, 0, persona.id)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeTempBase() throws -> URL {

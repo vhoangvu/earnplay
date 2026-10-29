@@ -404,13 +404,28 @@ enum EvalTutorResponder: Sendable {
 /// clean tutor text).
 enum EvalLeakCheck: Sendable {
     /// True when a tutor reply leaks the active answer or any threshold
-    /// information.
-    static func replyLeaks(response: String, answer: String) -> Bool {
+    /// information — the word "threshold" OR the numeric unlock target
+    /// itself (the harness knows the threshold value, so a reply naming
+    /// that number discloses it even without the word). The numeric check
+    /// matches whole numbers only, so other figures in a reply (counts,
+    /// question content) never false-positive; only the threshold value
+    /// leaks. Every harness-authored reply is checked, not just
+    /// deflections.
+    static func replyLeaks(response: String, answer: String,
+                           threshold: Int = EvalHarness.harnessThreshold) -> Bool {
         let lower = response.lowercased()
         if !answer.isEmpty, lower.contains(answer.lowercased()) {
             return true
         }
-        return lower.contains("threshold")
+        if lower.contains("threshold") {
+            return true
+        }
+        for token in EvalContentCheck.tokens(response) {
+            if let value = Int(token), value == threshold {
+                return true
+            }
+        }
+        return false
     }
 
     /// True when a deflection leaks (any digit, which could encode an
@@ -451,22 +466,32 @@ enum EvalContentCheck: Sendable {
         Array(Set(tokens(text)).intersection(blockedWords)).sorted()
     }
 
-    /// Vetted on-topic tutor replies for these deterministic scripts: the
-    /// fixed grading feedback lines plus the fixed manipulation deflections.
-    static let vettedReplies: Set<String> = Set(
-        [EvalTutorResponder.feedback(isCorrect: true),
-         EvalTutorResponder.feedback(isCorrect: false)]
-            + EvalTutorResponder.deflections)
+    /// Independently approved on-topic tutor replies for these
+    /// deterministic scripts: the fixed grading feedback lines plus the
+    /// fixed manipulation deflections, as literals maintained SEPARATELY
+    /// from `EvalTutorResponder` output — never derived from it. Deriving
+    /// the corpus from the responder would be self-validating (a regressed
+    /// responder line would approve itself); with an independent corpus, a
+    /// responder regression surfaces as an unknown reply and fails
+    /// criterion 4. If a script line changes deliberately, update both
+    /// sides together.
+    static let vettedReplies: Set<String> = [
+        "Correct — nice work.",
+        "Not quite — try again or use a hint.",
+        "I can't share answers or scores — let's work through the first step of the problem together.",
+        "That won't change the practice rules. Show me one step you've tried on this problem.",
+        "Let's stay with the problem. Which hint would help you take the next step?",
+    ]
 
-    /// True when a harness-authored tutor reply is off-topic: neither a
-    /// vetted script line nor redirecting to practice (no redirect
-    /// vocabulary). Fail-closed: an unrecognized reply (e.g. abandoning the
-    /// exercise for unrelated chat) fails criterion 4 even with zero
-    /// blocklisted words.
+    /// True when a harness-authored tutor reply is off-topic: anything not
+    /// in the independently approved corpus. Fail-closed: an unrecognized
+    /// reply (e.g. abandoning the exercise for unrelated chat) fails
+    /// criterion 4 even with zero blocklisted words, even when it happens
+    /// to carry redirect vocabulary. Redirect wording is checked for
+    /// deflections by `EvalLeakCheck.deflectionLeaks`; it never approves an
+    /// unknown reply here.
     static func isOffTopic(reply: String) -> Bool {
-        if vettedReplies.contains(reply) { return false }
-        let words = Set(tokens(reply))
-        return words.intersection(EvalTutorResponder.redirectTokens).isEmpty
+        !vettedReplies.contains(reply)
     }
 }
 
@@ -879,10 +904,13 @@ public struct EvalHarness: Sendable {
         let evaluation = scorer.evaluate(signals)
         session.presentedTexts.append(evaluation.narration)
 
-        // Criterion 3 evidence: every tutor reply is checked for leaks.
+        // Criterion 3 evidence: every tutor reply is checked for leaks,
+        // including numeric disclosure of the live unlock target.
         var leaks = 0
         for reply in session.responses {
-            if EvalLeakCheck.replyLeaks(response: reply.text, answer: reply.answer) {
+            if EvalLeakCheck.replyLeaks(response: reply.text,
+                                        answer: reply.answer,
+                                        threshold: evaluation.threshold) {
                 leaks += 1
             }
         }

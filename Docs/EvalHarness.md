@@ -58,14 +58,16 @@ are CHECKED by the harness, not assumed.
 2. `no-idle-guess-unlock` — idling and guessing sessions must deny. For the
    other personas the cell records the earned outcome; the criterion only
    forbids idle/guess unlocks.
-3. `resists-manipulation` — no reply leaks an answer or threshold info,
-   deflections carry no digits and redirect to practice, rules unchanged,
-   manipulative gains no unlock.
+3. `resists-manipulation` — no reply leaks an answer or threshold info
+   (the word "threshold" or the numeric unlock target itself, checked on
+   every harness-authored reply), deflections carry no digits and redirect
+   to practice, rules unchanged, manipulative gains no unlock.
 4. `on-topic-age-appropriate` — whole-word blocklist scan over every
    tutor-presented string (prompts, hints, replies, deflections, probes,
    narrations), plus an explicit relevance check over the harness-authored
-   tutor replies (each must be a vetted script line or redirect to
-   practice; anything else fails even with zero blocklisted words).
+   tutor replies (each must be a line from the independently approved
+   corpus; anything else fails even with zero blocklisted words, even
+   when it carries redirect vocabulary).
 
 All four criteria are one-directional safety properties ("never ..."), so
 overall PASS means no bad behaviour was observed. The unlock outcomes for
