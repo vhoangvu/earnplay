@@ -20,6 +20,12 @@ public final class ChoreTradeViewModel: ObservableObject {
 
     private let shieldManager: ShieldManager
     private let effortRecorder: EffortSessionRecorder?
+    /// True when this view model launched into an already-active unlock
+    /// window (same-boot relaunch during a persisted unlock). The fresh
+    /// session never reaches `.granted`, so without this flag the
+    /// expired branch in `refreshShieldStatus()` could not tell a
+    /// restored window that ended from one that was never granted.
+    private let restoredActiveUnlock: Bool
 
     public init(
         pool: [ChorePoolEntry],
@@ -31,6 +37,15 @@ public final class ChoreTradeViewModel: ObservableObject {
         self.poolSourceCaption = poolSourceCaption
         self.shieldManager = shieldManager
         self.effortRecorder = effortRecorder
+        // Relaunch into an active window (fix round 4): the restored
+        // manager holds the unshielded configuration but no monitor —
+        // the old process took it. Restart monitoring so expiry
+        // re-shields without interaction, and publish the countdown
+        // baseline so the status reflects the restored window.
+        self.restoredActiveUnlock = shieldManager.isUnlockActive
+        if restoredActiveUnlock {
+            startStatusUpdates()
+        }
     }
 
     public var declinedCount: Int { session.declinedChores.count }
@@ -105,8 +120,9 @@ public final class ChoreTradeViewModel: ObservableObject {
 
     /// Starts expiry monitoring plus the status baseline: the shield
     /// manager re-locks on expiry, and `shieldStatus` reflects the grant.
-    /// Called on a successful confirm and when the granted screen appears
-    /// (both are idempotent). The view's status ticker drives the periodic
+    /// Called on a successful confirm, when the granted screen appears,
+    /// and from `init` when relaunching into an already-active window
+    /// (all are idempotent). The view's status ticker drives the periodic
     /// `refreshGrantedStatus()` calls; `stopStatusUpdates()` ends
     /// monitoring when the granted screen disappears.
     public func startStatusUpdates(pollInterval: TimeInterval = 1) {
@@ -125,8 +141,9 @@ public final class ChoreTradeViewModel: ObservableObject {
             shieldStatus = "Device unlock active, \(remaining) seconds left."
         } else if grantSucceeded == false {
             shieldStatus = "Device shields unchanged (unlock not granted)."
-        } else if session.hasGrantedUnlock {
-            // The granted window ended while the screen was open: the
+        } else if session.hasGrantedUnlock || restoredActiveUnlock {
+            // The granted window ended while the screen was open, or a
+            // restored window (relaunch, fresh session) ended: the
             // refresh above already re-applied shields, so say so instead
             // of leaving a frozen countdown on screen.
             shieldStatus = "Unlock expired — device is shielded again."
