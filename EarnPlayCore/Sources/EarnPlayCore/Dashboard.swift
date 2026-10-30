@@ -233,6 +233,23 @@ public enum Dashboard {
         return "\(dateText), trying unchanged from previous session"
     }
 
+    /// Date text for one effort-bar row (fix round 5: the Progress view's
+    /// timezone-current date seam). A fresh formatter per call with the zone
+    /// set explicitly — the view's old cached static formatter captured the
+    /// zone at first creation, so bars and VoiceOver labels (both fed by
+    /// the same text) showed the wrong day after a time-zone change until
+    /// relaunch. Fresh-per-call is thread-safe and has negligible cost for
+    /// a handful of bars. Defaults render under the device's current zone
+    /// and locale at call time; the "MMMd" localized shape is unchanged.
+    public static func effortBarDateText(for date: Date, timeZone: TimeZone = .current,
+                                         locale: Locale = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.locale = locale
+        formatter.setLocalizedDateFormatFromTemplate("MMMd")
+        return formatter.string(from: date)
+    }
+
     // MARK: - Week bucketing
 
     private enum WeekBucket { case thisWeek, lastWeek }

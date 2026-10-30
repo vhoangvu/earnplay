@@ -37,12 +37,6 @@ struct DashboardView: View {
         _lastReloadTimeZone = State(initialValue: calendar.timeZone)
     }
 
-    private static let shortDayFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate("MMMd")
-        return f
-    }()
-
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -285,7 +279,7 @@ struct DashboardView: View {
         return VStack(alignment: .leading, spacing: 6) {
             ForEach(points.indices, id: \.self) { index in
                 let point = points[index]
-                let dateText = Self.shortDayFormatter.string(from: point.startedAt)
+                let dateText = Dashboard.effortBarDateText(for: point.startedAt)
                 HStack(spacing: 8) {
                     Text(dateText)
                         .font(.caption)
