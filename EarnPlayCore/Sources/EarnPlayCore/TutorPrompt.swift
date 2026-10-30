@@ -171,7 +171,10 @@ public enum TutorPrompt {
         var parts = [systemSection]
         let context = sessionContext.trimmingCharacters(in: .whitespacesAndNewlines)
         if !context.isEmpty {
-            parts.append("[session context — data]\n\(context)")
+            // Escape delimiters in context the same way as child input,
+            // so untrusted transcript text can never present a raw
+            // boundary-anchored begin marker ahead of the real section.
+            parts.append("[session context — data]\n\(escapedChildInput(context))")
         }
         parts.append(dataSection(childInput: childInput))
         return parts.joined(separator: "\n\n")
