@@ -109,13 +109,17 @@ public enum AuditorScoreFreeText {
     }
 }
 
-/// Serializes auditor runs (round 2, item 1): a run requested while
-/// another is in flight is skipped instead of overlapping it.
+/// Serializes auditor runs (round 2, item 1; round 3, item 3): a run
+/// requested while another is in flight coalesces into one rerun
+/// instead of overlapping or being dropped.
 public final class AuditRunGate: @unchecked Sendable {
     private let lock = NSLock()
     private var running = false
+    private var dirty = false
     public init() {}
     public var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
+    /// True when a request arrived mid-run and one rerun is owed.
+    public var hasPendingRerun: Bool { lock.lock(); defer { lock.unlock() }; return dirty }
     /// Marks a run in flight and returns true, or returns false when
     /// a run is already in flight.
     public func tryBegin() -> Bool {
@@ -124,7 +128,77 @@ public final class AuditRunGate: @unchecked Sendable {
         running = true
         return true
     }
-    public func end() { lock.lock(); running = false; lock.unlock() }
+    public func end() { lock.lock(); running = false; dirty = false; lock.unlock() }
+    /// Starts a run and returns true, or, when a run is already in
+    /// flight, marks it dirty and returns false so the caller coalesces
+    /// into one rerun instead of dropping the request (round 3, item 3).
+    public func beginOrMarkDirty() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if running { dirty = true; return false }
+        running = true
+        return true
+    }
+    /// Ends the current pass. Returns true when a coalesced request is
+    /// pending: the caller reruns once and the run stays in flight.
+    /// Returns false when the run is fully finished.
+    @discardableResult
+    public func finish() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if dirty { dirty = false; return true }
+        running = false
+        return false
+    }
+}
+
+/// Runs audit work off the main queue and hops to the main queue only
+/// to publish results (round 3, items 1-2). Requests arriving while a
+/// run is in flight coalesce into exactly one rerun, so a session
+/// stored mid-audit is still audited (round 3, item 3). The latest
+/// work/publish/settled closures are the ones a rerun executes.
+public final class AuditRunPerformer: @unchecked Sendable {
+    private let gate = AuditRunGate()
+    private let workQueue: DispatchQueue
+    private let lock = NSLock()
+    private var pendingWork: (@Sendable () -> Void)?
+    private var pendingPublish: (@Sendable () -> Void)?
+    private var pendingSettled: (@Sendable () -> Void)?
+
+    public init(workQueue: DispatchQueue = DispatchQueue(label: "earnplay.auditor-work", qos: .userInitiated)) {
+        self.workQueue = workQueue
+    }
+
+    public var isRunning: Bool { gate.isRunning }
+
+    /// `work` runs on the work queue; `publish` then runs on the main
+    /// queue. `settled` runs on the main queue once no rerun is owed.
+    public func request(work: @escaping @Sendable () -> Void,
+                        publish: @escaping @Sendable () -> Void,
+                        settled: (@Sendable () -> Void)? = nil) {
+        lock.lock()
+        pendingWork = work
+        pendingPublish = publish
+        if let settled { pendingSettled = settled }
+        lock.unlock()
+        guard gate.beginOrMarkDirty() else { return }
+        schedule()
+    }
+
+    private func schedule() {
+        workQueue.async { [self] in
+            lock.lock(); let work = pendingWork; lock.unlock()
+            work?()
+            DispatchQueue.main.async { [self] in
+                lock.lock(); let publish = pendingPublish; lock.unlock()
+                publish?()
+                if gate.finish() {
+                    schedule()
+                } else {
+                    lock.lock(); let settled = pendingSettled; pendingSettled = nil; lock.unlock()
+                    settled?()
+                }
+            }
+        }
+    }
 }
 
 /// Completion text for an auditor run (round 2, item 2): success is
@@ -226,6 +300,11 @@ public struct AuditorSessionExcerpt: Codable, Equatable, Sendable {
     }
 
     public var wasGranted: Bool { unlockDecision?.type == .grantUnlock }
+
+    /// True only when an unlock decision (grant or deny) was recorded.
+    /// A session without one has no outcome: it is neither granted nor
+    /// denied (round 3, item 5).
+    public var hasUnlockDecision: Bool { unlockDecision != nil }
 
     /// Values parsed from one decision's evidence text.
     public struct ParsedEvidence: Equatable, Sendable {
@@ -508,15 +587,18 @@ public struct AuditorEngine: Sendable {
         var out: [AuditFlag] = []
         for index in 3..<sessions.count {
             let latest = sessions[index]
-            let prior = Array(sessions[..<index])
-            guard let latestSignals = latest.signals,
-                  prior.allSatisfy({ $0.signals != nil }) else { continue }
-            let priorAttempts = prior.map { Double($0.signals?.genuineAttempts ?? 0) }
+            // Round 3, item 4: sessions without effort signals are
+            // skipped, not treated as a baseline of zero — one missing
+            // observation must not disable the whole check. At least
+            // three usable baseline sessions are still required.
+            let usable = sessions[..<index].filter { $0.signals != nil }
+            guard let latestSignals = latest.signals, usable.count >= 3 else { continue }
+            let priorAttempts = usable.map { Double($0.signals?.genuineAttempts ?? 0) }
             let meanAttempts = priorAttempts.reduce(0, +) / Double(priorAttempts.count)
             guard meanAttempts >= 3,
                   Double(latestSignals.genuineAttempts) <= meanAttempts * 0.25 else { continue }
             out.append(flag(.behaviorShift, .info, session: latest,
-                evidence: "Session \(latest.sessionId): genuineAttempts \(latestSignals.genuineAttempts), activeSeconds \(latestSignals.activeSeconds). Prior sessions \(prior.map(\.sessionId).joined(separator: ", ")) recorded genuineAttempts \(prior.map { String($0.signals?.genuineAttempts ?? 0) }.joined(separator: ", ")).",
+                evidence: "Session \(latest.sessionId): genuineAttempts \(latestSignals.genuineAttempts), activeSeconds \(latestSignals.activeSeconds). Prior sessions \(usable.map(\.sessionId).joined(separator: ", ")) recorded genuineAttempts \(usable.map { String($0.signals?.genuineAttempts ?? 0) }.joined(separator: ", ")).",
                 action: "Open the latest session excerpt to see what changed, and talk with your child about how practice is going."))
         }
         return out
@@ -526,9 +608,14 @@ public struct AuditorEngine: Sendable {
     private func checkInconsistency(_ sessions: [AuditorSessionExcerpt]) -> [AuditFlag] {
         var out: [AuditFlag] = []
         for (index, session) in sessions.enumerated() {
-            guard let total = session.effortTotal, let floor = session.floorMet else { continue }
+            // Round 3, item 5: only sessions with a recorded unlock
+            // decision have an outcome to compare. A session without
+            // one is not a denial and is never compared as one.
+            guard session.hasUnlockDecision,
+                  let total = session.effortTotal, let floor = session.floorMet else { continue }
             for prior in sessions[..<index] {
-                guard let priorTotal = prior.effortTotal, let priorFloor = prior.floorMet,
+                guard prior.hasUnlockDecision,
+                      let priorTotal = prior.effortTotal, let priorFloor = prior.floorMet,
                       prior.wasGranted != session.wasGranted,
                       abs(priorTotal - total) <= 2, priorFloor == floor else { continue }
                 // Item 10: exclude pairs where both outcomes follow

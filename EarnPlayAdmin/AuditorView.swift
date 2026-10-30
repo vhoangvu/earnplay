@@ -8,32 +8,48 @@ import EarnPlayCore
 /// choice and routes to the existing Policy tab, applying nothing.
 final class AdminAuditorController: ObservableObject {
     let runtime = AuditorRuntime.adminDefault()
-    lazy var engine = AuditorEngine(runtime: runtime)
+    let engine: AuditorEngine
     let flagManager = AuditFlagManager()
     private let sessionStore: SessionLogStore
-    private let runGate = AuditRunGate()
+    private let performer = AuditRunPerformer()
+    private let completionLock = NSLock()
+    private var pendingCompletions: [() -> Void] = []
     @Published private(set) var openFlags: [AuditFlag] = []
 
     init(sessionStore: SessionLogStore) {
         self.sessionStore = sessionStore
+        self.engine = AuditorEngine(runtime: runtime)
     }
 
-    /// Runs at sync time and on demand from the Auditor tab. The
-    /// production transport invokes this from its MCSession delegate
-    /// callback, off the main queue, so the work hops to the main
-    /// queue before touching @Published state, and a run requested
-    /// while another is in flight is skipped (round 2, item 1).
-    func runAudit() {
-        guard runGate.tryBegin() else { return }
-        let gate = runGate
-        let work = { [weak self] in
-            guard let self else { gate.end(); return }
-            defer { gate.end() }
+    /// Runs at sync time and on demand from the Auditor tab. Every
+    /// call path (the app's `onSessionStored` callback on the MCSession
+    /// delegate queue and the Auditor tab button on the main queue)
+    /// funnels through here: the audit work runs off the main queue so
+    /// navigation and policy editing stay responsive, only publishing
+    /// to `@Published` state hops to the main queue, and a request
+    /// arriving mid-audit coalesces into one rerun so no stored session
+    /// goes unaudited (round 3, items 1-3). The optional completion
+    /// runs on the main queue after the final publish.
+    func runAudit(completion: (() -> Void)? = nil) {
+        if let completion {
+            completionLock.lock()
+            pendingCompletions.append(completion)
+            completionLock.unlock()
+        }
+        performer.request(work: { [weak self] in
+            guard let self else { return }
             let excerpts = self.sessionStore.allLogs.map(AuditorSessionExcerpt.init(sessionLog:))
             self.flagManager.recordRun(self.engine.audit(excerpts))
-            self.refresh()
-        }
-        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+        }, publish: { [weak self] in
+            self?.refresh()
+        }, settled: { [weak self] in
+            guard let self else { return }
+            self.completionLock.lock()
+            let completions = self.pendingCompletions
+            self.pendingCompletions = []
+            self.completionLock.unlock()
+            completions.forEach { $0() }
+        })
     }
 
     func refresh() { openFlags = flagManager.openFlags }
@@ -67,10 +83,11 @@ struct AuditorView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Run auditor over synced sessions") {
-                        auditor.runAudit()
-                        status = AuditorRunStatus.completionMessage(
-                            openCount: auditor.openFlags.count,
-                            persistenceError: auditor.flagManager.lastPersistenceError)
+                        auditor.runAudit {
+                            status = AuditorRunStatus.completionMessage(
+                                openCount: auditor.openFlags.count,
+                                persistenceError: auditor.flagManager.lastPersistenceError)
+                        }
                     }
                     if !status.isEmpty {
                         Text(status).font(.caption).foregroundStyle(.secondary)
