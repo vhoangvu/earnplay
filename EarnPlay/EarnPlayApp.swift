@@ -22,7 +22,11 @@ struct ContentView: View {
                 } else if setup.step == .complete {
                     // Main practice screen (T1.8): the chat conversation.
                     // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
-                    ChatConversationView(engine: DemoTutorEngine())
+                    // Practice recording (issue #63): the production
+                    // SessionLog producer — per-question detail + effort
+                    // snapshot, enqueued for the existing sync.
+                    ChatConversationView(engine: DemoTutorEngine(
+                        recording: .productionDefault()))
                 } else {
                     SetupFlowView(viewModel: setup)
                 }

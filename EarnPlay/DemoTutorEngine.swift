@@ -17,6 +17,37 @@ import EarnPlayCore
 /// child's explanation of their step (acknowledged, not graded).
 /// Finishing the last question reports an explicit session-complete
 /// composer state; `startSession()` after that restarts the session.
+///
+/// Practice recording (issue #63): when constructed with `recording`
+/// dependencies, every session is recorded into a `PracticeSessionRecorder`
+/// (per-question detail + T1.4 effort) and, on completion, built via
+/// `SessionLog.make` with the logger AND the detail and enqueued in the
+/// T4.6 `SessionLogQueue` for the existing sync. Nil disables recording
+/// (existing demo behavior, no filesystem writes).
+struct PracticeRecordingDependencies {
+    var makeSessionId: () -> String
+    var logger: DecisionLogger
+    var queue: SessionLogQueue
+    var makeScorer: () -> EffortScorer
+    var policyVersion: () -> Int
+    var now: () -> Date
+
+    /// Production wiring: real on-device logger/queue/policy, one scorer
+    /// draw per session, UUID session ids, live clock. Used only by the
+    /// child app's practice screen; tests inject isolated fakes.
+    static func productionDefault(
+        logger: DecisionLogger = DecisionLogger(),
+        queue: SessionLogQueue = SessionLogQueue(),
+        policyVersion: @escaping () -> Int = { PolicyStore().storedVersion },
+        makeScorer: @escaping () -> EffortScorer = { EffortScorer() },
+        makeSessionId: @escaping () -> String = { UUID().uuidString },
+        now: @escaping () -> Date = Date.init
+    ) -> Self {
+        Self(makeSessionId: makeSessionId, logger: logger, queue: queue,
+             makeScorer: makeScorer, policyVersion: policyVersion, now: now)
+    }
+}
+
 final class DemoTutorEngine: ChatTutorEngine {
     private struct Item {
         let result: QuestionGenerationResult
@@ -36,7 +67,17 @@ final class DemoTutorEngine: ChatTutorEngine {
     /// when the question is answered, or on session (re)start.
     private var awaitingProbeReply = false
 
-    init(maxQuestions: Int = 3) {
+    private let recording: PracticeRecordingDependencies?
+    private var sessionRecorder: PracticeSessionRecorder?
+    private var sessionScorer: EffortScorer?
+    private var recordingEnded = false
+
+    /// Active recording session id, for tests. Nil when recording is
+    /// disabled or no session has started.
+    var recordingSessionId: String? { sessionRecorder?.sessionId }
+
+    init(maxQuestions: Int = 3, recording: PracticeRecordingDependencies? = nil) {
+        self.recording = recording
         // Serve verified fallback questions deterministically. A
         // proposal that does not re-verify is dropped, never shown.
         var built: [Item] = []
@@ -72,10 +113,43 @@ final class DemoTutorEngine: ChatTutorEngine {
                 text: "Let's practise together. Take your time.",
                 kind: .instruction))])
         }
+        // Practice recording: one recorder/scorer per session, started on
+        // first start and on restart after a finished session. A second
+        // start without a finish keeps the active session.
+        if let rec = recording, sessionRecorder == nil || recordingEnded {
+            let startedAt = rec.now()
+            sessionScorer = rec.makeScorer()
+            let recorder = PracticeSessionRecorder(
+                sessionId: rec.makeSessionId(), startedAt: startedAt, now: rec.now)
+            sessionRecorder = recorder
+            recordingEnded = false
+            recorder.startQuestion(questionId: item.result.question.questionId,
+                                   skill: item.result.question.skill, at: startedAt)
+        }
         return ChatEngineUpdate(
             turns: [questionTurn(item)],
             progress: ChatProgress(totalQuestions: items.count, attemptedQuestions: 0),
             composer: composer(for: item))
+    }
+
+    /// Finishes the active recording session (if any) and enqueues its
+    /// `SessionLog` in the T4.6 queue. Called automatically when the last
+    /// question is answered correctly; tests call it directly to finish
+    /// incomplete sessions (e.g. with a final incorrect answer). Returns
+    /// the enqueued log, or nil when recording is disabled, no session is
+    /// active, or the session already finished. Never invents detail:
+    /// unanswered questions produce no records and unscored sessions carry
+    /// nil effort.
+    @discardableResult
+    func finishRecordingSession(at date: Date? = nil) -> SessionLog? {
+        guard let rec = recording, let recorder = sessionRecorder,
+              let scorer = sessionScorer, !recordingEnded else { return nil }
+        recordingEnded = true
+        let log = recorder.makeSessionLog(
+            endedAt: date ?? rec.now(), logger: rec.logger,
+            policyVersion: rec.policyVersion(), scorer: scorer)
+        try? rec.queue.enqueue(log)
+        return log
     }
 
     func submitAnswer(_ plainText: String) -> ChatEngineUpdate {
@@ -91,6 +165,10 @@ final class DemoTutorEngine: ChatTutorEngine {
         // then back to answering the same question.
         if awaitingProbeReply {
             awaitingProbeReply = false
+            if let rec = recording, let recorder = sessionRecorder, !recordingEnded {
+                recorder.recordProbeReply(questionId: item.result.question.questionId,
+                                          at: rec.now())
+            }
             let progress = ChatProgress(totalQuestions: items.count,
                                         attemptedQuestions: attempted.count)
             return ChatEngineUpdate(
@@ -108,18 +186,43 @@ final class DemoTutorEngine: ChatTutorEngine {
         let progress = ChatProgress(totalQuestions: items.count, attemptedQuestions: attempted.count)
         lastAnswer = plainText
 
-        switch solver.checkAnswer(item.result.question, proposedAnswer: plainText) {
+        let verdict = solver.checkAnswer(item.result.question, proposedAnswer: plainText)
+        // Practice recording: one event date for the answer, the question
+        // end, and the next question start, so per-question timing has no
+        // invented gap. No error classification source exists on this
+        // branch, so errorType stays nil (never invented).
+        let eventDate: Date? = recording?.now()
+        if let rec = recording, let recorder = sessionRecorder,
+           !recordingEnded, let at = eventDate {
+            let genuine = !plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            recorder.recordAnswer(questionId: item.result.question.questionId,
+                                  correct: verdict == .correct, errorType: nil,
+                                  isRevision: isRevision, isGenuine: genuine, at: at)
+        }
+        switch verdict {
         case .correct:
             awaitingProbeReply = false
+            if let recorder = sessionRecorder, !recordingEnded, let at = eventDate,
+               recording != nil {
+                recorder.finishQuestion(questionId: item.result.question.questionId, at: at)
+            }
             index += 1
             lastAnswer = nil
             var turns: [ChatTurn] = [.tutor(nextMessage(
                 text: "Nice work. Let's try another one.", kind: .encouragement))]
             if let next = current {
+                if let recorder = sessionRecorder, !recordingEnded, let at = eventDate,
+                   recording != nil {
+                    recorder.startQuestion(questionId: next.result.question.questionId,
+                                           skill: next.result.question.skill, at: at)
+                }
                 turns.append(questionTurn(next))
                 return ChatEngineUpdate(turns: turns, progress: progress,
                                         composer: composer(for: next),
                                         submittedTurnIsRevision: isRevision)
+            }
+            if recording != nil, let at = eventDate {
+                _ = finishRecordingSession(at: at)
             }
             turns = [.tutor(nextMessage(
                 text: "Nice work. That was a good practice session.", kind: .encouragement))]
@@ -156,6 +259,9 @@ final class DemoTutorEngine: ChatTutorEngine {
         }
         guard let hint = item.ladder.requestHint() else {
             return ChatEngineUpdate()
+        }
+        if let rec = recording, let recorder = sessionRecorder, !recordingEnded {
+            recorder.recordHint(questionId: item.result.question.questionId, at: rec.now())
         }
         return ChatEngineUpdate(turns: [.tutor(hint.tutorMessage)])
     }
