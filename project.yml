@@ -14,11 +14,19 @@ targets:
       - EarnPlay
     dependencies:
       - package: EarnPlayCore
+    info:
+      path: EarnPlay/Info.plist
+      properties:
+        NSBonjourServices:
+          - _earnplay-sync._tcp
+          - _earnplay-sync._udp
     settings:
       base:
         PRODUCT_NAME: EarnPlay
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "EarnPlay syncs with the nearby parent/child app over Bluetooth and local peer-to-peer only. No account, server, or internet is used."
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "EarnPlay syncs policy and session logs with the nearby admin/child app over Bluetooth."
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchStoryboardName: ""
         SWIFT_VERSION: "5.0"
@@ -35,11 +43,19 @@ targets:
       - EarnPlayAdmin
     dependencies:
       - package: EarnPlayCore
+    info:
+      path: EarnPlayAdmin/Info.plist
+      properties:
+        NSBonjourServices:
+          - _earnplay-sync._tcp
+          - _earnplay-sync._udp
     settings:
       base:
         PRODUCT_NAME: EarnPlayAdmin
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.admin
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "EarnPlay syncs with the nearby parent/child app over Bluetooth and local peer-to-peer only. No account, server, or internet is used."
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "EarnPlay syncs policy and session logs with the nearby admin/child app over Bluetooth."
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchStoryboardName: ""
         SWIFT_VERSION: "5.0"

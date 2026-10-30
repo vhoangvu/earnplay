@@ -42,6 +42,8 @@ struct ContentView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Divider()
+                SyncDebugView()
+                Divider()
                 ReadAloudPreviewView()
                 Divider()
                 SimulatedShieldDemoView()

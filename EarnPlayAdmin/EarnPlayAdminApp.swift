@@ -1,16 +1,50 @@
 import SwiftUI
 import EarnPlayCore
 
+/// App-scope admin sync (finding 6): owned and started by the app,
+/// independently of the selected tab, and retained for the app's life.
+final class AdminSyncController {
+    let sessionStore = SessionLogStore()
+    let policyQueue = PolicyUpdateQueue()
+    // Round 4 (M7): persisted installation identity, pairing, and
+    // secret — the same device across relaunches.
+    let pairing = SyncPairingStore.loadOrCreateGate(displayName: "EarnPlay-Admin",
+                                                    key: "earnplay.pairing.admin.v1")
+    let transport: MultipeerSyncTransport
+    let service: AdminSyncService
+    private var started = false
+    init() {
+        transport = MultipeerSyncTransport(role: .browser, displayName: "EarnPlay-Admin", pairing: pairing)
+        service = AdminSyncService(policyQueue: policyQueue, sessionStore: sessionStore,
+                                   transport: transport, pairing: pairing)
+    }
+    func startIfNeeded() {
+        guard !started else { return }
+        started = true
+        service.start()
+    }
+    /// Reset/Unpair (round 4, M7): clears pairing + secret on both
+    /// the gate (persisted) and the live transport session.
+    func unpair() {
+        transport.unpair()
+        service.flushPending()
+    }
+}
+
 @main
 struct EarnPlayAdminApp: App {
+    @State private var syncController = AdminSyncController()
     var body: some Scene {
         WindowGroup {
             TabView {
-                PolicyEditorView()
+                PolicyEditorView(onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
+                SessionsView(controller: syncController)
+                    .tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
                 AdminVersionView()
                     .tabItem { Label("Version", systemImage: "info.circle") }
             }
+            .onAppear { syncController.startIfNeeded() }
         }
     }
 }
