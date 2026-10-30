@@ -18,19 +18,23 @@ import EarnPlayCore
 struct DashboardView: View {
     let controller: AdminSyncController
     @State private var report: Dashboard.Report
-    /// The `now` the cached report was computed against. Foreground and
-    /// significant-time-change reloads compare the current week to this
-    /// instant's week, so the comparison window always reflects the
-    /// current week without redundant recomputes inside one week.
+    /// The `now` and time zone the cached report was computed against.
+    /// Foreground reloads compare the current week and time zone to these,
+    /// so the comparison window always reflects the current week without
+    /// redundant recomputes when neither moved. Significant time changes
+    /// reload unconditionally (see below).
     @State private var lastReloadNow: Date
+    @State private var lastReloadTimeZone: TimeZone
     @Environment(\.scenePhase) private var scenePhase
 
     init(controller: AdminSyncController) {
         self.controller = controller
         let now = Date()
+        let calendar = Calendar.current
         _report = State(initialValue: Dashboard.compute(
-            logs: controller.sessionStore.allLogs, now: now))
+            logs: controller.sessionStore.allLogs, now: now, calendar: calendar))
         _lastReloadNow = State(initialValue: now)
+        _lastReloadTimeZone = State(initialValue: calendar.timeZone)
     }
 
     private static let shortDayFormatter: DateFormatter = {
@@ -77,16 +81,15 @@ struct DashboardView: View {
                 // Returning to the foreground never reruns .onAppear for
                 // an already-visible view, so a week boundary crossed
                 // while backgrounded would leave stale "This week"
-                // totals. Reload when the window moved; the Refresh
-                // button and sync-driven reload above are unchanged.
+                // totals. Reload when the window or time zone moved; the
+                // Refresh button and sync-driven reload above are unchanged.
                 if newPhase == .active { reloadIfWeekChanged() }
             }
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.significantTimeChangeNotification)
             ) { _ in
-                // Midnight rollover, time-zone/DST shifts, and carrier
-                // time updates while open: same week-boundary reload.
-                reloadIfWeekChanged()
+                // Time-zone changes can move session buckets even when both reload instants fall in the same calendar week.
+                reload()
             }
         }
     }
@@ -96,16 +99,22 @@ struct DashboardView: View {
     }
 
     private func reload(now: Date) {
+        let calendar = Calendar.current
         lastReloadNow = now
-        report = Dashboard.compute(logs: controller.sessionStore.allLogs, now: now)
+        lastReloadTimeZone = calendar.timeZone
+        report = Dashboard.compute(logs: controller.sessionStore.allLogs, now: now, calendar: calendar)
     }
 
-    /// Foreground/time-change path: one `now` feeds both the window check
-    /// and the recompute, so a boundary crossed mid-call cannot strand a
-    /// half-updated report. No-ops inside the current week.
+    /// Foreground path: one `now` feeds both the window check and the
+    /// recompute, so a boundary crossed mid-call cannot strand a
+    /// half-updated report. No-ops when neither the week nor the time
+    /// zone moved.
     private func reloadIfWeekChanged() {
         let now = Date()
-        guard Dashboard.comparisonWindowChanged(since: lastReloadNow, now: now) else { return }
+        let calendar = Calendar.current
+        guard Dashboard.reloadNeeded(since: lastReloadNow, previousTimeZone: lastReloadTimeZone,
+                                     now: now, currentTimeZone: calendar.timeZone,
+                                     calendar: calendar) else { return }
         reload(now: now)
     }
 

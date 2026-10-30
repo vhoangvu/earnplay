@@ -264,6 +264,31 @@ public enum Dashboard {
         return previousWeek.start != currentWeek.start
     }
 
+    /// Whether the Progress view should reload its cached report (fix
+    /// round 4: the timezone-aware foreground reload seam). True when the
+    /// comparison window moved under `calendar` OR when the time zone
+    /// changed between reloads — a zone change can move session buckets
+    /// even when both instants fall in the same new-calendar week, which
+    /// the week-only check above cannot see. A zone identifier change
+    /// (travel) or an offset change under the same identifier (DST)
+    /// both read true. Same week plus same zone reads false, preserving
+    /// the no-reload optimization. Pure in its inputs.
+    public static func reloadNeeded(since previousNow: Date, previousTimeZone: TimeZone,
+                                    now: Date, currentTimeZone: TimeZone,
+                                    calendar: Calendar = .current) -> Bool {
+        if timeZoneChanged(previous: previousTimeZone, previousNow: previousNow,
+                           current: currentTimeZone, now: now) {
+            return true
+        }
+        return comparisonWindowChanged(since: previousNow, now: now, calendar: calendar)
+    }
+
+    private static func timeZoneChanged(previous: TimeZone, previousNow: Date,
+                                        current: TimeZone, now: Date) -> Bool {
+        if previous.identifier != current.identifier { return true }
+        return previous.secondsFromGMT(for: previousNow) != current.secondsFromGMT(for: now)
+    }
+
     // MARK: - Report
 
     /// Computes all six aggregates over `logs` (typically
