@@ -75,6 +75,18 @@ protocol ChatTutorEngine: AnyObject {
     func startSession() -> ChatEngineUpdate
     func submitAnswer(_ plainText: String) -> ChatEngineUpdate
     func requestHint() -> ChatEngineUpdate
+    /// Ends the active session (the practice view disappeared): the
+    /// engine finalizes any unfinished recording. Default is a no-op.
+    func endSession()
+    /// Composer activity (a keystroke, number-pad tap, or draft edit):
+    /// the engine records a timing anchor on the current question, never
+    /// an attempt or hint count. Default is a no-op.
+    func recordComposerActivity()
+}
+
+extension ChatTutorEngine {
+    func endSession() {}
+    func recordComposerActivity() {}
 }
 
 // MARK: - Untrusted child input
@@ -119,7 +131,13 @@ final class ChatConversationViewModel: ObservableObject {
     @Published private(set) var messages: [ChatTurn] = []
     @Published private(set) var progress = ChatProgress()
     @Published private(set) var composer: ChatComposerSpec = .text
-    @Published var draft = ""
+    /// Every mutation (typing, number-pad taps, backspace, the
+    /// submit clear) is composer activity: forwarded to the engine as a
+    /// timing anchor. The submit clear coincides with the submission's
+    /// own anchor, so it adds no time.
+    @Published var draft = "" {
+        didSet { engine.recordComposerActivity() }
+    }
     /// Mirrors `speech.isVoiceUnavailable` so the thread can show a
     /// plain notice when no bundled voice is available.
     @Published private(set) var isVoiceUnavailable = false
@@ -256,7 +274,10 @@ final class ChatConversationViewModel: ObservableObject {
         apply(ChatEngineUpdate(turns: turns, progress: progress, composer: composer))
     }
 
+    /// The practice view disappeared: end the engine session (it
+    /// finalizes any unfinished recording) and stop any reading.
     func handleDisappeared() {
+        engine.endSession()
         speech.handleViewDisappeared()
     }
 }

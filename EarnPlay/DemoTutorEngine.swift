@@ -31,6 +31,11 @@ struct PracticeRecordingDependencies {
     var makeScorer: () -> EffortScorer
     var policyVersion: () -> Int
     var now: () -> Date
+    /// Fired after a session log is durably enqueued (issue #63 fix 3).
+    /// Production wires this to the shared sync service's
+    /// `notifySessionEnqueued()` so delivery does not depend on any view;
+    /// nil (tests, recording-only use) keeps enqueue-only behavior.
+    var onSessionEnqueued: (() -> Void)? = nil
 
     /// Production wiring: real on-device logger/queue/policy, one scorer
     /// draw per session, UUID session ids, live clock. Used only by the
@@ -41,10 +46,12 @@ struct PracticeRecordingDependencies {
         policyVersion: @escaping () -> Int = { PolicyStore().storedVersion },
         makeScorer: @escaping () -> EffortScorer = { EffortScorer() },
         makeSessionId: @escaping () -> String = { UUID().uuidString },
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        onSessionEnqueued: (() -> Void)? = nil
     ) -> Self {
         Self(makeSessionId: makeSessionId, logger: logger, queue: queue,
-             makeScorer: makeScorer, policyVersion: policyVersion, now: now)
+             makeScorer: makeScorer, policyVersion: policyVersion, now: now,
+             onSessionEnqueued: onSessionEnqueued)
     }
 }
 
@@ -71,6 +78,10 @@ final class DemoTutorEngine: ChatTutorEngine {
     private var sessionRecorder: PracticeSessionRecorder?
     private var sessionScorer: EffortScorer?
     private var recordingEnded = false
+    /// Finalized log awaiting a durable enqueue. Set on the first finish
+    /// attempt and cleared only after the enqueue succeeds, so a retry
+    /// enqueues THAT log (original records/effort/endedAt, no recompute).
+    private var pendingFinishedLog: SessionLog?
 
     /// Active recording session id, for tests. Nil when recording is
     /// disabled or no session has started.
@@ -102,6 +113,13 @@ final class DemoTutorEngine: ChatTutorEngine {
         // Restart after completion: reset the session state and
         // serve the first question again with fresh hint ladders.
         if current == nil && !items.isEmpty {
+            // A new practice run starts here: finalize a prior
+            // unfinished recording first. Normally already durable
+            // (a no-op); otherwise this retries the failed completion
+            // enqueue under Fix 4 semantics (retained log, original
+            // endedAt). If it fails again the old session is kept and
+            // stays retryable rather than orphaned.
+            _ = finishRecordingSession()
             index = 0
             attempted = []
             lastAnswer = nil
@@ -132,23 +150,67 @@ final class DemoTutorEngine: ChatTutorEngine {
             composer: composer(for: item))
     }
 
+    /// Ends the active session through the chat engine boundary (view
+    /// disappearance): finalizes any unfinished recording session via the
+    /// retryable finish below. Partially practised sessions keep the last
+    /// solver verdict per question; sessions with no graded answers
+    /// produce no records and nil effort. No-op when recording is
+    /// disabled, no session is active, or the session already finished.
+    func endSession() {
+        _ = finishRecordingSession()
+    }
+
+    /// Composer activity (typing, number-pad taps, draft edits): a timing
+    /// anchor on the current question via `recordInteraction` — question
+    /// timing plus session active time, never attempt/hint counts.
+    /// No-op when recording is disabled, no session is active, no
+    /// question is current, or the session already finished. Unthrottled:
+    /// one `Date` per keystroke is trivially bounded, and any throttle
+    /// would cost timing accuracy.
+    func recordComposerActivity() {
+        guard let rec = recording, let recorder = sessionRecorder,
+              !recordingEnded, let item = current else { return }
+        recorder.recordInteraction(questionId: item.result.question.questionId, at: rec.now())
+    }
+
     /// Finishes the active recording session (if any) and enqueues its
     /// `SessionLog` in the T4.6 queue. Called automatically when the last
-    /// question is answered correctly; tests call it directly to finish
-    /// incomplete sessions (e.g. with a final incorrect answer). Returns
+    /// question is answered correctly, when the session ends early
+    /// (`endSession`), and when a new run starts over an unfinished
+    /// session; tests call it directly to finish incomplete sessions
+    /// (e.g. with a final incorrect answer). Returns
     /// the enqueued log, or nil when recording is disabled, no session is
-    /// active, or the session already finished. Never invents detail:
+    /// active, or the session already finished. A failed enqueue also
+    /// returns nil, but the finalized log is retained and the session stays
+    /// retryable: a later finish enqueues THAT log (original
+    /// records/effort/endedAt, no recompute). Never invents detail:
     /// unanswered questions produce no records and unscored sessions carry
     /// nil effort.
     @discardableResult
     func finishRecordingSession(at date: Date? = nil) -> SessionLog? {
         guard let rec = recording, let recorder = sessionRecorder,
               let scorer = sessionScorer, !recordingEnded else { return nil }
+        // Finalize once: a retry reuses the retained log instead of
+        // recomputing it (a recompute would shift endedAt and re-end
+        // questions at the later date).
+        let log: SessionLog
+        if let pending = pendingFinishedLog {
+            log = pending
+        } else {
+            log = recorder.makeSessionLog(
+                endedAt: date ?? rec.now(), logger: rec.logger,
+                policyVersion: rec.policyVersion(), scorer: scorer)
+            pendingFinishedLog = log
+        }
+        do {
+            try rec.queue.enqueue(log)
+        } catch {
+            return nil
+        }
         recordingEnded = true
-        let log = recorder.makeSessionLog(
-            endedAt: date ?? rec.now(), logger: rec.logger,
-            policyVersion: rec.policyVersion(), scorer: scorer)
-        try? rec.queue.enqueue(log)
+        pendingFinishedLog = nil
+        // Durable now: kick delivery (the service does not poll).
+        rec.onSessionEnqueued?()
         return log
     }
 
@@ -166,8 +228,15 @@ final class DemoTutorEngine: ChatTutorEngine {
         if awaitingProbeReply {
             awaitingProbeReply = false
             if let rec = recording, let recorder = sessionRecorder, !recordingEnded {
-                recorder.recordProbeReply(questionId: item.result.question.questionId,
-                                          at: rec.now())
+                // Only a substantive explanation scores follow-up +
+                // explanation effort; anything else is a timing anchor.
+                if StallingDetector().isSubstantiveReply(plainText) {
+                    recorder.recordProbeReply(questionId: item.result.question.questionId,
+                                              at: rec.now())
+                } else {
+                    recorder.recordInteraction(questionId: item.result.question.questionId,
+                                               at: rec.now())
+                }
             }
             let progress = ChatProgress(totalQuestions: items.count,
                                         attemptedQuestions: attempted.count)
