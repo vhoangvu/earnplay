@@ -118,24 +118,43 @@ public enum TutorPrompt {
         guard all.count >= closing.count,
               Array(all.suffix(closing.count)) == closing else { return nil }
         let payloadEnd = all.count - closing.count
-        // The real section is the first begin candidate whose payload is
-        // exactly the escaped form of its decoding. A marker echoed in
-        // session context cannot qualify: its candidate payload contains
-        // the real begin marker raw, which re-escaping would prefix.
-        // Escaped markers inside the payload are never reached because
-        // the real begin precedes them.
-        for start in beginStarts {
-            let afterBegin = start + beginScalars.count
-            guard afterBegin < all.count, all[afterBegin] == "\n" else { continue }
-            let payloadStart = afterBegin + 1
-            guard payloadStart <= payloadEnd else { continue }
-            let payload = String(String.UnicodeScalarView(all[payloadStart..<payloadEnd]))
-            if let decoded = unescapedChildInput(payload),
-               escapedChildInput(decoded) == payload {
-                return decoded
+        // The real section is unambiguously framed: `assemble` joins
+        // sections with a blank line, so the real begin is the first
+        // begin marker anchored at a section boundary (start of the
+        // string or immediately after "\n\n"). A marker echoed inline
+        // in session context is not boundary-anchored and is never a
+        // candidate; escaped markers inside the payload are preceded
+        // by a backslash, so they are not boundary-anchored either.
+        // Only that first boundary candidate is tried — never retry
+        // candidates inside its payload: a payload that still holds an
+        // unescaped begin marker (or otherwise fails the escaping
+        // round-trip) is malformed and rejected wholesale, instead of
+        // silently truncating to the text after a nested marker.
+        let boundaryStarts = beginStarts.filter { start in
+            start == 0
+                || (start >= 2 && all[start - 2] == "\n" && all[start - 1] == "\n")
+        }
+        guard let start = boundaryStarts.first else { return nil }
+        let afterBegin = start + beginScalars.count
+        guard afterBegin < all.count, all[afterBegin] == "\n" else { return nil }
+        let payloadStart = afterBegin + 1
+        guard payloadStart <= payloadEnd else { return nil }
+        let payloadScalars = Array(all[payloadStart..<payloadEnd])
+        // An unescaped begin marker inside the payload means the
+        // enclosure is malformed (a well-formed payload escapes it
+        // with a leading backslash). Reject, do not re-anchor inside.
+        if payloadScalars.count >= beginScalars.count {
+            for offset in 0...(payloadScalars.count - beginScalars.count)
+            where Array(payloadScalars[offset..<(offset + beginScalars.count)]) == beginScalars {
+                if offset == 0 || payloadScalars[offset - 1] != "\\" {
+                    return nil
+                }
             }
         }
-        return nil
+        let payload = String(String.UnicodeScalarView(payloadScalars))
+        guard let decoded = unescapedChildInput(payload),
+              escapedChildInput(decoded) == payload else { return nil }
+        return decoded
     }
 
     /// True when an assembled call's data section provably encloses
