@@ -270,8 +270,12 @@ public final class ModelRuntime: @unchecked Sendable {
     }
 
     /// Resolves the spike model location: `$EARNPLAY_MODEL_PATH`, else
-    /// `Documents/EarnPlayModel.gguf` (manual device installs), else the
-    /// cache directory written by `Scripts/setup-model-spike.sh`.
+    /// the first-launch download in Application Support (issue #53),
+    /// else `Documents/EarnPlayModel.gguf` (manual device installs),
+    /// else the cache directory written by
+    /// `Scripts/setup-model-spike.sh`. The pre-existing
+    /// `$EARNPLAY_MODEL_PATH` / Documents / script-cache relative order
+    /// is unchanged for local/demo builds.
     public static func defaultModelURL(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
@@ -282,6 +286,12 @@ public final class ModelRuntime: @unchecked Sendable {
             if let override = environment[key], !override.isEmpty {
                 return URL(fileURLWithPath: override)
             }
+        }
+        // Production first-launch download (Application Support, never
+        // Caches — iOS can purge Caches under storage pressure).
+        let downloaded = ModelDownloader.defaultDestinationURL(fileManager: fileManager)
+        if fileManager.fileExists(atPath: downloaded.path) {
+            return downloaded
         }
         let fileName = "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
         if let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first {

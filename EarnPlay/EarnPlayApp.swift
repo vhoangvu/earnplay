@@ -11,17 +11,27 @@ struct EarnPlayApp: App {
 }
 
 struct ContentView: View {
+    @StateObject private var downloadModel = ModelDownloadViewModel()
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
 
     var body: some View {
-        if setup.step == .complete, !setup.summaryDismissed {
-            SetupCompleteView(viewModel: setup)
-        } else if setup.step == .complete {
-            // Main practice screen (T1.8): the chat conversation.
-            // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
-            ChatConversationView(engine: DemoTutorEngine())
-        } else {
-            SetupFlowView(viewModel: setup)
+        Group {
+            if downloadModel.isReady {
+                if setup.step == .complete, !setup.summaryDismissed {
+                    SetupCompleteView(viewModel: setup)
+                } else if setup.step == .complete {
+                    // Main practice screen (T1.8): the chat conversation.
+                    // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
+                    ChatConversationView(engine: DemoTutorEngine())
+                } else {
+                    SetupFlowView(viewModel: setup)
+                }
+            } else {
+                ModelDownloadView(viewModel: downloadModel)
+            }
+        }
+        .task {
+            downloadModel.refreshIfNeeded()
         }
     }
 
@@ -36,13 +46,21 @@ struct ContentView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Divider()
+                SyncDebugView()
+                Divider()
                 ReadAloudPreviewView()
+                Divider()
+                SimulatedShieldDemoView()
                 Divider()
                 StallProbePreviewView()
                 Divider()
                 SpikeView()
                 Divider()
+                ChoreTradeView()
+                Divider()
                 MovementTradePreviewView()
+                Divider()
+                AboutView()
             }
             .padding()
         }

@@ -11,6 +11,9 @@ import EarnPlayCore
 /// persists the admin's copy, and queues the `PolicyUpdate` for T4.6
 /// sync; the version line shows the increment immediately.
 struct PolicyEditorView: View {
+    /// Finding 7: invoked after a successful save so the app-scope
+    /// sync service flushes the queued policy immediately.
+    var onPolicySaved: (() -> Void)? = nil
     @State private var store = PolicyStore()
     @State private var queue = PolicyUpdateQueue()
     @State private var state = PolicyEditorState()
@@ -252,6 +255,7 @@ struct PolicyEditorView: View {
 
     private func save() {
         state.save(adminStore: store, queue: queue)
+        if state.errorText.isEmpty { onPolicySaved?() }
     }
 }
 
