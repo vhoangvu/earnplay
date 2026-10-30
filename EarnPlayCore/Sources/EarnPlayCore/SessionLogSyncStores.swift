@@ -51,6 +51,11 @@ public enum SessionLogStoreResult: Equatable, Sendable { case stored, duplicate,
 /// Idempotent by sessionId — the exactly-once anchor.
 public final class SessionLogStore: @unchecked Sendable {
     public static let fileName = "received-session-logs.json"
+    /// Posted (object: the store) after a new log persists via `storeResult`.
+    /// Duplicates and failures post nothing. The admin Progress view observes
+    /// this to refresh its aggregates when a sync lands while open (T4.2 fix
+    /// round 2, item 3); posted after the lock releases so observers can read.
+    public static let didChangeNotification = Notification.Name("earnplay.SessionLogStore.didChange")
     private let directory: URL; private let lock = NSLock()
     private let dataWriter: (Data, URL) throws -> Void
     private var items: [SessionLog]
@@ -61,17 +66,28 @@ public final class SessionLogStore: @unchecked Sendable {
     }
     public convenience init() { self.init(directory: PolicyStore.defaultDirectory()) }
     public func storeResult(_ log: SessionLog) -> SessionLogStoreResult {
-        lock.lock(); defer { lock.unlock() }
+        let result: SessionLogStoreResult
+        lock.lock()
         items = Self.load(directory: directory) ?? items
-        guard !items.contains(where: { $0.sessionId == log.sessionId }) else { return .duplicate }
-        items.append(log)
-        do { try persist() } catch {
-            // Roll back any unpersisted cache change (finding 3).
-            if let reloaded = Self.load(directory: directory) { items = reloaded }
-            else { items.removeAll { $0.sessionId == log.sessionId } }
-            return .failed
+        if items.contains(where: { $0.sessionId == log.sessionId }) {
+            result = .duplicate
+        } else {
+            items.append(log)
+            do {
+                try persist()
+                result = .stored
+            } catch {
+                // Roll back any unpersisted cache change (finding 3).
+                if let reloaded = Self.load(directory: directory) { items = reloaded }
+                else { items.removeAll { $0.sessionId == log.sessionId } }
+                result = .failed
+            }
         }
-        return .stored
+        lock.unlock()
+        if result == .stored {
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
+        }
+        return result
     }
     @discardableResult
     public func store(_ log: SessionLog) -> Bool { storeResult(log) == .stored }

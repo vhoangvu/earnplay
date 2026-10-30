@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import EarnPlayCore
 
@@ -56,6 +57,14 @@ struct DashboardView: View {
                 }
             }
             .onAppear { reload() }
+            .onReceive(NotificationCenter.default.publisher(
+                for: SessionLogStore.didChangeNotification)
+            ) { _ in
+                // A sync landing while open refreshes automatically; the
+                // manual Refresh button stays for on-demand reloads.
+                // Posted off-main by the sync path, so hop to main.
+                DispatchQueue.main.async { reload() }
+            }
         }
     }
 

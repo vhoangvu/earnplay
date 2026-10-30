@@ -34,6 +34,24 @@ public struct SessionQuestionRecord: Codable, Equatable, Sendable {
             self.errorType = trimmed.isEmpty ? nil : trimmed
         }
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case questionId, skill, correct, activeMs, hintsUsed, errorType
+    }
+
+    /// Decodes the unchanged wire format, then normalizes through the
+    /// memberwise initializer so decoded records satisfy the same
+    /// invariants as constructed ones (T4.2 fix round 2, item 4).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            questionId: try c.decode(String.self, forKey: .questionId),
+            skill: try c.decode(String.self, forKey: .skill),
+            correct: try c.decode(Bool.self, forKey: .correct),
+            activeMs: try c.decode(Int.self, forKey: .activeMs),
+            hintsUsed: try c.decode(Int.self, forKey: .hintsUsed),
+            errorType: try c.decodeIfPresent(String.self, forKey: .errorType))
+    }
 }
 
 /// Effort outcome snapshot for one session (T4.2 trend input).
