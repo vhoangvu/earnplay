@@ -20,10 +20,18 @@ no commits, no PRs, no merges, no code edits from the review session.
 
 ## 1. Runner and timing
 
-- Runner: Vu, manually, in an interactive Muse Code session (any
-  capable model is fine for this review; unlike the security review,
-  there is no model requirement here). The assistant can also run it
-  on request, but the submission itself is always Vu's step.
+- Runner: Vu, manually, in an interactive Muse Code session. This
+  review is manual for the same reason as the security review: Vu
+  wants it run on Wonder Full, and Wonder Full is subscription-only
+  with no published Model API id, so the assistant's API-key agent
+  runs cannot select it. Only an interactive session signed in with
+  the purchasing account can.
+- Model rule: confirm the current model before starting (§2). If Vu
+  has not explicitly overridden the model, Wonder Full is the model.
+  If Vu explicitly overrides to a different model for a run, use that
+  model, record the override in the report header, and label the
+  report with the actual model used. The assistant can also run this
+  review on request, but the submission itself is always Vu's step.
 - Target: the shipping candidate, AFTER the remaining M2 code merges,
   BEFORE App Store submission. The submission window targets
   Oct 31–Nov 2, ahead of the Nov 4 hackathon submission.
@@ -48,6 +56,12 @@ waits. Do not file them as code findings.
 - Clean tree: only the 2 generated Info.plists may be dirty.
   Record `git rev-parse HEAD` and the branch. That commit is the
   review target; findings cite it.
+- Confirm the current model: in Muse Code, open `/model` and confirm
+  it shows Wonder Full before starting, unless Vu explicitly
+  overrode the model for this run (then record the override and
+  label the report with the actual model used). If Wonder Full does
+  not appear and there is no explicit override, stop and fix sign-in
+  first; do not substitute another model silently.
 - Static review only: read code, project files, and strings. Do not
   run the app, do not modify code. If the model starts editing,
   stop, `git revert` / discard, note it, and re-run the affected
@@ -318,6 +332,11 @@ before triage.
 
 - Wrong target (dirty tree beyond the 2 Info.plists, or the commit
   is not the shipping candidate): stop and re-establish the target.
+- Wrong model: if the session is not on Wonder Full and Vu has not
+  explicitly overridden the model for this run, stop and fix sign-in
+  first; do not substitute another model silently. An explicit
+  override is recorded in the report header and the report is labeled
+  with the actual model used.
 - Model starts editing code: stop, discard the edits, note it, and
   re-run the affected areas read-only.
 - Model asserts App Store Connect values it cannot see: stop that

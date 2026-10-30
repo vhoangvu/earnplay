@@ -11,12 +11,21 @@ be invoked by an agent run (see §1).
 
 ## 1. Why this run is manual
 
-- Wonder Full is subscription-only and has no published Model API id, so
-  the assistant's SSH-driven agent runs (which authenticate with
-  `META_API_KEY`) cannot select it.
+This review is manual because Vu wants it run on Wonder Full, the
+strongest available model. Wonder Full is subscription-only and has
+no published Model API id, so the assistant's SSH-driven agent runs
+(which authenticate with `META_API_KEY`) cannot select it — an agent
+run cannot do this review on Wonder Full at all.
 - Only an interactive Muse Code session signed in with the purchasing
   account can use it. Run this SOP in such a session (`/model` picker),
   not through the assistant's build loop.
+- Model rule: confirm the current model before starting (§3 step 3).
+  If Vu has not explicitly overridden the model, Wonder Full is the
+  model — do not substitute another one and keep the Wonder Full
+  label. If Vu explicitly overrides to a different model for a run,
+  use that model, record the override in the report header, and label
+  the report with the actual model used (it is then not a "Wonder
+  Full review").
 - This review sits OUTSIDE the auto-proceed build loop: it makes no
   commits, opens no PRs, and merges nothing. Findings come back to the
   assistant for triage, and real fixes go through the normal loop
@@ -44,7 +53,9 @@ be invoked by an agent run (see §1).
    Confirm the picker shows Wonder Full before pasting the prompt. If it
    does not appear, the session is not signed in with the purchasing
    account — stop and fix sign-in first; do not substitute another model
-   and call it the Wonder Full review.
+   and call it the Wonder Full review, unless Vu has explicitly
+   overridden the model for this run (then record the override in the
+   report header and label the report with the actual model used).
 4. Do NOT install anything, do NOT change code, do NOT run the app.
    This is a static review. Dynamic/on-device testing is a separate
    step (T7.5) and is out of scope here.
@@ -253,7 +264,9 @@ the moved areas.
 ## 8. Stop conditions
 
 - Stop and report if the session is not on Wonder Full (wrong model
-  invalidates the "Wonder Full review" label).
+  invalidates the "Wonder Full review" label), unless Vu explicitly
+  overrode the model for this run — then record the override and label
+  the report with the actual model used.
 - Stop and report if the tree is dirty beyond the two generated
   Info.plists, or if the target commit cannot be established.
 - Stop and report if the model starts editing files: revert with git,
