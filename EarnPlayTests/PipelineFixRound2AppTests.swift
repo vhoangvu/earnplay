@@ -133,7 +133,8 @@ final class PipelineRound2Item2Tests: XCTestCase {
             displayName: "EarnPlay-Child", defaults: defaults, key: "test-key")
         let controller = ChildSyncController(
             policyStore: PolicyStore(directory: tempDir("store")),
-            sessionQueue: queue, pairing: gate)
+            sessionQueue: queue, pairing: gate,
+            retentionDirectory: tempDir("retention"))
         var deliveryCount = 0
         controller.onSessionEnqueued = { deliveryCount += 1 }
 

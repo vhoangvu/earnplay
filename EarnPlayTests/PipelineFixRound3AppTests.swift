@@ -156,7 +156,8 @@ final class PipelineRound3Item1bTests: XCTestCase {
             displayName: "EarnPlay-Child", defaults: defaults, key: "test-key")
         let controller = ChildSyncController(
             policyStore: PolicyStore(directory: tempDir("store")),
-            sessionQueue: queue, pairing: gate)
+            sessionQueue: queue, pairing: gate,
+            retentionDirectory: tempDir("retention"))
         let ids = IdSequence(["r3-1b-1", "r3-1b-2"])
         let deps = PracticeRecordingDependencies(
             makeSessionId: { ids.next() },
