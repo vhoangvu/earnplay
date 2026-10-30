@@ -97,8 +97,8 @@ public enum AuditorScoreFreeText {
     public static func make(_ text: String) -> String {
         var out = text
         out = replace(#"(?i)score\s+\d+\s+vs\s+threshold\s+\d+"#, in: out, with: "recorded effort compared with the recorded bar")
-        out = replace(#"(?i)effortTotal:?\s*\d+"#, in: out, with: "effortTotal (recorded)")
-        out = replace(#"(?i)effortBar:?\s*\d+"#, in: out, with: "effortBar (recorded)")
+        out = replace(#"(?i)effortTotal:?\s*(?:is\s+)?\d+"#, in: out, with: "effortTotal (recorded)")
+        out = replace(#"(?i)effortBar:?\s*(?:is\s+)?\d+"#, in: out, with: "effortBar (recorded)")
         out = replace(#"(?i)score\s+\d+"#, in: out, with: "recorded effort")
         out = replace(#"(?i)threshold\s+\d+"#, in: out, with: "recorded bar")
         return out
@@ -106,6 +106,36 @@ public enum AuditorScoreFreeText {
     private static func replace(_ pattern: String, in text: String, with template: String) -> String {
         guard let re = try? NSRegularExpression(pattern: pattern) else { return text }
         return re.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: template)
+    }
+}
+
+/// Serializes auditor runs (round 2, item 1): a run requested while
+/// another is in flight is skipped instead of overlapping it.
+public final class AuditRunGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = false
+    public init() {}
+    public var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
+    /// Marks a run in flight and returns true, or returns false when
+    /// a run is already in flight.
+    public func tryBegin() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if running { return false }
+        running = true
+        return true
+    }
+    public func end() { lock.lock(); running = false; lock.unlock() }
+}
+
+/// Completion text for an auditor run (round 2, item 2): success is
+/// reported only when the findings write persisted; a persistence
+/// failure is reported with a retry prompt instead.
+public enum AuditorRunStatus {
+    public static func completionMessage(openCount: Int, persistenceError: String?) -> String {
+        if let persistenceError, !persistenceError.isEmpty {
+            return "Could not save the findings (\(persistenceError)). The previous findings are still shown — run the auditor again to retry."
+        }
+        return "Auditor run complete. \(openCount) open finding(s)."
     }
 }
 
@@ -399,17 +429,33 @@ public struct AuditorEngine: Sendable {
     }
 
     // Check 1: leniency drift — grants on progressively weaker evidence.
+    // Each maximal non-increasing streak is evaluated independently
+    // (round 2, item 4): a later drift flags even when an earlier
+    // grant breaks the global sequence.
     private func checkLeniencyDrift(_ sessions: [AuditorSessionExcerpt]) -> [AuditFlag] {
         let grants = sessions.filter { $0.wasGranted && $0.effortTotal != nil }
-        guard grants.count >= 3, let first = grants.first, let last = grants.last,
-              let firstTotal = first.effortTotal, let lastTotal = last.effortTotal,
-              lastTotal <= firstTotal - 4 else { return [] }
-        let totals = grants.compactMap { $0.effortTotal }
-        let falling = zip(totals, totals.dropFirst()).allSatisfy { $0.1 <= $0.0 }
-        guard falling else { return [] }
-        return [flag(.leniencyDrift, .watch, session: last,
-            evidence: "Granted sessions in order: " + grants.map { "\($0.sessionId) effortTotal \($0.effortTotal ?? 0)" }.joined(separator: ", ") + ". The latest grant rests on weaker evidence than the first.",
-            action: "Open the latest session excerpt and review whether the unlock settings still reflect the effort you want to see.")]
+        guard grants.count >= 3 else { return [] }
+        var runs: [[AuditorSessionExcerpt]] = []
+        for grant in grants {
+            if let prev = runs.last?.last, let prevTotal = prev.effortTotal,
+               let total = grant.effortTotal, total > prevTotal {
+                runs.append([grant])
+            } else if runs.isEmpty {
+                runs.append([grant])
+            } else {
+                runs[runs.count - 1].append(grant)
+            }
+        }
+        var out: [AuditFlag] = []
+        for run in runs where run.count >= 3 {
+            guard let first = run.first, let last = run.last,
+                  let firstTotal = first.effortTotal, let lastTotal = last.effortTotal,
+                  lastTotal <= firstTotal - 4 else { continue }
+            out.append(flag(.leniencyDrift, .watch, session: last,
+                evidence: "Granted sessions in order: " + run.map { "\($0.sessionId) effortTotal \($0.effortTotal ?? 0)" }.joined(separator: ", ") + ". The latest grant rests on weaker evidence than the first.",
+                action: "Open the latest session excerpt and review whether the unlock settings still reflect the effort you want to see."))
+        }
+        return out
     }
 
     // Check 3: gaming patterns — repeated minimal-work grants (act when repeated).
@@ -454,19 +500,26 @@ public struct AuditorEngine: Sendable {
         }
     }
 
-    // Check 5: behavior shifts versus the child's own history.
+    // Check 5: behavior shifts versus the child's own history. Every
+    // session from the fourth onward is evaluated against its own
+    // preceding history (round 2, item 5), not only the last session.
     private func checkBehaviorShifts(_ sessions: [AuditorSessionExcerpt]) -> [AuditFlag] {
-        guard sessions.count >= 4, let latest = sessions.last else { return [] }
-        let prior = sessions.dropLast()
-        guard let latestSignals = latest.signals,
-              prior.allSatisfy({ $0.signals != nil }) else { return [] }
-        let priorAttempts = prior.map { Double($0.signals?.genuineAttempts ?? 0) }
-        let meanAttempts = priorAttempts.reduce(0, +) / Double(priorAttempts.count)
-        guard meanAttempts >= 3,
-              Double(latestSignals.genuineAttempts) <= meanAttempts * 0.25 else { return [] }
-        return [flag(.behaviorShift, .info, session: latest,
-            evidence: "Session \(latest.sessionId): genuineAttempts \(latestSignals.genuineAttempts), activeSeconds \(latestSignals.activeSeconds). Prior sessions \(prior.map(\.sessionId).joined(separator: ", ")) recorded genuineAttempts \(prior.map { String($0.signals?.genuineAttempts ?? 0) }.joined(separator: ", ")).",
-            action: "Open the latest session excerpt to see what changed, and talk with your child about how practice is going.")]
+        guard sessions.count >= 4 else { return [] }
+        var out: [AuditFlag] = []
+        for index in 3..<sessions.count {
+            let latest = sessions[index]
+            let prior = Array(sessions[..<index])
+            guard let latestSignals = latest.signals,
+                  prior.allSatisfy({ $0.signals != nil }) else { continue }
+            let priorAttempts = prior.map { Double($0.signals?.genuineAttempts ?? 0) }
+            let meanAttempts = priorAttempts.reduce(0, +) / Double(priorAttempts.count)
+            guard meanAttempts >= 3,
+                  Double(latestSignals.genuineAttempts) <= meanAttempts * 0.25 else { continue }
+            out.append(flag(.behaviorShift, .info, session: latest,
+                evidence: "Session \(latest.sessionId): genuineAttempts \(latestSignals.genuineAttempts), activeSeconds \(latestSignals.activeSeconds). Prior sessions \(prior.map(\.sessionId).joined(separator: ", ")) recorded genuineAttempts \(prior.map { String($0.signals?.genuineAttempts ?? 0) }.joined(separator: ", ")).",
+                action: "Open the latest session excerpt to see what changed, and talk with your child about how practice is going."))
+        }
+        return out
     }
 
     // Check 6: inconsistency — similar evidence, different decisions.
@@ -550,7 +603,13 @@ public final class AuditFlagManager: @unchecked Sendable {
         flags = Self.deduped(Self.load(directory: directory) ?? flags)
         let resolved = flags.filter { $0.status != .open }
         let resolvedIds = Set(resolved.map(\.flagId))
-        flags = Self.deduped(resolved + Self.deduped(newFlags).filter { !resolvedIds.contains($0.flagId) })
+        // Round 2, item 6: previously open findings are preserved
+        // alongside resolved and new flags. A finding leaves the open
+        // list only by parent dismiss/act, never by silent omission
+        // from a later run.
+        let previouslyOpen = flags.filter { $0.status == .open }
+        flags = Self.deduped(resolved + previouslyOpen
+            + Self.deduped(newFlags).filter { !resolvedIds.contains($0.flagId) })
         do { try persistLocked(); lastPersistenceError = nil; return true }
         catch { flags = previous; lastPersistenceError = String(describing: error); return false }
     }

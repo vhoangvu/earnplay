@@ -11,17 +11,29 @@ final class AdminAuditorController: ObservableObject {
     lazy var engine = AuditorEngine(runtime: runtime)
     let flagManager = AuditFlagManager()
     private let sessionStore: SessionLogStore
+    private let runGate = AuditRunGate()
     @Published private(set) var openFlags: [AuditFlag] = []
 
     init(sessionStore: SessionLogStore) {
         self.sessionStore = sessionStore
     }
 
-    /// Runs at sync time and on demand from the Auditor tab.
+    /// Runs at sync time and on demand from the Auditor tab. The
+    /// production transport invokes this from its MCSession delegate
+    /// callback, off the main queue, so the work hops to the main
+    /// queue before touching @Published state, and a run requested
+    /// while another is in flight is skipped (round 2, item 1).
     func runAudit() {
-        let excerpts = sessionStore.allLogs.map(AuditorSessionExcerpt.init(sessionLog:))
-        flagManager.recordRun(engine.audit(excerpts))
-        refresh()
+        guard runGate.tryBegin() else { return }
+        let gate = runGate
+        let work = { [weak self] in
+            guard let self else { gate.end(); return }
+            defer { gate.end() }
+            let excerpts = self.sessionStore.allLogs.map(AuditorSessionExcerpt.init(sessionLog:))
+            self.flagManager.recordRun(self.engine.audit(excerpts))
+            self.refresh()
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     func refresh() { openFlags = flagManager.openFlags }
@@ -56,7 +68,9 @@ struct AuditorView: View {
                         .foregroundStyle(.secondary)
                     Button("Run auditor over synced sessions") {
                         auditor.runAudit()
-                        status = "Auditor run complete. \(auditor.openFlags.count) open finding(s)."
+                        status = AuditorRunStatus.completionMessage(
+                            openCount: auditor.openFlags.count,
+                            persistenceError: auditor.flagManager.lastPersistenceError)
                     }
                     if !status.isEmpty {
                         Text(status).font(.caption).foregroundStyle(.secondary)
