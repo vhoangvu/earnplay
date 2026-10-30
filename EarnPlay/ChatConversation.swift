@@ -294,9 +294,25 @@ struct ChatConversationView: View {
     private var header: some View {
         HStack(spacing: 4) {
             ForEach(0..<max(0, viewModel.progress.totalQuestions), id: \.self) { index in
-                Image(systemName: index < viewModel.progress.attemptedQuestions ? "star.fill" : "star")
-                    .foregroundStyle(index < viewModel.progress.attemptedQuestions ? ChatDesign.secondary : ChatDesign.textSecondary)
+                if index < viewModel.progress.attemptedQuestions {
+                    // Filled star keeps its yellow fill, backed by a
+                    // larger primary star so the star's defining
+                    // outline meets 3:1 against the white header
+                    // (the yellow alone is ~1.75:1).
+                    ZStack {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(ChatDesign.primary)
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 15))
+                            .foregroundStyle(ChatDesign.secondary)
+                    }
                     .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "star")
+                        .foregroundStyle(ChatDesign.textSecondary)
+                        .accessibilityHidden(true)
+                }
             }
             Spacer()
         }

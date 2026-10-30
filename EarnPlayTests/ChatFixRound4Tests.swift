@@ -68,10 +68,13 @@ final class ChatFixRound4Tests: XCTestCase {
     }
 
     /// The normalized check must still reject a genuinely
-    /// low-contrast fixture: a pale-gray glyph on the white surface.
+    /// low-contrast fixture: a low-contrast BLUE glyph on the white
+    /// surface (~2.72:1), chosen blue so pixels are actually sampled
+    /// and the measured-contrast path is exercised (a pale-gray
+    /// fixture sampled zero blue pixels and hit the (0, 1) fallback).
     func testNormalizedSamplingFailsOnLowContrastFixture() throws {
         let fixture = Image(systemName: "speaker.wave.2.fill")
-            .foregroundStyle(Color(red: 0xC9 / 255, green: 0xCE / 255, blue: 0xD6 / 255))
+            .foregroundStyle(Color(red: 0x80 / 255, green: 0x99 / 255, blue: 0xEE / 255))
             .font(.body)
             .frame(minWidth: 44, minHeight: 44)
             .background(ChatDesign.surface)
@@ -82,7 +85,7 @@ final class ChatFixRound4Tests: XCTestCase {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
         let sample = normalizedRGBASample(in: host.view)
         print("R4-ITEM1-LOW bluePixels=\(sample.blueCount) contrast=\(sample.contrastVsWhite)")
-        XCTAssertEqual(sample.blueCount, 0, "pale-gray glyph must not classify as the blue glyph")
+        XCTAssertGreaterThan(sample.blueCount, 5, "low-contrast fixture must sample pixels before the contrast check")
         XCTAssertLessThanOrEqual(sample.contrastVsWhite, 3.0, "low-contrast fixture must not satisfy the 3:1 check")
     }
 
