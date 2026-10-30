@@ -249,6 +249,21 @@ public enum Dashboard {
         return .lastWeek
     }
 
+    /// Whether the this-week/last-week comparison window moved between two
+    /// `now` values (fix round 3: the Progress view's foreground/time-change
+    /// reload seam). Same calendar week on both sides reads false; a week
+    /// boundary crossed in either direction reads true. A week that cannot
+    /// be computed reads true — reload rather than risk stale "This week"
+    /// totals. Pure in (`previousNow`, `now`, `calendar`).
+    public static func comparisonWindowChanged(since previousNow: Date, now: Date,
+                                               calendar: Calendar = .current) -> Bool {
+        guard let previousWeek = calendar.dateInterval(of: .weekOfYear, for: previousNow),
+              let currentWeek = calendar.dateInterval(of: .weekOfYear, for: now) else {
+            return true
+        }
+        return previousWeek.start != currentWeek.start
+    }
+
     // MARK: - Report
 
     /// Computes all six aggregates over `logs` (typically

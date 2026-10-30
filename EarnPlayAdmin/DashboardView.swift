@@ -18,11 +18,19 @@ import EarnPlayCore
 struct DashboardView: View {
     let controller: AdminSyncController
     @State private var report: Dashboard.Report
+    /// The `now` the cached report was computed against. Foreground and
+    /// significant-time-change reloads compare the current week to this
+    /// instant's week, so the comparison window always reflects the
+    /// current week without redundant recomputes inside one week.
+    @State private var lastReloadNow: Date
+    @Environment(\.scenePhase) private var scenePhase
 
     init(controller: AdminSyncController) {
         self.controller = controller
+        let now = Date()
         _report = State(initialValue: Dashboard.compute(
-            logs: controller.sessionStore.allLogs, now: Date()))
+            logs: controller.sessionStore.allLogs, now: now))
+        _lastReloadNow = State(initialValue: now)
     }
 
     private static let shortDayFormatter: DateFormatter = {
@@ -65,11 +73,40 @@ struct DashboardView: View {
                 // Posted off-main by the sync path, so hop to main.
                 DispatchQueue.main.async { reload() }
             }
+            .onChange(of: scenePhase) { _, newPhase in
+                // Returning to the foreground never reruns .onAppear for
+                // an already-visible view, so a week boundary crossed
+                // while backgrounded would leave stale "This week"
+                // totals. Reload when the window moved; the Refresh
+                // button and sync-driven reload above are unchanged.
+                if newPhase == .active { reloadIfWeekChanged() }
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: UIApplication.significantTimeChangeNotification)
+            ) { _ in
+                // Midnight rollover, time-zone/DST shifts, and carrier
+                // time updates while open: same week-boundary reload.
+                reloadIfWeekChanged()
+            }
         }
     }
 
     private func reload() {
-        report = Dashboard.compute(logs: controller.sessionStore.allLogs, now: Date())
+        reload(now: Date())
+    }
+
+    private func reload(now: Date) {
+        lastReloadNow = now
+        report = Dashboard.compute(logs: controller.sessionStore.allLogs, now: now)
+    }
+
+    /// Foreground/time-change path: one `now` feeds both the window check
+    /// and the recompute, so a boundary crossed mid-call cannot strand a
+    /// half-updated report. No-ops inside the current week.
+    private func reloadIfWeekChanged() {
+        let now = Date()
+        guard Dashboard.comparisonWindowChanged(since: lastReloadNow, now: now) else { return }
+        reload(now: now)
     }
 
     // MARK: - Empty state
