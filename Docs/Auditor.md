@@ -22,8 +22,55 @@ never trusted to act on its own.
   `flagId`, `sessionId`, `category`, `severity`, `evidence`,
   `suggestedAction`, `status`), persisted by `AuditFlagManager` in
   `audit-flags.json` on the parent device. The engine runs at sync
-  time (`AdminSyncController.startIfNeeded`) and on demand (Auditor
+  time (`AdminSyncController.startIfNeeded`), immediately after a
+  session is successfully stored (`AdminSyncService.onSessionStored`,
+  wired in `startIfNeeded` to `auditor.runAudit()`; findings publish
+  via `AdminAuditorController.openFlags`), and on demand (Auditor
   tab → Run auditor).
+
+## Fix round 1 (PR #61)
+
+- Mismatch flags carry decision-specific ids; persisted duplicate
+  ids are deduped (resolved wins) before any dictionary is built,
+  never trapping. Dismiss/act update all records sharing an id.
+- The flag detail shows an excerpt + justification section for
+  EVERY session cited by the flag (`AuditFlag.citedSessionIds`),
+  not only `flag.sessionId`, plus recorded questions per session.
+- Presented evidence/justifications pass `AuditorScoreFreeText`,
+  which strips score/threshold tokens and numeric score/bar values
+  while retaining attempts, hint interactions, and other permitted
+  evidence. Stored records keep their values. No user-visible
+  auditor surface shows scores, thresholds, timers, or pass/fail.
+- Act: on `.openPolicyEditor` the detail dismisses its sheet and
+  the app selects the existing Policy tab (`TabView(selection:)`);
+  saving there remains the parent's explicit action.
+- Justification-mismatch value comparison runs only for the
+  session-final unlock decision against an independently recorded
+  snapshot, comparing all six signal fields plus total/bar/floor.
+- Inconsistency excludes pairs where both outcomes follow their
+  own recorded bar (grant: total ≥ bar with floor; deny: total <
+  bar or floor unmet), including threshold-boundary cases.
+- Persistence failures propagate: dismiss/act/record return failure,
+  restore the previous cached state, expose `lastPersistenceError`,
+  and the UI shows success only after a durable write.
+
+### Known limitation — independent evidence (items 6–7)
+
+`SessionLog` in the current data model carries decisions and,
+optionally, question detail / independently recorded raw effort
+fields (`questions`, `rawSignals`, `rawEffortTotal`, `rawEffortBar`,
+`rawFloorMet`) where the child recorded them. The auditor uses
+those where they exist. Where they do not exist, the only effort
+values available are parsed from the unlock decision's own
+evidence text, so a wrong claim in a complete single-unlock session
+cannot be detected by comparing it against itself; the value
+check is skipped for such excerpts (`hasIndependentSnapshot ==
+false`) and only blank/out-of-range justification fields flag.
+What is missing: a child-side independently recorded per-decision
+effort snapshot (raw signals + total/bar/floor at decision time)
+and per-session question records synced with the log. Supplying
+those fields on `SessionLog` enables the check with no engine
+change. No new pipeline is invented here.
 
 Full T4.3 transcripts and T4.4 decision-log viewers are v1 inputs and
 are not built here. The Demo flag detail shows the session excerpt

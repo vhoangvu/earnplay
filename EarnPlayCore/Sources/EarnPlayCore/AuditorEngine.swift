@@ -76,6 +76,37 @@ public struct AuditFlag: Codable, Equatable, Sendable, Identifiable {
         self.suggestedAction = suggestedAction
         self.status = status
     }
+
+    /// Every session this flag cites: its own session first, then any
+    /// known session id named in the evidence or suggested action.
+    public func citedSessionIds(knownSessionIds: [String]) -> [String] {
+        var out = [sessionId]
+        for id in knownSessionIds where id != sessionId && !out.contains(id)
+            && (evidence.contains(id) || suggestedAction.contains(id)) {
+            out.append(id)
+        }
+        return out
+    }
+}
+
+/// Score-free presentation for auditor surfaces (item 3): strips
+/// score/threshold tokens and numeric score/bar values while retaining
+/// concrete attempts, hint interactions, and other permitted evidence.
+/// Stored records are unchanged; only presented text passes here.
+public enum AuditorScoreFreeText {
+    public static func make(_ text: String) -> String {
+        var out = text
+        out = replace(#"(?i)score\s+\d+\s+vs\s+threshold\s+\d+"#, in: out, with: "recorded effort compared with the recorded bar")
+        out = replace(#"(?i)effortTotal:?\s*\d+"#, in: out, with: "effortTotal (recorded)")
+        out = replace(#"(?i)effortBar:?\s*\d+"#, in: out, with: "effortBar (recorded)")
+        out = replace(#"(?i)score\s+\d+"#, in: out, with: "recorded effort")
+        out = replace(#"(?i)threshold\s+\d+"#, in: out, with: "recorded bar")
+        return out
+    }
+    private static func replace(_ pattern: String, in text: String, with template: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return text }
+        return re.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: template)
+    }
 }
 
 // MARK: - Synced session excerpt (auditor input)
@@ -116,12 +147,16 @@ public struct AuditorSessionExcerpt: Codable, Equatable, Sendable {
     public var floorMet: Bool?
     public var signals: EffortSignals?
     public var questions: [AuditorQuestionRecord]
+    /// True only when effort/signals came from an independently
+    /// recorded snapshot, not parsed from a decision's own text.
+    public var hasIndependentSnapshot: Bool
 
     public init(sessionId: String, startedAt: Date, endedAt: Date,
                 decisions: [Decision], effortTotal: Int? = nil,
                 effortBar: Int? = nil, floorMet: Bool? = nil,
                 signals: EffortSignals? = nil,
-                questions: [AuditorQuestionRecord] = []) {
+                questions: [AuditorQuestionRecord] = [],
+                hasIndependentSnapshot: Bool = true) {
         self.sessionId = sessionId
         self.startedAt = startedAt
         self.endedAt = endedAt
@@ -131,23 +166,28 @@ public struct AuditorSessionExcerpt: Codable, Equatable, Sendable {
         self.floorMet = floorMet
         self.signals = signals
         self.questions = questions
+        self.hasIndependentSnapshot = hasIndependentSnapshot
     }
 
-    /// Builds the excerpt from a synced T4.6 `SessionLog`. Raw effort
-    /// values are read from the unlock decision's evidence text (the
-    /// concrete field values T1.6 recorded), so a synced log can be
-    /// audited without any new child-side schema.
+    /// Builds the excerpt from a synced T4.6 `SessionLog`. Where the
+    /// log carries independently recorded raw signals/questions, they
+    /// are used; otherwise values parsed from the unlock decision's
+    /// own evidence text are marked non-independent, so the mismatch
+    /// value check does not compare a claim against itself (item 6).
     public init(sessionLog: SessionLog) {
         let parsed = Self.parsedUnlockEvidence(in: sessionLog.decisions)
+        let independent = sessionLog.rawSignals != nil || sessionLog.rawEffortTotal != nil
+            || sessionLog.rawEffortBar != nil || sessionLog.rawFloorMet != nil
         self.init(sessionId: sessionLog.sessionId,
                   startedAt: sessionLog.startedAt,
                   endedAt: sessionLog.endedAt,
                   decisions: sessionLog.decisions,
-                  effortTotal: parsed?.total,
-                  effortBar: parsed?.bar,
-                  floorMet: parsed?.floorMet,
-                  signals: parsed?.signals,
-                  questions: [])
+                  effortTotal: sessionLog.rawEffortTotal ?? parsed?.total,
+                  effortBar: sessionLog.rawEffortBar ?? parsed?.bar,
+                  floorMet: sessionLog.rawFloorMet ?? parsed?.floorMet,
+                  signals: sessionLog.rawSignals ?? parsed?.signals,
+                  questions: sessionLog.questions ?? [],
+                  hasIndependentSnapshot: independent)
     }
 
     /// The session's unlock decision (grant or deny), when present.
@@ -299,50 +339,48 @@ public struct AuditorEngine: Sendable {
 
     private func flag(_ category: AuditCategory, _ severity: AuditSeverity,
                       session: AuditorSessionExcerpt, evidence: String,
-                      action: String) -> AuditFlag {
-        AuditFlag(flagId: "audit-\(category.rawValue)-\(session.sessionId)",
+                      action: String, discriminator: String? = nil) -> AuditFlag {
+        let suffix = discriminator.map { "-\($0)" } ?? ""
+        return AuditFlag(flagId: "audit-\(category.rawValue)-\(session.sessionId)\(suffix)",
                   sessionId: session.sessionId, category: category,
                   severity: severity, evidence: evidence, suggestedAction: action)
     }
 
     // Check 7: justification mismatch (severity act, LLD §9.2).
+    // Value comparison runs only for the session-final unlock decision
+    // against an independently recorded snapshot (items 6, 8), and
+    // compares all six signal fields (item 9).
     private func checkJustificationMismatch(_ sessions: [AuditorSessionExcerpt]) -> [AuditFlag] {
         var out: [AuditFlag] = []
         for session in sessions {
-            for decision in session.decisions {
-                if !decision.isComplete {
-                    out.append(flag(.justificationMismatch, .act, session: session,
-                        evidence: "Session \(session.sessionId), decision \(decision.decisionId): justification field(s) \(decision.incompleteFields.joined(separator: ", ")) are blank or out of range in the synced record.",
-                        action: "Open the session excerpt and read this decision beside the raw log values, then decide whether any setting needs attention."))
-                    continue
-                }
-                guard let claimed = AuditorSessionExcerpt.parsedEvidence(decision.evidenceSummary),
-                      let total = session.effortTotal, let bar = session.effortBar,
-                      let floor = session.floorMet else { continue }
-                var differing: [String] = []
-                if claimed.total != total {
-                    differing.append("evidence text says effortTotal \(claimed.total); raw log field effortTotal is \(total)")
-                }
-                if claimed.bar != bar {
-                    differing.append("evidence text says effortBar \(claimed.bar); raw log field effortBar is \(bar)")
-                }
-                if claimed.floorMet != floor {
-                    differing.append("evidence text says floorMet \(claimed.floorMet); raw log field floorMet is \(floor)")
-                }
-                if let raw = session.signals {
-                    let c = claimed.signals
-                    if c.genuineAttempts != raw.genuineAttempts {
-                        differing.append("evidence text says genuineAttempts \(c.genuineAttempts); raw log field genuineAttempts is \(raw.genuineAttempts)")
-                    }
-                    if c.activeSeconds != raw.activeSeconds {
-                        differing.append("evidence text says activeSeconds \(c.activeSeconds); raw log field activeSeconds is \(raw.activeSeconds)")
-                    }
-                }
-                if !differing.isEmpty {
-                    out.append(flag(.justificationMismatch, .act, session: session,
-                        evidence: "Session \(session.sessionId), decision \(decision.decisionId): " + differing.joined(separator: "; ") + ".",
-                        action: "Open the session excerpt and compare the justification with the raw log values shown with this flag."))
-                }
+            for decision in session.decisions where !decision.isComplete {
+                out.append(flag(.justificationMismatch, .act, session: session,
+                    evidence: "Session \(session.sessionId), decision \(decision.decisionId): justification field(s) \(decision.incompleteFields.joined(separator: ", ")) are blank or out of range in the synced record.",
+                    action: "Open the session excerpt and read this decision beside the raw log values, then decide whether any setting needs attention.",
+                    discriminator: decision.decisionId))
+            }
+            guard session.hasIndependentSnapshot, let decision = session.unlockDecision, decision.isComplete,
+                  let claimed = AuditorSessionExcerpt.parsedEvidence(decision.evidenceSummary),
+                  let total = session.effortTotal, let bar = session.effortBar,
+                  let floor = session.floorMet else { continue }
+            var differing: [String] = []
+            if claimed.total != total { differing.append("evidence text says effortTotal \(claimed.total); raw log field effortTotal is \(total)") }
+            if claimed.bar != bar { differing.append("evidence text says effortBar \(claimed.bar); raw log field effortBar is \(bar)") }
+            if claimed.floorMet != floor { differing.append("evidence text says floorMet \(claimed.floorMet); raw log field floorMet is \(floor)") }
+            if let raw = session.signals {
+                let c = claimed.signals
+                if c.genuineAttempts != raw.genuineAttempts { differing.append("evidence text says genuineAttempts \(c.genuineAttempts); raw log field genuineAttempts is \(raw.genuineAttempts)") }
+                if c.activeSeconds != raw.activeSeconds { differing.append("evidence text says activeSeconds \(c.activeSeconds); raw log field activeSeconds is \(raw.activeSeconds)") }
+                if c.hintInteractions != raw.hintInteractions { differing.append("evidence text says hintInteractions \(c.hintInteractions); raw log field hintInteractions is \(raw.hintInteractions)") }
+                if c.followUpInteractions != raw.followUpInteractions { differing.append("evidence text says followUpInteractions \(c.followUpInteractions); raw log field followUpInteractions is \(raw.followUpInteractions)") }
+                if c.answerRevisions != raw.answerRevisions { differing.append("evidence text says answerRevisions \(c.answerRevisions); raw log field answerRevisions is \(raw.answerRevisions)") }
+                if c.explanations != raw.explanations { differing.append("evidence text says explanations \(c.explanations); raw log field explanations is \(raw.explanations)") }
+            }
+            if !differing.isEmpty {
+                out.append(flag(.justificationMismatch, .act, session: session,
+                    evidence: "Session \(session.sessionId), decision \(decision.decisionId): " + differing.joined(separator: "; ") + ".",
+                    action: "Open the session excerpt and compare the justification with the raw log values shown with this flag.",
+                    discriminator: decision.decisionId))
             }
         }
         return out
@@ -440,6 +478,9 @@ public struct AuditorEngine: Sendable {
                 guard let priorTotal = prior.effortTotal, let priorFloor = prior.floorMet,
                       prior.wasGranted != session.wasGranted,
                       abs(priorTotal - total) <= 2, priorFloor == floor else { continue }
+                // Item 10: exclude pairs where both outcomes follow
+                // their own recorded eligibility (total vs own bar).
+                if Self.followsEligibility(session) && Self.followsEligibility(prior) { continue }
                 out.append(flag(.inconsistency, .watch, session: session,
                     evidence: "Session \(session.sessionId): effortTotal \(total), floorMet \(floor), outcome \(session.wasGranted ? "granted" : "denied"). Earlier session \(prior.sessionId): effortTotal \(priorTotal), floorMet \(priorFloor), outcome \(prior.wasGranted ? "granted" : "denied"). The recorded evidence is close and the outcomes differ.",
                     action: "Open both session excerpts and compare the justifications shown with this flag."))
@@ -447,6 +488,11 @@ public struct AuditorEngine: Sendable {
             }
         }
         return out
+    }
+
+    private static func followsEligibility(_ s: AuditorSessionExcerpt) -> Bool {
+        guard let total = s.effortTotal, let bar = s.effortBar, let floor = s.floorMet else { return false }
+        return s.wasGranted ? (total >= bar && floor) : (total < bar || !floor)
     }
 }
 
@@ -471,90 +517,103 @@ public final class AuditFlagManager: @unchecked Sendable {
     private let lock = NSLock()
     private let dataWriter: (Data, URL) throws -> Void
     private var flags: [AuditFlag]
+    /// Last persistence failure, if any (item 11). Success is reported
+    /// only after a durable write; failures restore prior cached state.
+    public private(set) var lastPersistenceError: String?
 
     public init(directory: URL, dataWriter: ((Data, URL) throws -> Void)? = nil) {
         self.directory = directory
         self.dataWriter = dataWriter ?? { data, url in try data.write(to: url, options: [.atomic]) }
-        self.flags = Self.load(directory: directory) ?? []
+        self.flags = Self.deduped(Self.load(directory: directory) ?? [])
     }
 
     public convenience init() {
         self.init(directory: PolicyStore.defaultDirectory())
     }
 
-    /// Records a fresh audit run. Flags the parent already dismissed
-    /// or acted on keep their recorded status across runs.
-    public func recordRun(_ newFlags: [AuditFlag]) {
-        lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
-        var byId = Dictionary(uniqueKeysWithValues: flags.map { ($0.flagId, $0) })
-        for flag in newFlags where byId[flag.flagId]?.status != .dismissed
-            && byId[flag.flagId]?.status != .acted {
-            byId[flag.flagId] = flag
+    static func deduped(_ input: [AuditFlag]) -> [AuditFlag] {
+        var byId: [String: AuditFlag] = [:]; var order: [String] = []
+        for f in input {
+            if let existing = byId[f.flagId] {
+                // Resolved status wins over open for duplicate ids.
+                if existing.status == .open && f.status != .open { byId[f.flagId] = f }
+            } else { byId[f.flagId] = f; order.append(f.flagId) }
         }
-        // Keep resolved flags the parent already handled, drop stale opens.
+        return order.compactMap { byId[$0] }
+    }
+
+    /// Records a fresh audit run. Returns true only after durable write.
+    @discardableResult
+    public func recordRun(_ newFlags: [AuditFlag]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let previous = flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
         let resolved = flags.filter { $0.status != .open }
         let resolvedIds = Set(resolved.map(\.flagId))
-        flags = resolved + newFlags.filter { !resolvedIds.contains($0.flagId) }
-        persistLocked()
+        flags = Self.deduped(resolved + Self.deduped(newFlags).filter { !resolvedIds.contains($0.flagId) })
+        do { try persistLocked(); lastPersistenceError = nil; return true }
+        catch { flags = previous; lastPersistenceError = String(describing: error); return false }
     }
 
     /// Open flags, act first, then watch, then info.
     public var openFlags: [AuditFlag] {
         lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
         return flags.filter { $0.status == .open }
             .sorted { ($0.severity.rank, $0.flagId) < ($1.severity.rank, $1.flagId) }
     }
 
     public var allFlags: [AuditFlag] {
         lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
         return flags
     }
 
-    /// Parent dismisses a flag. Clears it from the open list and
-    /// changes nothing else — policy is untouched by design.
-    public func dismiss(flagId: String) {
-        update(flagId: flagId, status: .dismissed)
-    }
+    /// Parent dismisses a flag. Returns true only after durable write.
+    @discardableResult
+    public func dismiss(flagId: String) -> Bool { update(flagId: flagId, status: .dismissed) }
 
-    /// Parent chooses to act. Records the choice and returns where to
-    /// route the parent; it applies no policy change itself.
+    /// Parent chooses to act. Returns route only after durable write;
+    /// nil on failure (previous cached state restored).
     @discardableResult
     public func markActed(flagId: String) -> AuditActionRoute? {
         lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
+        let previous = flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
         guard let index = flags.firstIndex(where: { $0.flagId == flagId }) else { return nil }
         flags[index].status = .acted
-        persistLocked()
-        return .openPolicyEditor
+        do { try persistLocked(); lastPersistenceError = nil; return .openPolicyEditor }
+        catch { flags = previous; lastPersistenceError = String(describing: error); return nil }
     }
 
     /// Route for opening a flag's staged detail.
     public func detailRoute(flagId: String) -> AuditActionRoute? {
         lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
         guard let flag = flags.first(where: { $0.flagId == flagId }) else { return nil }
         return .openSession(sessionId: flag.sessionId)
     }
 
-    private func update(flagId: String, status: AuditFlagStatus) {
+    @discardableResult
+    private func update(flagId: String, status: AuditFlagStatus) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        flags = Self.load(directory: directory) ?? flags
-        guard let index = flags.firstIndex(where: { $0.flagId == flagId }) else { return }
-        flags[index].status = status
-        persistLocked()
+        let previous = flags
+        flags = Self.deduped(Self.load(directory: directory) ?? flags)
+        // Update every duplicate sharing this id, not only the first.
+        var found = false
+        for i in flags.indices where flags[i].flagId == flagId { flags[i].status = status; found = true }
+        guard found else { return false }
+        do { try persistLocked(); lastPersistenceError = nil; return true }
+        catch { flags = previous; lastPersistenceError = String(describing: error); return false }
     }
 
-    private func persistLocked() {
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    private func persistLocked() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .deferredToDate
         encoder.outputFormatting = [.sortedKeys]
-        if let data = try? encoder.encode(flags) {
-            try? dataWriter(data, directory.appendingPathComponent(Self.fileName))
-        }
+        let data = try encoder.encode(flags)
+        try dataWriter(data, directory.appendingPathComponent(Self.fileName))
     }
 
     private static func load(directory: URL) -> [AuditFlag]? {
