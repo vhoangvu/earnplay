@@ -10,6 +10,10 @@ import XCTest
 /// 2. Restoration is established BEFORE the sentinel write, so a
 ///    sentinel-write failure still restores the original
 ///    byte-identical.
+/// 3. The shelter directory is removed ONLY after a successful
+///    restoration; when the restore move fails, the shelter is
+///    retained at its reported path so the original stays
+///    recoverable.
 final class ShelteredFileGuard {
     private(set) var tempRoots: [URL] = []
 
@@ -62,11 +66,17 @@ final class ShelteredFileGuard {
             if let shelter {
                 do {
                     try FileManager.default.moveItem(at: shelter, to: real)
+                    // The original is home: only now may the shelter
+                    // go. On restore failure the shelter directory is
+                    // RETAINED at its reported path — it holds the only
+                    // remaining copy of the pre-existing file.
+                    try? FileManager.default.removeItem(at: shelterRoot)
                 } catch {
-                    XCTFail("FAILED to restore sheltered file from \(shelter.path) to \(real.path): \(error)")
+                    XCTFail("FAILED to restore sheltered file from \(shelter.path) to \(real.path): \(error). Backup retained for recovery.")
                 }
+            } else {
+                try? FileManager.default.removeItem(at: shelterRoot)
             }
-            try? FileManager.default.removeItem(at: shelterRoot)
         }
         if hadOriginal {
             let backup = shelterRoot.appendingPathComponent("sheltered-original")
