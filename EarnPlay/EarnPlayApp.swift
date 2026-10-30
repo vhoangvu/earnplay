@@ -11,15 +11,25 @@ struct EarnPlayApp: App {
 }
 
 struct ContentView: View {
+    @StateObject private var downloadModel = ModelDownloadViewModel()
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
 
     var body: some View {
-        if setup.step == .complete, !setup.summaryDismissed {
-            SetupCompleteView(viewModel: setup)
-        } else if setup.step == .complete {
-            mainPlaceholder
-        } else {
-            SetupFlowView(viewModel: setup)
+        Group {
+            if downloadModel.isReady {
+                if setup.step == .complete, !setup.summaryDismissed {
+                    SetupCompleteView(viewModel: setup)
+                } else if setup.step == .complete {
+                    mainPlaceholder
+                } else {
+                    SetupFlowView(viewModel: setup)
+                }
+            } else {
+                ModelDownloadView(viewModel: downloadModel)
+            }
+        }
+        .task {
+            downloadModel.refreshIfNeeded()
         }
     }
 
@@ -43,6 +53,8 @@ struct ContentView: View {
                 ChoreTradeView()
                 Divider()
                 MovementTradePreviewView()
+                Divider()
+                AboutView()
             }
             .padding()
         }

@@ -34,7 +34,8 @@ let package = Package(
         .executable(name: "eval-harness", targets: ["EvalHarness"])
     ],
     targets: [
-        .target(name: "EarnPlayCore", dependencies: earnPlayCoreDeps),
+        .target(name: "EarnPlayCore", dependencies: earnPlayCoreDeps,
+                resources: [.process("Resources")]),
         .executableTarget(name: "EvalHarness", dependencies: ["EarnPlayCore"]),
         .testTarget(name: "EarnPlayCoreTests", dependencies: ["EarnPlayCore"])
     ] + extraTargets

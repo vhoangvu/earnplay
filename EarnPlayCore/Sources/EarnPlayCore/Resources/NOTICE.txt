@@ -1,0 +1,18 @@
+EarnPlay — on-device tutor model notice
+=========================================
+
+Model: Llama 3.2 1B Instruct (bartowski Llama-3.2-1B-Instruct-GGUF, Q4_K_M)
+Source: https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+License: Llama 3.2 Community License (full text ships in this bundle as
+LLAMA_3_2_COMMUNITY_LICENSE.txt)
+Use policy: https://www.llama.com/llama3_2/use-policy
+
+Built with Llama
+
+Required attribution (Llama 3.2 Community License, Section 1.b.iii):
+
+Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.
+
+Per Section 1.b.i, a copy of the Llama 3.2 Community License Agreement
+ships with this app, and the "Built with Llama" credit is displayed on
+the app's About screen.
