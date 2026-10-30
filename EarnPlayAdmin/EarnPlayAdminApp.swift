@@ -47,6 +47,9 @@ struct EarnPlayAdminApp: App {
     var body: some Scene {
         WindowGroup {
             TabView(selection: $selectedTab) {
+                DashboardView(controller: syncController)
+                    .tabItem { Label("Progress", systemImage: "chart.bar") }
+                    .tag(4)
                 PolicyEditorView(onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
                     .tag(0)
