@@ -177,6 +177,28 @@ public final class PracticeSessionRecorder: HintListenEventSink, @unchecked Send
         effortRecorder.recordHintListen(event)
     }
 
+    /// Snapshot of hint-message → originating-question ownership (round 5
+    /// item 2): the engine carries this from a replaced recorder into its
+    /// replacement, so a replayed earlier hint still resolves to its own
+    /// question after any resume — instead of falling back to current.
+    public func hintMessageOwnership() -> [String: String] {
+        lock.lock(); defer { lock.unlock() }
+        return hintMessageQuestions
+    }
+
+    /// Carries hint-message ownership from a replaced recorder (round 5
+    /// item 2): merges entries this recorder does not already map. Carrying
+    /// is ownership only — it records no shows (`hintsUsed` stays tied to
+    /// ladder-show events), no interactions, and no effort events.
+    /// Unmapped ids keep the current-question fallback in
+    /// `recordHintListen`.
+    public func carryHintMessageOwnership(_ ownership: [String: String]) {
+        lock.lock(); defer { lock.unlock() }
+        for (messageID, questionId) in ownership where hintMessageQuestions[messageID] == nil {
+            hintMessageQuestions[messageID] = questionId
+        }
+    }
+
     /// Generic interaction (typing, non-substantive reply): question timing
     /// plus session active time, never effort counts. When `questionId` is
     /// nil or unknown, only the session stream records.

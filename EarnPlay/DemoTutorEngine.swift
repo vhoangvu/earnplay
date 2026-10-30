@@ -183,6 +183,21 @@ final class DemoTutorEngine: ChatTutorEngine {
         // first start and on restart after a finished session. A second
         // start without a finish keeps the active session.
         if let rec = recording, sessionRecorder == nil || recordingEnded {
+            // Round 5 item 1: a Start-again-style re-presentation clears any
+            // pending probe reply. This branch is reached three ways: first
+            // start (flag already false, no-op), completed restart (already
+            // cleared above, no-op duplicate), and the
+            // background-drain-then-Start-again path — a later background
+            // drained the pending log, so the retry branch above is skipped
+            // and a probe left pending across the failed disappear would
+            // otherwise swallow the next submission as an unseen
+            // explanation. Resume paths (`resumeSession`,
+            // `drainPendingAndResume`) deliberately do NOT clear: they
+            // preserve the thread, so the probe turn is still visible and a
+            // pending probe reply is still legitimate — only
+            // re-presentation (conversation cleared, only the question
+            // returns) makes the flag stale.
+            awaitingProbeReply = false
             beginFreshRecordingSession(recording: rec, questionId: item.result.question.questionId,
                                         skill: item.result.question.skill)
         }
@@ -254,6 +269,18 @@ final class DemoTutorEngine: ChatTutorEngine {
         sessionScorer = rec.makeScorer()
         let recorder = PracticeSessionRecorder(
             sessionId: rec.makeSessionId(), startedAt: startedAt, now: rec.now)
+        // Round 5 item 2: carry hint-message ownership from the replaced
+        // recorder, so a replayed earlier hint still resolves to its own
+        // question after the replacement — instead of falling back to
+        // current. Carrying records nothing (no shows, no interactions, no
+        // effort). On a mid-run resume this is the fix: the chat keeps the
+        // earlier hint bubbles. On a full restart after completion the
+        // carry is harmless: the thread is cleared and the old bubbles are
+        // gone, so the carried ids are never replayed. On first start
+        // there is no previous recorder (no-op).
+        if let previous = sessionRecorder {
+            recorder.carryHintMessageOwnership(previous.hintMessageOwnership())
+        }
         sessionRecorder = recorder
         recordingEnded = false
         recorder.startQuestion(questionId: questionId, skill: skill, at: startedAt)
