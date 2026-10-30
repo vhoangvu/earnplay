@@ -153,14 +153,18 @@ public final class AuditRunGate: @unchecked Sendable {
 /// Runs audit work off the main queue and hops to the main queue only
 /// to publish results (round 3, items 1-2). Requests arriving while a
 /// run is in flight coalesce into exactly one rerun, so a session
-/// stored mid-audit is still audited (round 3, item 3). The latest
-/// work/publish/settled closures are the ones a rerun executes.
+/// stored mid-audit is still audited (round 3, item 3). Each pass
+/// captures its work/publish pair together under one lock when the
+/// pass starts, and a newer request's pair is used only for the
+/// coalesced rerun: an earlier pass never invokes a later request's
+/// publish callback, and no pass's callback is dropped (round 4,
+/// item 2).
 public final class AuditRunPerformer: @unchecked Sendable {
+    private typealias Pair = (work: @Sendable () -> Void, publish: @Sendable () -> Void)
     private let gate = AuditRunGate()
     private let workQueue: DispatchQueue
     private let lock = NSLock()
-    private var pendingWork: (@Sendable () -> Void)?
-    private var pendingPublish: (@Sendable () -> Void)?
+    private var pendingPair: Pair?
     private var pendingSettled: (@Sendable () -> Void)?
 
     public init(workQueue: DispatchQueue = DispatchQueue(label: "earnplay.auditor-work", qos: .userInitiated)) {
@@ -175,29 +179,39 @@ public final class AuditRunPerformer: @unchecked Sendable {
                         publish: @escaping @Sendable () -> Void,
                         settled: (@Sendable () -> Void)? = nil) {
         lock.lock()
-        pendingWork = work
-        pendingPublish = publish
+        pendingPair = (work: work, publish: publish)
         if let settled { pendingSettled = settled }
+        // Capture the starting pass's pair together, under the same
+        // lock that records the newest pair, so a request arriving
+        // before this pass runs cannot substitute its own pair.
+        let startPair = gate.beginOrMarkDirty() ? pendingPair : nil
         lock.unlock()
-        guard gate.beginOrMarkDirty() else { return }
-        schedule()
+        if let startPair { schedule(startPair) }
     }
 
-    private func schedule() {
+    private func schedule(_ pair: Pair) {
         workQueue.async { [self] in
-            lock.lock(); let work = pendingWork; lock.unlock()
-            work?()
+            pair.work()
             DispatchQueue.main.async { [self] in
-                lock.lock(); let publish = pendingPublish; lock.unlock()
-                publish?()
+                pair.publish()
                 if gate.finish() {
-                    schedule()
+                    // Use the newer pair only now, for the rerun.
+                    lock.lock(); let next = pendingPair; lock.unlock()
+                    if let next {
+                        schedule(next)
+                    } else {
+                        drainSettled()
+                    }
                 } else {
-                    lock.lock(); let settled = pendingSettled; pendingSettled = nil; lock.unlock()
-                    settled?()
+                    drainSettled()
                 }
             }
         }
+    }
+
+    private func drainSettled() {
+        lock.lock(); let settled = pendingSettled; pendingSettled = nil; lock.unlock()
+        settled?()
     }
 }
 
