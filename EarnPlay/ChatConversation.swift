@@ -359,12 +359,38 @@ final class ChatConversationViewModel: ObservableObject {
             needsResumeAfterDisappear = true
         }
     }
+
+    /// Scene-phase transitions (round 4 item 1): backgrounding the app does
+    /// NOT trigger `onDisappear` on the root chat view, so without this the
+    /// partial session stayed only in memory and an iOS termination lost it
+    /// even with healthy storage. Background finalizes exactly like a
+    /// disappearance (the engine's `endSession` hook, idempotent via its
+    /// ended guard — a second finalize is a no-op, never a second log — and
+    /// a failed enqueue arms the round-3 blocked state on resume instead of
+    /// resuming live). Foreground re-enters the existing reappearance path
+    /// (`startIfNeeded`, which resumes a fresh recording session). A
+    /// transient `.inactive` (notification shade, control center) is not a
+    /// backgrounding and does nothing. The view forwards the phase here;
+    /// every decision stays at this engine/view-model boundary.
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            handleDisappeared()
+        case .active:
+            startIfNeeded()
+        case .inactive:
+            break
+        @unknown default:
+            break
+        }
+    }
 }
 
 // MARK: - View (Band B layout per HLD)
 
 struct ChatConversationView: View {
     @StateObject private var viewModel: ChatConversationViewModel
+    @Environment(\.scenePhase) private var scenePhase
 
     init(viewModel: ChatConversationViewModel) {
         _viewModel = StateObject(wrappedValue: viewModel)
@@ -388,6 +414,13 @@ struct ChatConversationView: View {
         .accessibilityIdentifier("chatConversationView")
         .onAppear { viewModel.startIfNeeded() }
         .onDisappear { viewModel.handleDisappeared() }
+        // Round 4 item 1: backgrounding finalizes the active session
+        // (backgrounding never triggers onDisappear on this root view),
+        // and foregrounding resumes recording — the same two view-model
+        // hooks as disappear/reappear, so no new finalization path.
+        .onChange(of: scenePhase) { _, newPhase in
+            viewModel.handleScenePhase(newPhase)
+        }
     }
 
     // Slim header: star progress only. No score, clock, or text count.

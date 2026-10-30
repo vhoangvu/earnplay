@@ -315,4 +315,41 @@ final class PracticeSessionRecordingTests: XCTestCase {
         XCTAssertTrue(queue.pending().isEmpty)
         XCTAssertTrue(queue.isEmpty)
     }
+
+    // MARK: - Hint-listen attribution (round 4 item 3)
+
+    /// A hint listen resolves through the hint-show map to its originating
+    /// question: the replayed earlier hint anchors Q1 (out-of-window there,
+    /// so no time), Q2 keeps its single capped gap, and the session-level
+    /// listen event is still recorded. A message id with no map entry falls
+    /// back to the current question (the pre-round-4 behavior, pinned).
+    func testHintListenAttributesToOriginatingQuestionWithCurrentFallback() {
+        let recorder = PracticeSessionRecorder(sessionId: "s-hintmap", startedAt: date(0))
+        let scorer = EffortScorer(threshold: 10)
+        recorder.startQuestion(questionId: "q1", skill: "multiplicationFacts", at: date(0))
+        recorder.recordHint(questionId: "q1", at: date(5), hintMessageID: "q1-hint-1")
+        recorder.recordAnswer(questionId: "q1", correct: true, at: date(10))
+        recorder.finishQuestion(questionId: "q1", at: date(10))
+        recorder.startQuestion(questionId: "q2", skill: "multiplicationFacts", at: date(10))
+        // Q1's hint replayed at 40 while Q2 is current.
+        recorder.recordHintListen(HintListenEvent(
+            messageID: "q1-hint-1", messageText: "hint", emittedAt: date(40)))
+        recorder.recordAnswer(questionId: "q2", correct: true, at: date(70))
+        // An unmapped listen at 75 anchors the current question (fallback).
+        recorder.recordHintListen(HintListenEvent(
+            messageID: "unknown-hint", messageText: "hint", emittedAt: date(75)))
+        let finished = recorder.finishSession(at: date(80), scorer: scorer)
+
+        // Q1: gaps 5,5 = 10s; the replayed listen is out-of-window there.
+        XCTAssertEqual(finished.questionRecords.first?.activeMs, 10000)
+        XCTAssertEqual(finished.questionRecords.first?.hintsUsed, 1)
+        // Q2: start 10, answer 70, fallback listen 75, end 80. The Q1 replay
+        // adds nothing; the unmapped listen splits the tail: gaps 60->20,
+        // 5, 5 = 30s.
+        XCTAssertEqual(finished.questionRecords.last?.activeMs, 30000)
+        // Session level: both listens recorded as hint interactions
+        // (1 show + 2 listens = 3 hints -> 6 points, 2 attempts -> 4 points,
+        // 60s active (5+5+20+20+5+5) = 1 minute -> 1 point): 6+4+1 = 11.
+        XCTAssertEqual(finished.effort, SessionEffortRecord(score: 11, threshold: 10))
+    }
 }

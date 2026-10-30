@@ -166,6 +166,13 @@ final class DemoTutorEngine: ChatTutorEngine {
                 resumeBlockedOnPersistence = true
                 return ChatEngineUpdate(composer: .sessionComplete)
             }
+            // Round 4 item 2: the pending log drained, so this Start-again
+            // falls through to a fresh recorder and a re-presented question
+            // below — a probe left pending across the failed disappear must
+            // not swallow the next submission as an unseen explanation. (The
+            // completed-restart branch above clears it too; the still-blocked
+            // path above keeps it, but input stays refused there.)
+            awaitingProbeReply = false
         }
         guard let item = current else {
             return ChatEngineUpdate(turns: [.tutor(nextMessage(
@@ -472,7 +479,11 @@ final class DemoTutorEngine: ChatTutorEngine {
             return ChatEngineUpdate()
         }
         if let rec = recording, let recorder = sessionRecorder, !recordingEnded {
-            recorder.recordHint(questionId: item.result.question.questionId, at: rec.now())
+            // Round 4 item 3: feed the delivered hint message's id so a
+            // later replay of THIS hint anchors this question, never
+            // whatever is current when replayed.
+            recorder.recordHint(questionId: item.result.question.questionId, at: rec.now(),
+                                hintMessageID: hint.tutorMessage.id)
         }
         return ChatEngineUpdate(turns: [.tutor(hint.tutorMessage)])
     }

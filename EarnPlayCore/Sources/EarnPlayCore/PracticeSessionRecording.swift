@@ -60,6 +60,10 @@ public final class PracticeSessionRecorder: HintListenEventSink, @unchecked Send
     /// Question ids in first-start order.
     private var order: [String] = []
     private var states: [String: QuestionState] = [:]
+    /// Hint tutor-message id → originating question id (round 4 item 3),
+    /// fed at hint-show time via `recordHint`. Lets a replayed earlier
+    /// hint's listen anchor its own question instead of the current one.
+    private var hintMessageQuestions: [String: String] = [:]
 
     public init(sessionId: String, startedAt: Date,
                 idlePauseSeconds: TimeInterval = ActiveTimeTracker.defaultIdlePauseSeconds,
@@ -91,13 +95,20 @@ public final class PracticeSessionRecorder: HintListenEventSink, @unchecked Send
     /// Records one shown hint for the question. Call only when
     /// `HintLadder.requestHint()` returns a hint (exhausted taps record
     /// nothing). Unknown questions are ignored, never created.
-    public func recordHint(questionId: String, at date: Date? = nil) {
+    /// `hintMessageID` is the delivered hint tutor message's id: stored so a
+    /// later replay of that message (round 4 item 3) anchors its originating
+    /// question instead of whatever is current when replayed.
+    public func recordHint(questionId: String, at date: Date? = nil,
+                           hintMessageID: String? = nil) {
         let at = date ?? now()
         lock.lock()
         guard var state = states[questionId] else { lock.unlock(); return }
         state.hintsUsed += 1
         state.interactionDates.append(at)
         states[questionId] = state
+        if let hintMessageID {
+            hintMessageQuestions[hintMessageID] = questionId
+        }
         lock.unlock()
         effortRecorder.recordHintInteraction(at: at)
     }
@@ -141,21 +152,26 @@ public final class PracticeSessionRecorder: HintListenEventSink, @unchecked Send
         effortRecorder.recordExplanation(at: at)
     }
 
-    /// `HintListenEventSink` (round 3 item 2): one listen event does BOTH
-    /// the question timing anchor for the current question AND the session
-    /// effort event. The event carries no question id, so the anchor goes
-    /// to the recorder's current question — the most recently started one
-    /// (`order.last`, which is the unfinished question while a session is
-    /// actively recording). `hintsUsed` is untouched: it stays tied to
-    /// ladder-show events (`recordHint` is its only writer). Out-of-window
-    /// anchors are filtered by `activeMs`, so a late listen after its
-    /// question ended contributes no time.
+    /// `HintListenEventSink` (round 3 item 2, round 4 item 3): one listen
+    /// event does BOTH a question timing anchor AND the session effort
+    /// event. The event carries the replayed tutor message's id
+    /// (`messageID`), not a question id, so the anchor resolves through the
+    /// hint-show map (`recordHint`'s `hintMessageID`): a replayed earlier
+    /// hint anchors its originating question, never the current one. A
+    /// message id with no map entry (a listen recorded without a hint-show
+    /// call) falls back to the recorder's current question — the most
+    /// recently started one (`order.last`, the unfinished question while a
+    /// session is actively recording). `hintsUsed` is untouched: it stays
+    /// tied to ladder-show events (`recordHint` is its only writer).
+    /// Out-of-window anchors are filtered by `activeMs`, so a replay after
+    /// its question ended contributes no time.
     public func recordHintListen(_ event: HintListenEvent) {
         let at = event.emittedAt
         lock.lock()
-        if let currentId = order.last, var state = states[currentId] {
+        let targetId = hintMessageQuestions[event.messageID] ?? order.last
+        if let targetId, var state = states[targetId] {
             state.interactionDates.append(at)
-            states[currentId] = state
+            states[targetId] = state
         }
         lock.unlock()
         effortRecorder.recordHintListen(event)
