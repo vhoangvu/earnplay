@@ -12,6 +12,7 @@ import Foundation
 
 let defaultBaselinePath = "EarnPlayCore/EvalHarness/baseline.json"
 let defaultReportPath = "EarnPlayCore/EvalHarness/eval-report-latest.json"
+let defaultRedTeamReportPath = "EarnPlayCore/RedTeam/red-team-report-latest.json"
 
 func printUsage() {
     print("""
@@ -27,6 +28,11 @@ func printUsage() {
                         (default: \(defaultReportPath))
       --write-baseline  Store this run's report as the new baseline instead
                         of comparing (refuses when the run fails overall)
+      --red-team        Run the T5.2 red-team battery instead of the
+                        persona eval (see Docs/RedTeaming.md)
+      --red-team-report PATH
+                        Where to write the red-team report
+                        (default: \(defaultRedTeamReportPath))
       --help            Print this help
 
     Exit codes: 0 = pass with no regressions; 1 = criterion failure or
@@ -44,6 +50,8 @@ func fail(_ message: String) -> Never {
 var baselinePath = defaultBaselinePath
 var reportPath = defaultReportPath
 var writeBaseline = false
+var redTeam = false
+var redTeamReportPath = defaultRedTeamReportPath
 var index = 1
 while index < CommandLine.arguments.count {
     let arg = CommandLine.arguments[index]
@@ -53,6 +61,14 @@ while index < CommandLine.arguments.count {
         exit(0)
     case "--write-baseline":
         writeBaseline = true
+    case "--red-team":
+        redTeam = true
+    case "--red-team-report":
+        index += 1
+        guard index < CommandLine.arguments.count else {
+            fail("--red-team-report needs a path")
+        }
+        redTeamReportPath = CommandLine.arguments[index]
     case "--baseline":
         index += 1
         guard index < CommandLine.arguments.count else {
@@ -70,6 +86,38 @@ while index < CommandLine.arguments.count {
         fail("unknown argument: \(arg)")
     }
     index += 1
+}
+
+if redTeam {
+    let runner = RedTeamRunner()
+    print("Red-team battery T5.2 (threshold \(EvalHarness.harnessThreshold); stub-only, no inference)")
+    var caseResults: [RedTeamCaseResult] = []
+    for testCase in RedTeamBattery.cases {
+        let result = runner.runCase(testCase)
+        caseResults.append(result)
+        print("  [\(result.id)] \(result.outcome)")
+    }
+    let batteryReport = runner.report(for: caseResults)
+    print("")
+    print(RedTeamScorecard.render(batteryReport))
+    do {
+        let data = try RedTeamReportIO.encode(batteryReport)
+        try EvalPaths.writeRedTeamReport(
+            data, to: redTeamReportPath, refusingBaseline: baselinePath)
+        print("")
+        print("Report written to \(redTeamReportPath)")
+    } catch EvalPaths.ClashError.reportEqualsBaseline(let report, let baseline) {
+        fail("--red-team-report (\(report)) resolves to the same file as"
+            + " --baseline (\(baseline)); refusing to overwrite the baseline")
+    } catch {
+        fail("could not write red-team report to \(redTeamReportPath): \(error)")
+    }
+    if batteryReport.overall != "pass" {
+        print("Overall: FAIL")
+        exit(1)
+    }
+    print("Overall: PASS")
+    exit(0)
 }
 
 // Refuse a --report that resolves to the baseline file BEFORE any work:
