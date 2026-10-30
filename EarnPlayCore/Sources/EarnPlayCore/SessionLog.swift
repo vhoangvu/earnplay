@@ -10,11 +10,26 @@ public struct SessionLog: Codable, Equatable, Sendable {
     public var decisions: [Decision]
     /// Child's policy version in force for this session.
     public var policyVersion: Int
+    /// Optional question detail carried with the log, where the child
+    /// recorded it (T4.5 item 7). Nil when absent; old logs decode nil.
+    public var questions: [AuditorQuestionRecord]?
+    /// Independently recorded raw effort signals, where they exist
+    /// (T4.5 item 6). Never derived from a decision's evidence text.
+    public var rawSignals: EffortSignals?
+    public var rawEffortTotal: Int?
+    public var rawEffortBar: Int?
+    public var rawFloorMet: Bool?
     public init(sessionId: String, startedAt: Date, endedAt: Date,
-                decisions: [Decision], policyVersion: Int) {
+                decisions: [Decision], policyVersion: Int,
+                questions: [AuditorQuestionRecord]? = nil,
+                rawSignals: EffortSignals? = nil, rawEffortTotal: Int? = nil,
+                rawEffortBar: Int? = nil, rawFloorMet: Bool? = nil) {
         self.sessionId = sessionId; self.startedAt = startedAt
         self.endedAt = endedAt; self.decisions = decisions
         self.policyVersion = policyVersion
+        self.questions = questions; self.rawSignals = rawSignals
+        self.rawEffortTotal = rawEffortTotal; self.rawEffortBar = rawEffortBar
+        self.rawFloorMet = rawFloorMet
     }
     /// Builds a log from the T1.6 DecisionLogger for one session.
     public static func make(sessionId: String, startedAt: Date, endedAt: Date,

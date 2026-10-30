@@ -12,6 +12,9 @@ final class AdminSyncController {
                                                     key: "earnplay.pairing.admin.v1")
     let transport: MultipeerSyncTransport
     let service: AdminSyncService
+    /// Separate admin-app auditor instance (T4.5), distinct from the
+    /// child-app tutor runtime. Advisory only.
+    lazy var auditor = AdminAuditorController(sessionStore: sessionStore)
     private var started = false
     init() {
         transport = MultipeerSyncTransport(role: .browser, displayName: "EarnPlay-Admin", pairing: pairing)
@@ -21,7 +24,13 @@ final class AdminSyncController {
     func startIfNeeded() {
         guard !started else { return }
         started = true
+        // Audit immediately after a session is successfully stored
+        // (item 5). Separate from onSnapshotChange, which SessionsView
+        // owns; findings publish via AdminAuditorController.openFlags.
+        service.onSessionStored = { [weak self] _ in self?.auditor.runAudit() }
         service.start()
+        // Auditor runs at sync time over already-synced logs.
+        auditor.runAudit()
     }
     /// Reset/Unpair (round 4, M7): clears pairing + secret on both
     /// the gate (persisted) and the live transport session.
@@ -34,15 +43,22 @@ final class AdminSyncController {
 @main
 struct EarnPlayAdminApp: App {
     @State private var syncController = AdminSyncController()
+    @State private var selectedTab = 0
     var body: some Scene {
         WindowGroup {
-            TabView {
+            TabView(selection: $selectedTab) {
                 PolicyEditorView(onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
+                    .tag(0)
                 SessionsView(controller: syncController)
                     .tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
+                    .tag(1)
+                AuditorView(auditor: syncController.auditor, onOpenPolicy: { selectedTab = 0 })
+                    .tabItem { Label("Auditor", systemImage: "checkmark.shield") }
+                    .tag(2)
                 AdminVersionView()
                     .tabItem { Label("Version", systemImage: "info.circle") }
+                    .tag(3)
             }
             .onAppear { syncController.startIfNeeded() }
         }
