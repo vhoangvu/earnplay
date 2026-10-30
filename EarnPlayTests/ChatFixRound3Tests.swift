@@ -47,6 +47,8 @@ final class ChatFixRound3Tests: XCTestCase {
     }
 
     // MARK: Item 1 — contrast in both appearances (pixel-provable)
+    // Round 4: sampling normalizes into an explicitly configured
+    // RGBA8 bitmap first; the renderer guarantees no byte layout.
     func testSpeakerGlyphContrastsWithRowSurfaceInLightAndDark() throws {
         for style: UIUserInterfaceStyle in [.light, .dark] {
             let fake = FakeEngine()
@@ -58,30 +60,39 @@ final class ChatFixRound3Tests: XCTestCase {
             win.rootViewController = host; win.makeKeyAndVisible()
             host.view.setNeedsLayout(); host.view.layoutIfNeeded()
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
-            let blue = bluePixelCount(in: host.view)
-            print("R3-ITEM1 style=\(style.rawValue) bluePixels=\(blue)")
-            XCTAssertGreaterThan(blue, 5, "speaker glyph (ChatDesign.primary on white surface) must render visible in style \(style.rawValue)")
+            let sample = normalizedRGBASample(in: host.view)
+            print("R4-ITEM1 style=\(style.rawValue) bluePixels=\(sample.blueCount) contrast=\(sample.contrastVsWhite)")
+            XCTAssertGreaterThan(sample.blueCount, 5, "speaker glyph (ChatDesign.primary on white surface) must render visible in style \(style.rawValue)")
+            XCTAssertGreaterThan(sample.contrastVsWhite, 3.0, "normalized glyph/white contrast must exceed 3:1 in style \(style.rawValue)")
         }
-        // Analytic corroboration: primary vs white contrast ratio.
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        UIColor(ChatDesign.primary).getRed(&r, green: &g, blue: &b, alpha: &a)
-        func lum(_ x: CGFloat) -> CGFloat { x <= 0.03928 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4) }
-        let l = 0.2126 * lum(r) + 0.7152 * lum(g) + 0.0722 * lum(b)
-        XCTAssertGreaterThan((1.0 + 0.05) / (l + 0.05), 3.0, "primary/white contrast must exceed 3:1")
     }
 
-    private func bluePixelCount(in view: UIView) -> Int {
+    /// Renders the view, then redraws the result into a bitmap with a
+    /// fixed layout — 8-bit RGBA, 4 bytes/pixel, byteOrder32Big,
+    /// premultipliedLast — before any byte is sampled.
+    private func normalizedRGBASample(in view: UIView) -> (blueCount: Int, contrastVsWhite: Double) {
         let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
         let image = renderer.image { _ in view.drawHierarchy(in: view.bounds, afterScreenUpdates: true) }
-        guard let cg = image.cgImage, let data = cg.dataProvider?.data, let ptr = CFDataGetBytePtr(data) else { return 0 }
-        let bpr = cg.bytesPerRow, count = cg.width * cg.height
-        var n = 0
-        for i in 0..<count {
-            let o = (i / cg.width) * bpr + (i % cg.width) * 4
-            let (rr, gg, bb) = (Int(ptr[o]), Int(ptr[o + 1]), Int(ptr[o + 2]))
-            if bb > rr + 30 && bb > gg + 10 && bb > 120 { n += 1 }
+        guard let cg = image.cgImage else { return (0, 1) }
+        let w = cg.width, h = cg.height
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        let info = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: info) else { return (0, 1) }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var n = 0, sr = 0.0, sg = 0.0, sb = 0.0
+        for i in 0..<(w * h) {
+            let o = i * 4
+            let (rr, gg, bb) = (Int(bytes[o]), Int(bytes[o + 1]), Int(bytes[o + 2]))
+            if bb > rr + 30 && bb > gg + 10 && bb > 120 {
+                n += 1; sr += Double(rr); sg += Double(gg); sb += Double(bb)
+            }
         }
-        return n
+        guard n > 0 else { return (0, 1) }
+        func lum(_ x: Double) -> Double { x <= 0.03928 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4) }
+        let l = 0.2126 * lum(sr / Double(n) / 255) + 0.7152 * lum(sg / Double(n) / 255) + 0.0722 * lum(sb / Double(n) / 255)
+        return (n, 1.05 / (l + 0.05))
     }
 
     // MARK: Item 2 — voice-unavailable notice appears / disappears

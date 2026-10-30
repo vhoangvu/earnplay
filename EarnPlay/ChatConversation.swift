@@ -278,6 +278,9 @@ struct ChatConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if viewModel.isVoiceUnavailable {
+                voiceUnavailableNotice
+            }
             thread
             composerBar
         }
@@ -305,20 +308,22 @@ struct ChatConversationView: View {
         .accessibilityValue("\(viewModel.progress.attemptedQuestions) of \(viewModel.progress.totalQuestions) questions started")
     }
 
+    // Fixed chrome below the header: stays in the visible viewport
+    // however far the thread below it has scrolled.
+    private var voiceUnavailableNotice: some View {
+        Text("Reading is unavailable on this device right now. You can still read the messages.")
+            .font(.body)
+            .foregroundStyle(ChatDesign.textSecondary)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(ChatDesign.surface)
+            .accessibilityIdentifier("chatVoiceUnavailableNotice")
+    }
+
     private var thread: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    if viewModel.isVoiceUnavailable {
-                        Text("Reading is unavailable on this device right now. You can still read the messages.")
-                            .font(.body)
-                            .foregroundStyle(ChatDesign.textSecondary)
-                            .padding(12)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(ChatDesign.surface)
-                            .clipShape(RoundedRectangle(cornerRadius: ChatDesign.cardRadius))
-                            .accessibilityIdentifier("chatVoiceUnavailableNotice")
-                    }
                     ForEach(viewModel.messages) { turn in
                         row(for: turn).id(turn.id)
                     }
