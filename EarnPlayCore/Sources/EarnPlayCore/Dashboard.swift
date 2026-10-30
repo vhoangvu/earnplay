@@ -282,19 +282,34 @@ public enum Dashboard {
     }
 
     /// Whether the Progress view should reload its cached report (fix
-    /// round 4: the timezone-aware foreground reload seam). True when the
-    /// comparison window moved under `calendar` OR when the time zone
-    /// changed between reloads — a zone change can move session buckets
-    /// even when both instants fall in the same new-calendar week, which
-    /// the week-only check above cannot see. A zone identifier change
-    /// (travel) or an offset change under the same identifier (DST)
-    /// both read true. Same week plus same zone reads false, preserving
-    /// the no-reload optimization. Pure in its inputs.
+    /// round 4: the timezone-aware foreground reload seam; fix round 6:
+    /// week-definition-aware). True when the comparison window moved under
+    /// `calendar` OR when the time zone changed between reloads OR when
+    /// the week definition (`firstWeekday`, from the device region, or the
+    /// calendar identifier) changed between reloads — a definition change
+    /// can move session buckets even when both instants fall in the same
+    /// new-calendar week, which the week-only check above cannot see. A
+    /// zone identifier change (travel) or an offset change under the same
+    /// identifier (DST) both read true, as does any firstWeekday or
+    /// identifier change. Same week plus same zone plus same definition
+    /// reads false, preserving the no-reload optimization. A nil week
+    /// definition side means untracked (pre-round-6 callers) and skips
+    /// that comparison. Pure in its inputs.
     public static func reloadNeeded(since previousNow: Date, previousTimeZone: TimeZone,
                                     now: Date, currentTimeZone: TimeZone,
+                                    previousFirstWeekday: Int? = nil,
+                                    currentFirstWeekday: Int? = nil,
+                                    previousCalendarIdentifier: Calendar.Identifier? = nil,
+                                    currentCalendarIdentifier: Calendar.Identifier? = nil,
                                     calendar: Calendar = .current) -> Bool {
         if timeZoneChanged(previous: previousTimeZone, previousNow: previousNow,
                            current: currentTimeZone, now: now) {
+            return true
+        }
+        if weekDefinitionChanged(previousFirstWeekday: previousFirstWeekday,
+                                 currentFirstWeekday: currentFirstWeekday,
+                                 previousIdentifier: previousCalendarIdentifier,
+                                 currentIdentifier: currentCalendarIdentifier) {
             return true
         }
         return comparisonWindowChanged(since: previousNow, now: now, calendar: calendar)
@@ -304,6 +319,21 @@ public enum Dashboard {
                                         current: TimeZone, now: Date) -> Bool {
         if previous.identifier != current.identifier { return true }
         return previous.secondsFromGMT(for: previousNow) != current.secondsFromGMT(for: now)
+    }
+
+    private static func weekDefinitionChanged(previousFirstWeekday: Int?,
+                                              currentFirstWeekday: Int?,
+                                              previousIdentifier: Calendar.Identifier?,
+                                              currentIdentifier: Calendar.Identifier?) -> Bool {
+        if let previousFirstWeekday, let currentFirstWeekday,
+           previousFirstWeekday != currentFirstWeekday {
+            return true
+        }
+        if let previousIdentifier, let currentIdentifier,
+           previousIdentifier != currentIdentifier {
+            return true
+        }
+        return false
     }
 
     // MARK: - Report

@@ -18,13 +18,16 @@ import EarnPlayCore
 struct DashboardView: View {
     let controller: AdminSyncController
     @State private var report: Dashboard.Report
-    /// The `now` and time zone the cached report was computed against.
-    /// Foreground reloads compare the current week and time zone to these,
-    /// so the comparison window always reflects the current week without
-    /// redundant recomputes when neither moved. Significant time changes
-    /// reload unconditionally (see below).
+    /// The `now`, time zone, and week definition the cached report was
+    /// computed against. Foreground reloads compare the current week,
+    /// time zone, and week definition to these, so the comparison window
+    /// always reflects the current week without redundant recomputes when
+    /// none moved. Significant time and locale changes reload
+    /// unconditionally (see below).
     @State private var lastReloadNow: Date
     @State private var lastReloadTimeZone: TimeZone
+    @State private var lastReloadFirstWeekday: Int
+    @State private var lastReloadCalendarIdentifier: Calendar.Identifier
     @Environment(\.scenePhase) private var scenePhase
 
     init(controller: AdminSyncController) {
@@ -35,6 +38,8 @@ struct DashboardView: View {
             logs: controller.sessionStore.allLogs, now: now, calendar: calendar))
         _lastReloadNow = State(initialValue: now)
         _lastReloadTimeZone = State(initialValue: calendar.timeZone)
+        _lastReloadFirstWeekday = State(initialValue: calendar.firstWeekday)
+        _lastReloadCalendarIdentifier = State(initialValue: calendar.identifier)
     }
 
     var body: some View {
@@ -75,14 +80,21 @@ struct DashboardView: View {
                 // Returning to the foreground never reruns .onAppear for
                 // an already-visible view, so a week boundary crossed
                 // while backgrounded would leave stale "This week"
-                // totals. Reload when the window or time zone moved; the
-                // Refresh button and sync-driven reload above are unchanged.
+                // totals. Reload when the window, time zone, or week
+                // definition moved; the Refresh button and sync-driven
+                // reload above are unchanged.
                 if newPhase == .active { reloadIfWeekChanged() }
             }
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.significantTimeChangeNotification)
             ) { _ in
                 // Time-zone changes can move session buckets even when both reload instants fall in the same calendar week.
+                reload()
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSLocale.currentLocaleDidChangeNotification)
+            ) { _ in
+                // Region changes can move the week start (firstWeekday) and shift session buckets without a significant time change.
                 reload()
             }
         }
@@ -96,18 +108,24 @@ struct DashboardView: View {
         let calendar = Calendar.current
         lastReloadNow = now
         lastReloadTimeZone = calendar.timeZone
+        lastReloadFirstWeekday = calendar.firstWeekday
+        lastReloadCalendarIdentifier = calendar.identifier
         report = Dashboard.compute(logs: controller.sessionStore.allLogs, now: now, calendar: calendar)
     }
 
     /// Foreground path: one `now` feeds both the window check and the
     /// recompute, so a boundary crossed mid-call cannot strand a
-    /// half-updated report. No-ops when neither the week nor the time
-    /// zone moved.
+    /// half-updated report. No-ops when none of the week, the time zone,
+    /// and the week definition moved.
     private func reloadIfWeekChanged() {
         let now = Date()
         let calendar = Calendar.current
         guard Dashboard.reloadNeeded(since: lastReloadNow, previousTimeZone: lastReloadTimeZone,
                                      now: now, currentTimeZone: calendar.timeZone,
+                                     previousFirstWeekday: lastReloadFirstWeekday,
+                                     currentFirstWeekday: calendar.firstWeekday,
+                                     previousCalendarIdentifier: lastReloadCalendarIdentifier,
+                                     currentCalendarIdentifier: calendar.identifier,
                                      calendar: calendar) else { return }
         reload(now: now)
     }
