@@ -37,7 +37,7 @@ final class DashboardFixRound1Tests: XCTestCase {
         let log = SessionLog(
             sessionId: "s-old", startedAt: date(c, 2026, 10, 12, 10),
             endedAt: date(c, 2026, 10, 12, 10), decisions: [], policyVersion: 1,
-            questions: [SessionQuestionRecord(questionId: "q1", skill: "division",
+            questionRecords: [SessionQuestionRecord(questionId: "q1", skill: "division",
                                               correct: true, activeMs: 30_000, hintsUsed: 0)])
         let report = Dashboard.compute(logs: [log], now: now, calendar: c)
         XCTAssertTrue(report.skillAccuracies.isEmpty)
@@ -63,11 +63,11 @@ final class DashboardFixRound1Tests: XCTestCase {
         let log = SessionLog(
             sessionId: "s-1", startedAt: date(c, 2026, 10, 28, 10),
             endedAt: date(c, 2026, 10, 28, 10), decisions: [], policyVersion: 1,
-            questions: [SessionQuestionRecord(questionId: "q1", skill: "division",
+            questionRecords: [SessionQuestionRecord(questionId: "q1", skill: "division",
                                               correct: false, activeMs: 30_000, hintsUsed: 0,
                                               errorType: nil)])
-        XCTAssertFalse(log.questions[0].correct)
-        XCTAssertNil(log.questions[0].errorType)
+        XCTAssertFalse(log.questionRecords[0].correct)
+        XCTAssertNil(log.questionRecords[0].errorType)
         let report = Dashboard.compute(logs: [log], now: now, calendar: c)
         XCTAssertNil(report.topError)
         XCTAssertEqual(report.activeTime.questionCount, 1)

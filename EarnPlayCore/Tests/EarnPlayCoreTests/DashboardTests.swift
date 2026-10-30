@@ -66,7 +66,7 @@ final class DashboardTests: XCTestCase {
         let old = SessionLog(
             sessionId: "s-old-1", startedAt: date(c, 2026, 10, 12, 10),
             endedAt: date(c, 2026, 10, 12, 10, 20), decisions: [], policyVersion: 3,
-            questions: [question("q8", skill: "division", correct: true, activeMs: 50000, hints: 0)],
+            questionRecords: [question("q8", skill: "division", correct: true, activeMs: 50000, hints: 0)],
             effort: SessionEffortRecord(score: 6, threshold: 8))
         let last = SessionLog(
             sessionId: "s-last-1", startedAt: date(c, 2026, 10, 20, 10),
@@ -80,7 +80,7 @@ final class DashboardTests: XCTestCase {
                          at: date(c, 2026, 10, 20, 10, 5)),
             ],
             policyVersion: 3,
-            questions: [
+            questionRecords: [
                 question("q6", skill: "multiplication-facts", correct: false,
                          activeMs: 60000, hints: 1, error: "computation"),
                 question("q7", skill: "multiplication-facts", correct: false,
@@ -99,7 +99,7 @@ final class DashboardTests: XCTestCase {
                          at: date(c, 2026, 10, 27, 10, 5)),
             ],
             policyVersion: 4,
-            questions: [
+            questionRecords: [
                 question("q1", skill: "multiplication-facts", correct: true,
                          activeMs: 45000, hints: 0),
                 question("q2", skill: "multiplication-facts", correct: false,
@@ -117,7 +117,7 @@ final class DashboardTests: XCTestCase {
                          at: date(c, 2026, 10, 28, 10, 20)),
             ],
             policyVersion: 4,
-            questions: [
+            questionRecords: [
                 question("q4", skill: "multiplication-facts", correct: true,
                          activeMs: 30000, hints: 0),
                 question("q5", skill: "fraction-comparison", correct: false,
@@ -186,7 +186,7 @@ final class DashboardTests: XCTestCase {
         let log = SessionLog(
             sessionId: "s-tie", startedAt: date(c, 2026, 10, 28, 10),
             endedAt: date(c, 2026, 10, 28, 10, 20), decisions: [], policyVersion: 1,
-            questions: [
+            questionRecords: [
                 question("a", skill: "division", correct: false, activeMs: 1000, hints: 0, error: "zebra"),
                 question("b", skill: "division", correct: false, activeMs: 1000, hints: 0, error: "apple"),
                 question("c", skill: "division", correct: false, activeMs: 1000, hints: 0, error: "zebra"),
@@ -334,7 +334,7 @@ final class DashboardTests: XCTestCase {
         XCTAssertEqual(decoded.sessionId, "s-1")
         XCTAssertEqual(decoded.decisions.count, 1)
         XCTAssertEqual(decoded.endedAt.timeIntervalSince(decoded.startedAt), 600)
-        XCTAssertTrue(decoded.questions.isEmpty)
+        XCTAssertTrue(decoded.questionRecords.isEmpty)
         XCTAssertNil(decoded.effort)
 
         let f = fixture()

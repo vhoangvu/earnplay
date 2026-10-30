@@ -82,6 +82,8 @@ public final class AdminSyncService: @unchecked Sendable {
     private let snapLock = NSLock()
     private var _snapshot: AdminSyncSnapshot
     public var onSnapshotChange: ((AdminSyncSnapshot) -> Void)?
+    /// Called after a session is durably stored (not for duplicates).
+    public var onSessionStored: ((SessionLog) -> Void)?
     public init(policyQueue: PolicyUpdateQueue, sessionStore: SessionLogStore,
                 transport: any SyncTransport, pairing: SyncPairingGate? = nil,
                 retry: SyncRetryConfiguration = SyncRetryConfiguration()) {
@@ -140,7 +142,13 @@ public final class AdminSyncService: @unchecked Sendable {
         case .sessionLog(let log):
             guard isPaired else { return }
             switch sessionStore.storeResult(log) {
-            case .stored, .duplicate:
+            case .stored:
+                publishSnapshot()
+                onSessionStored?(log)
+                if let ack = try? SyncMessageCodec.encode(.ackSession(sessionId: log.sessionId)) {
+                    try? transport.send(ack)
+                }
+            case .duplicate:
                 publishSnapshot()
                 if let ack = try? SyncMessageCodec.encode(.ackSession(sessionId: log.sessionId)) {
                     try? transport.send(ack)

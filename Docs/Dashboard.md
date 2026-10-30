@@ -9,8 +9,10 @@ queue, store, codec, and decision schema are unchanged.
 
 T4.2 adds two optional fields to `SessionLog`, both defaulting to empty:
 
-- `questions: [SessionQuestionRecord]` — per-question skill, correctness,
-  idle-paused active ms, hints used, and error type (incorrect only).
+- `questionRecords: [SessionQuestionRecord]` — per-question skill,
+  correctness, idle-paused active ms, hints used, and error type
+  (incorrect only). (Renamed from `questions` at the T4.2/T4.5 merge:
+  `questions` on `SessionLog` now carries the T4.5 auditor records.)
 - `effort: SessionEffortRecord?` — the session's T1.4 score vs threshold
   snapshot.
 
@@ -19,7 +21,7 @@ still decode and sync unchanged. No producer invents detail: sessions
 without recorded practice (e.g. the child sync-debug session) sync with
 empty detail, and the dashboard renders those cards as "not yet" states.
 
-## Known gap: no child-side detail producer yet (fix round 1)
+## Known gap: no child-side detail producer yet (fix round 1; producer tracked as code-repo issue #63)
 
 No production path attaches practice detail to `SessionLog` before
 upload — the only producer is the child sync-debug demo session, which
@@ -28,7 +30,10 @@ detail-dependent aggregates (accuracy, active time, hint rate, top
 error, effort trend) requires a child-side practice pipeline that does
 not exist on this branch: there is no TutorEngine/practice chat
 recording per-question results, and the only effort scorers run in
-demo-scoped or interaction-only contexts that never reach sync.
+demo-scoped or interaction-only contexts that never reach sync. That
+pipeline task is tracked as code-repo issue #63; at this merge the
+dashboard adapts to the renamed `questionRecords` field, and the five
+detail cards populate once #63 lands.
 
 The missing producer must record, per session, before `sendSessionLog`:
 per-question `SessionQuestionRecord`s (questionId, skill, correct,

@@ -43,7 +43,7 @@ final class DashboardFixRound3Tests: XCTestCase {
         let log = SessionLog(
             sessionId: "s-tue", startedAt: date(c, 2026, 10, 27, 10),
             endedAt: date(c, 2026, 10, 27, 10, 20), decisions: [], policyVersion: 1,
-            questions: [SessionQuestionRecord(questionId: "q1", skill: "division",
+            questionRecords: [SessionQuestionRecord(questionId: "q1", skill: "division",
                                               correct: true, activeMs: 30_000, hintsUsed: 0)])
         // Thu Oct 29: the session's week (Oct 26–Nov 1) is this week.
         let before = Dashboard.compute(logs: [log], now: date(c, 2026, 10, 29, 12), calendar: c)

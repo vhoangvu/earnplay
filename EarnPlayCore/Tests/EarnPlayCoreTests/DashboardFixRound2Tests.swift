@@ -110,15 +110,15 @@ final class DashboardFixRound2Tests: XCTestCase {
         let json = """
         {"sessionId":"s-1","startedAt":\(at.timeIntervalSinceReferenceDate),\
         "endedAt":\(at.addingTimeInterval(600).timeIntervalSinceReferenceDate),\
-        "decisions":[],"policyVersion":1,"questions":[\
+        "decisions":[],"policyVersion":1,"questionRecords":[\
         {"questionId":"q1","skill":"  division  ","correct":true,\
         "activeMs":-5000,"hintsUsed":-2,"errorType":"computation"}]}
         """
         let log = try SessionLogCodec.decode(Data(json.utf8))
-        XCTAssertEqual(log.questions.count, 1)
-        XCTAssertEqual(log.questions[0].skill, "division")
-        XCTAssertEqual(log.questions[0].activeMs, 0)
-        XCTAssertNil(log.questions[0].errorType)
+        XCTAssertEqual(log.questionRecords.count, 1)
+        XCTAssertEqual(log.questionRecords[0].skill, "division")
+        XCTAssertEqual(log.questionRecords[0].activeMs, 0)
+        XCTAssertNil(log.questionRecords[0].errorType)
         let report = Dashboard.compute(logs: [log], now: now, calendar: c)
         XCTAssertEqual(report.skillAccuracies.map(\.skill), ["division"])
         XCTAssertEqual(report.activeTime.totalActiveMs, 0)

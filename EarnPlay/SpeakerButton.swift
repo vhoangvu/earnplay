@@ -23,6 +23,7 @@ struct SpeakerButton: View {
             service.toggle(message)
         } label: {
             Image(systemName: isCurrentAndSpeaking ? "stop.fill" : "speaker.wave.2.fill")
+                .foregroundStyle(ChatDesign.primary)
                 .font(.body)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())

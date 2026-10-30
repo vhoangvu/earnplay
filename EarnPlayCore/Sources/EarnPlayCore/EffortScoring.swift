@@ -58,7 +58,7 @@ public struct EffortWeights: Equatable, Sendable {
 
 /// Raw effort signals for one session. Counts are clamped to zero on
 /// construction so downstream code never sees negative effort.
-public struct EffortSignals: Equatable, Sendable {
+public struct EffortSignals: Codable, Equatable, Sendable {
     /// Active seconds, already idle-paused (see `ActiveTimeTracker`).
     public var activeSeconds: Int
     public var genuineAttempts: Int

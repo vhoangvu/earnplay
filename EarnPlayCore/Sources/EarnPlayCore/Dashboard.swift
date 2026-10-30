@@ -278,7 +278,7 @@ public enum Dashboard {
         var lastTotal: [String: Int] = [:]
         for log in logs {
             guard let bucket = weekBucket(of: log.startedAt, now: now, calendar: calendar) else { continue }
-            for q in log.questions {
+            for q in log.questionRecords {
                 switch bucket {
                 case .thisWeek:
                     thisTotal[q.skill, default: 0] += 1
@@ -304,7 +304,7 @@ public enum Dashboard {
         var withHints = 0
         var errorCounts: [String: Int] = [:]
         for log in logs {
-            for q in log.questions {
+            for q in log.questionRecords {
                 questionCount += 1
                 totalMs += q.activeMs
                 if q.hintsUsed > 0 { withHints += 1 }
