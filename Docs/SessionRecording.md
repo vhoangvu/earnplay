@@ -125,3 +125,20 @@ sessions show "not yet" states, never zeroes. No score, timer,
 countdown, or pass/fail language is user-visible anywhere on this path,
 and production code carries no sample or hard-coded data (fixtures live
 in tests only).
+
+## Known gap: first-time pairing has no reachable confirmation surface
+
+`ChildSyncController` sets no `onPairingRequest` handler (its own comment
+says so): while no confirmation UI is attached, the transport refuses
+untrusted invitations instead of holding them unanswerable. The only
+confirmation UI is in `SyncDebugView`, which lives only in the unreachable
+`previewHarnesses`. First-time (untrusted) pairing therefore has no
+reachable confirmation surface in production; trusted reconnect works once
+the service runs (the persisted gate key and display name match the debug
+view's previous values, so an already-paired device reconnects
+automatically once started).
+
+Accepted limitation for this merge (same standing as the H5 deferral in
+`Docs/Sync.md`): building any pairing UI — setup/settings route or
+confirmation screen — is Vu's pending product decision, not this
+pipeline's. This note lets the merge decision be made with eyes open.

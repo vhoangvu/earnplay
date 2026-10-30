@@ -21,6 +21,7 @@ struct ContentView: View {
     /// Shared sync; the practice engine enqueues into its outbox
     /// instance and notifies its service after each durable enqueue.
     let syncController: ChildSyncController
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -39,11 +40,24 @@ struct ContentView: View {
                     ChatConversationView(engine: DemoTutorEngine(
                         recording: .productionDefault(
                             queue: syncController.sessionQueue,
-                            policyVersion: { [policyStore = syncController.policyStore] in
-                                policyStore.storedVersion
-                            },
+                            // Round 2 item 4: read the persisted version
+                            // per log (one file read per session). Setup
+                            // commits through a separate store, so the
+                            // controller's cache stays stale until
+                            // restart; a fresh read carries the post-setup
+                            // version with no restart. Sync
+                            // version-comparison semantics unchanged.
+                            policyVersion: { PolicyStore().storedVersion },
                             onSessionEnqueued: { [service = syncController.service] in
                                 service.notifySessionEnqueued()
+                            },
+                            // Round 2 item 2: a failed enqueue hands the
+                            // finalized log to the app-scoped controller,
+                            // which retains it across discarding this
+                            // view/engine and retries through the shared
+                            // queue on lifecycle triggers below.
+                            onEnqueueFailed: { [syncController] log in
+                                syncController.handleFailedEnqueue(log)
                             })))
                 } else {
                     SetupFlowView(viewModel: setup)
@@ -54,6 +68,13 @@ struct ContentView: View {
         }
         .task {
             downloadModel.refreshIfNeeded()
+        }
+        // Round 2 item 2: retry retained failed-enqueue logs when the app
+        // foregrounds — a real lifecycle trigger, never a timer.
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                syncController.retryPendingFailedLogs()
+            }
         }
     }
 

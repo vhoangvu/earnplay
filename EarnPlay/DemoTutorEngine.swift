@@ -36,6 +36,11 @@ struct PracticeRecordingDependencies {
     /// `notifySessionEnqueued()` so delivery does not depend on any view;
     /// nil (tests, recording-only use) keeps enqueue-only behavior.
     var onSessionEnqueued: (() -> Void)? = nil
+    /// Handoff for a finalized log whose enqueue failed (round 2 item 2).
+    /// Production wires this to the app-scoped `ChildSyncController`, which
+    /// retains the log and retries through the shared queue; nil (tests,
+    /// recording-only use) keeps engine-memory-only retry.
+    var onEnqueueFailed: ((SessionLog) -> Void)? = nil
 
     /// Production wiring: real on-device logger/queue/policy, one scorer
     /// draw per session, UUID session ids, live clock. Used only by the
@@ -47,11 +52,12 @@ struct PracticeRecordingDependencies {
         makeScorer: @escaping () -> EffortScorer = { EffortScorer() },
         makeSessionId: @escaping () -> String = { UUID().uuidString },
         now: @escaping () -> Date = Date.init,
-        onSessionEnqueued: (() -> Void)? = nil
+        onSessionEnqueued: (() -> Void)? = nil,
+        onEnqueueFailed: ((SessionLog) -> Void)? = nil
     ) -> Self {
         Self(makeSessionId: makeSessionId, logger: logger, queue: queue,
              makeScorer: makeScorer, policyVersion: policyVersion, now: now,
-             onSessionEnqueued: onSessionEnqueued)
+             onSessionEnqueued: onSessionEnqueued, onEnqueueFailed: onEnqueueFailed)
     }
 }
 
@@ -120,6 +126,16 @@ final class DemoTutorEngine: ChatTutorEngine {
             // endedAt). If it fails again the old session is kept and
             // stays retryable rather than orphaned.
             _ = finishRecordingSession()
+            // Round 2 item 1: the retry failed too — stay in the
+            // completed state and do NOT reset. Resetting here would
+            // reuse the old recorder for the new run (it exists and is
+            // not ended), and the next finish would short-circuit to
+            // the retained old log, losing the new run's records. The
+            // next start attempt retries again; on success the normal
+            // reset below proceeds.
+            if pendingFinishedLog != nil {
+                return ChatEngineUpdate(composer: .sessionComplete)
+            }
             index = 0
             attempted = []
             lastAnswer = nil
@@ -158,6 +174,36 @@ final class DemoTutorEngine: ChatTutorEngine {
     /// disabled, no session is active, or the session already finished.
     func endSession() {
         _ = finishRecordingSession()
+    }
+
+    /// Resumes recording after the practice view reappears mid-run (round
+    /// 2 item 3): starts a fresh recorder/scorer for the current question
+    /// when the prior session was finalized via `endSession`. The prior
+    /// log is already durable (or retained retryable); the continued run
+    /// records under a new session id. No-op when recording is disabled,
+    /// no session ever started, recording is still active, or the session
+    /// is complete (restart owns that). Recording-only: question state
+    /// (index, attempts, ladders) is untouched.
+    func resumeSession() {
+        guard let rec = recording, sessionRecorder != nil, recordingEnded,
+              let item = current else { return }
+        let startedAt = rec.now()
+        sessionScorer = rec.makeScorer()
+        let recorder = PracticeSessionRecorder(
+            sessionId: rec.makeSessionId(), startedAt: startedAt, now: rec.now)
+        sessionRecorder = recorder
+        recordingEnded = false
+        recorder.startQuestion(questionId: item.result.question.questionId,
+                               skill: item.result.question.skill, at: startedAt)
+    }
+
+    /// The CURRENT session's hint-listen sink (round 2 item 5): the live
+    /// effort recorder while actively recording, nil once the session
+    /// finishes (or when recording is disabled) so the production chat's
+    /// forwarding sink never delivers to a stale recorder.
+    var currentHintListenSink: (any HintListenEventSink)? {
+        guard !recordingEnded, let recorder = sessionRecorder else { return nil }
+        return recorder.effortRecorder
     }
 
     /// Composer activity (typing, number-pad taps, draft edits): a timing
@@ -205,6 +251,11 @@ final class DemoTutorEngine: ChatTutorEngine {
         do {
             try rec.queue.enqueue(log)
         } catch {
+            // Hand the finalized log to the app-scoped owner (round 2
+            // item 2) so discarding this engine does not lose it. The
+            // engine also retains it for its own retry (dedupe by
+            // sessionId makes a double enqueue safe).
+            rec.onEnqueueFailed?(log)
             return nil
         }
         recordingEnded = true

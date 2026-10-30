@@ -23,25 +23,74 @@ import EarnPlayCore
 /// no confirmation UI is attached the transport refuses untrusted
 /// invitations instead of holding them unanswerable.
 final class ChildSyncController {
-    let policyStore = PolicyStore()
-    let sessionQueue = SessionLogQueue()
+    let policyStore: PolicyStore
+    let sessionQueue: SessionLogQueue
     // Persisted installation identity, pairing, and secret — the same
     // device across relaunches. Key/displayName unchanged from the
     // debug view's standalone gate so trusted pairing survives.
-    let pairing = SyncPairingStore.loadOrCreateGate(displayName: "EarnPlay-Child",
-                                                    key: "earnplay.pairing.child.v1")
+    let pairing: SyncPairingGate
     let transport: MultipeerSyncTransport
     let service: ChildSyncService
     private var started = false
-    init() {
-        transport = MultipeerSyncTransport(role: .advertiser, displayName: "EarnPlay-Child", pairing: pairing)
-        service = ChildSyncService(policyStore: policyStore, sessionQueue: sessionQueue,
-                                   transport: transport, pairing: pairing)
+    /// Finalized logs whose enqueue failed, handed off from the practice
+    /// engine (round 2 item 2). Retained here — the app-scoped owner —
+    /// so discarding the practice view does not lose them. Retried
+    /// through the shared `sessionQueue` (never a second writer).
+    private(set) var pendingFailedLogs: [SessionLog] = []
+    /// Fired after a retained failed log drains (round 2 item 2 test
+    /// hook; production delivery is `service.notifySessionEnqueued()`).
+    var onSessionEnqueued: (() -> Void)?
+    init(policyStore: PolicyStore = PolicyStore(),
+         sessionQueue: SessionLogQueue = SessionLogQueue(),
+         pairing: SyncPairingGate? = nil) {
+        self.policyStore = policyStore
+        self.sessionQueue = sessionQueue
+        self.pairing = pairing ?? SyncPairingStore.loadOrCreateGate(
+            displayName: "EarnPlay-Child", key: "earnplay.pairing.child.v1")
+        self.transport = MultipeerSyncTransport(
+            role: .advertiser, displayName: "EarnPlay-Child", pairing: self.pairing)
+        self.service = ChildSyncService(
+            policyStore: self.policyStore, sessionQueue: self.sessionQueue,
+            transport: self.transport, pairing: self.pairing)
     }
     func startIfNeeded() {
         guard !started else { return }
         started = true
         service.start()
+        retryPendingFailedLogs()
+    }
+    /// Retains a finalized log whose enqueue failed (round 2 item 2
+    /// handoff from the practice engine). Deduplicated by sessionId, so
+    /// a repeated handoff of the same session replaces rather than
+    /// duplicates. Survives discarding the practice view/engine; the
+    /// app-scoped controller outlives both.
+    func handleFailedEnqueue(_ log: SessionLog) {
+        if let index = pendingFailedLogs.firstIndex(where: { $0.sessionId == log.sessionId }) {
+            pendingFailedLogs[index] = log
+        } else {
+            pendingFailedLogs.append(log)
+        }
+    }
+    /// Retries retained failed logs through the SHARED `sessionQueue`
+    /// (never a second writer over the same directory). Each drained log
+    /// kicks delivery via `service.notifySessionEnqueued()` and the
+    /// `onSessionEnqueued` hook. Called on app-lifecycle triggers
+    /// (controller start, foreground via the app's scenePhase observer) —
+    /// never on a timer. Failures stay retained for the next trigger.
+    func retryPendingFailedLogs() {
+        var drained: [String] = []
+        for log in pendingFailedLogs {
+            do {
+                try sessionQueue.enqueue(log)
+                drained.append(log.sessionId)
+            } catch {
+                // Still failing: keep for the next lifecycle trigger.
+            }
+        }
+        guard !drained.isEmpty else { return }
+        pendingFailedLogs.removeAll { drained.contains($0.sessionId) }
+        service.notifySessionEnqueued()
+        onSessionEnqueued?()
     }
     /// Reset/Unpair: clears pairing + secret on both the gate
     /// (persisted) and the live transport session, then republish.
