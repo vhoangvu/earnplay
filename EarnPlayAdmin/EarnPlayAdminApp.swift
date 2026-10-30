@@ -12,6 +12,9 @@ final class AdminSyncController {
                                                     key: "earnplay.pairing.admin.v1")
     let transport: MultipeerSyncTransport
     let service: AdminSyncService
+    /// Separate admin-app auditor instance (T4.5), distinct from the
+    /// child-app tutor runtime. Advisory only.
+    lazy var auditor = AdminAuditorController(sessionStore: sessionStore)
     private var started = false
     init() {
         transport = MultipeerSyncTransport(role: .browser, displayName: "EarnPlay-Admin", pairing: pairing)
@@ -22,6 +25,8 @@ final class AdminSyncController {
         guard !started else { return }
         started = true
         service.start()
+        // Auditor runs at sync time over already-synced logs.
+        auditor.runAudit()
     }
     /// Reset/Unpair (round 4, M7): clears pairing + secret on both
     /// the gate (persisted) and the live transport session.
@@ -41,6 +46,8 @@ struct EarnPlayAdminApp: App {
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
                 SessionsView(controller: syncController)
                     .tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
+                AuditorView(auditor: syncController.auditor)
+                    .tabItem { Label("Auditor", systemImage: "checkmark.shield") }
                 AdminVersionView()
                     .tabItem { Label("Version", systemImage: "info.circle") }
             }
