@@ -36,9 +36,10 @@ Per-question facts, all from recorded sources only:
   explanations, never graded, and never change correctness.
 - `activeMs`: idle-paused engaged milliseconds on the question. Anchors
   are the question start, each recorded interaction on that question
-  (hint, graded answer, probe reply), and the question end; each gap
-  contributes at most 20 seconds (`ActiveTimeTracker` default). Time
-  beyond the pause with no interaction never counts. Not wall-clock.
+  (hint shown, hint listened, graded answer, probe reply, composer
+  activity), and the question end; each gap contributes at most 20
+  seconds (`ActiveTimeTracker` default). Time beyond the pause with no
+  interaction never counts. Not wall-clock.
 - `hintsUsed`: count of `HintLadder.requestHint()` successes for the
   question (exhausted taps record nothing), equal to
   `ladder.events.count`.
@@ -125,6 +126,24 @@ sessions show "not yet" states, never zeroes. No score, timer,
 countdown, or pass/fail language is user-visible anywhere on this path,
 and production code carries no sample or hard-coded data (fixtures live
 in tests only).
+
+## Failed-enqueue retention (round 2 handoff, round 3 quit survival)
+
+When a session log's queue enqueue fails, the engine hands the finalized
+log to the app-scoped `ChildSyncController` (`onEnqueueFailed`, wired in
+`EarnPlayApp`), which retains it by sessionId and retries through the
+shared `SessionLogQueue` on lifecycle triggers (controller start,
+foreground) — the same queue instance, the same sessionId dedupe, the
+same `notifySessionEnqueued` delivery kick. Retention is also persisted
+best-effort to `pending-failed-logs.json` beside the queue, loaded on
+controller init and re-persisted on every retain and drain, so a retained
+log survives app quit.
+
+Residual limitation: the retention write is only as reliable as the disk.
+When the enqueue failure is disk-full, the retention write fails the same
+way and retention stays memory-only — a quit before any retry trigger
+then loses the log. This is accepted as a bounded residue (no second
+storage subsystem); the in-memory list is always retained regardless.
 
 ## Known gap: first-time pairing has no reachable confirmation surface
 

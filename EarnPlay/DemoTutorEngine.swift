@@ -88,10 +88,22 @@ final class DemoTutorEngine: ChatTutorEngine {
     /// attempt and cleared only after the enqueue succeeds, so a retry
     /// enqueues THAT log (original records/effort/endedAt, no recompute).
     private var pendingFinishedLog: SessionLog?
+    /// True once a resume-time persistence retry has failed (round 3 item
+    /// 1): input stays blocked until the pending log drains. Set only
+    /// alongside a retained `pendingFinishedLog`, cleared only by a
+    /// successful enqueue in `finishRecordingSession` (the single drain
+    /// funnel), so blocked always implies a pending log to retry.
+    private var resumeBlockedOnPersistence = false
 
     /// Active recording session id, for tests. Nil when recording is
     /// disabled or no session has started.
     var recordingSessionId: String? { sessionRecorder?.sessionId }
+
+    /// Whether input is blocked awaiting persistence (round 3 item 1).
+    /// True after a resume-time pending-log retry fails; the view model
+    /// renders the session-complete state (which refuses all submissions)
+    /// until a later retry observes the drain.
+    var isInputBlocked: Bool { resumeBlockedOnPersistence }
 
     init(maxQuestions: Int = 3, recording: PracticeRecordingDependencies? = nil) {
         self.recording = recording
@@ -142,6 +154,19 @@ final class DemoTutorEngine: ChatTutorEngine {
             awaitingProbeReply = false
             items = items.map { Item(result: $0.result, ladder: HintLadder(result: $0.result)) }
         }
+        // Round 3 item 1: a mid-run start while a prior finalize is still
+        // undrained (the blocked reappearance's "Start again") retries it
+        // first — the same stay-complete-until-durable rule as the
+        // completed restart above. Success falls through to a fresh
+        // recorder below (`recordingEnded` is true after the drain);
+        // failure stays blocked. No-op unless a log is pending.
+        if pendingFinishedLog != nil {
+            _ = finishRecordingSession()
+            if pendingFinishedLog != nil {
+                resumeBlockedOnPersistence = true
+                return ChatEngineUpdate(composer: .sessionComplete)
+            }
+        }
         guard let item = current else {
             return ChatEngineUpdate(turns: [.tutor(nextMessage(
                 text: "Let's practise together. Take your time.",
@@ -151,18 +176,12 @@ final class DemoTutorEngine: ChatTutorEngine {
         // first start and on restart after a finished session. A second
         // start without a finish keeps the active session.
         if let rec = recording, sessionRecorder == nil || recordingEnded {
-            let startedAt = rec.now()
-            sessionScorer = rec.makeScorer()
-            let recorder = PracticeSessionRecorder(
-                sessionId: rec.makeSessionId(), startedAt: startedAt, now: rec.now)
-            sessionRecorder = recorder
-            recordingEnded = false
-            recorder.startQuestion(questionId: item.result.question.questionId,
-                                   skill: item.result.question.skill, at: startedAt)
+            beginFreshRecordingSession(recording: rec, questionId: item.result.question.questionId,
+                                        skill: item.result.question.skill)
         }
         return ChatEngineUpdate(
             turns: [questionTurn(item)],
-            progress: ChatProgress(totalQuestions: items.count, attemptedQuestions: 0),
+            progress: ChatProgress(totalQuestions: items.count, attemptedQuestions: attempted.count),
             composer: composer(for: item))
     }
 
@@ -177,45 +196,88 @@ final class DemoTutorEngine: ChatTutorEngine {
     }
 
     /// Resumes recording after the practice view reappears mid-run (round
-    /// 2 item 3): starts a fresh recorder/scorer for the current question
-    /// when the prior session was finalized via `endSession`. The prior
-    /// log is already durable (or retained retryable); the continued run
-    /// records under a new session id. No-op when recording is disabled,
-    /// no session ever started, recording is still active, or the session
-    /// is complete (restart owns that). Recording-only: question state
-    /// (index, attempts, ladders) is untouched.
+    /// 2 item 3, round 3 item 1): resolves pending-log ownership BEFORE
+    /// resuming. When the `endSession` finalize failed its enqueue, the
+    /// pending log is retried first; only a drained prior log resumes into
+    /// a fresh recorder/scorer for the current question (the continued run
+    /// records under a new session id). A retry that still fails blocks
+    /// input instead (`isInputBlocked`, no fresh recorder): resuming on
+    /// top of an unresolved pending log would record continued answers
+    /// into the old recorder, which the next finish short-circuits past —
+    /// dropping them. No-op when recording is disabled, no session ever
+    /// started, recording is still active, or the session is complete
+    /// (restart owns that). Recording-only: question state (index,
+    /// attempts, ladders) is untouched.
     func resumeSession() {
-        guard let rec = recording, sessionRecorder != nil, recordingEnded,
+        guard let rec = recording, sessionRecorder != nil,
               let item = current else { return }
+        if pendingFinishedLog != nil {
+            // drainPendingAndResume blocks input itself on failure.
+            _ = drainPendingAndResume(questionId: item.result.question.questionId,
+                                       skill: item.result.question.skill)
+            return
+        }
+        guard recordingEnded else { return }
+        beginFreshRecordingSession(recording: rec, questionId: item.result.question.questionId,
+                                    skill: item.result.question.skill)
+    }
+
+    /// Retries the pending log's enqueue and, on success, starts a fresh
+    /// recorder/scorer for the current question (round 3 item 1). The queue
+    /// dedupes by sessionId (`SessionLogQueue.enqueue` replaces in place),
+    /// so a retry after the controller already drained its handed-off copy
+    /// of the same log overwrites it instead of double-delivering.
+    /// Returns false (and blocks input) when the retry still fails, in
+    /// which case no recorder is started and nothing is recorded.
+    private func drainPendingAndResume(questionId: String, skill: String) -> Bool {
+        guard let rec = recording, finishRecordingSession() != nil else {
+            resumeBlockedOnPersistence = true
+            return false
+        }
+        beginFreshRecordingSession(recording: rec, questionId: questionId, skill: skill)
+        return true
+    }
+
+    /// Starts a fresh recorder/scorer for one question: a new session id,
+    /// open recording, and the question started. Shared by first/restart
+    /// starts, resumes, and blocked-state retries that just drained.
+    private func beginFreshRecordingSession(recording rec: PracticeRecordingDependencies,
+                                             questionId: String, skill: String) {
         let startedAt = rec.now()
         sessionScorer = rec.makeScorer()
         let recorder = PracticeSessionRecorder(
             sessionId: rec.makeSessionId(), startedAt: startedAt, now: rec.now)
         sessionRecorder = recorder
         recordingEnded = false
-        recorder.startQuestion(questionId: item.result.question.questionId,
-                               skill: item.result.question.skill, at: startedAt)
+        recorder.startQuestion(questionId: questionId, skill: skill, at: startedAt)
     }
 
-    /// The CURRENT session's hint-listen sink (round 2 item 5): the live
-    /// effort recorder while actively recording, nil once the session
-    /// finishes (or when recording is disabled) so the production chat's
-    /// forwarding sink never delivers to a stale recorder.
+    /// The CURRENT session's hint-listen sink (round 2 item 5, round 3 item
+    /// 2): the live session recorder while actively recording — one listen
+    /// event records both the question timing anchor and the effort event
+    /// — nil once the session finishes, while input is blocked awaiting
+    /// persistence (no active session exists to anchor to), or when
+    /// recording is disabled, so the production chat's forwarding sink
+    /// never delivers to a stale recorder.
     var currentHintListenSink: (any HintListenEventSink)? {
-        guard !recordingEnded, let recorder = sessionRecorder else { return nil }
-        return recorder.effortRecorder
+        guard !recordingEnded, !resumeBlockedOnPersistence,
+              let recorder = sessionRecorder else { return nil }
+        return recorder
     }
 
     /// Composer activity (typing, number-pad taps, draft edits): a timing
     /// anchor on the current question via `recordInteraction` — question
     /// timing plus session active time, never attempt/hint counts.
     /// No-op when recording is disabled, no session is active, no
-    /// question is current, or the session already finished. Unthrottled:
+    /// question is current, the session already finished, or input is
+    /// blocked awaiting persistence (no active session exists to anchor
+    /// to; anchoring the dead recorder would be dropped). Unthrottled:
     /// one `Date` per keystroke is trivially bounded, and any throttle
     /// would cost timing accuracy.
     func recordComposerActivity() {
         guard let rec = recording, let recorder = sessionRecorder,
-              !recordingEnded, let item = current else { return }
+              !recordingEnded, !resumeBlockedOnPersistence,
+              let item = current else { return }
         recorder.recordInteraction(questionId: item.result.question.questionId, at: rec.now())
     }
 
@@ -260,6 +322,11 @@ final class DemoTutorEngine: ChatTutorEngine {
         }
         recordingEnded = true
         pendingFinishedLog = nil
+        // Persistence observed succeeding: lift any resume block (round 3
+        // item 1). Retry-on-touch unblocks from here — no controller→engine
+        // signal exists, so the next resume, submission, hint, or start
+        // observes the drain and proceeds.
+        resumeBlockedOnPersistence = false
         // Durable now: kick delivery (the service does not poll).
         rec.onSessionEnqueued?()
         return log
@@ -270,6 +337,19 @@ final class DemoTutorEngine: ChatTutorEngine {
             // Explicit session-complete state, never a silent empty
             // update behind an editable composer.
             return ChatEngineUpdate(composer: items.isEmpty ? nil : .sessionComplete)
+        }
+        // Round 3 item 1: while blocked on persistence, a submission
+        // retries the pending enqueue instead of recording into the dead
+        // recorder. Success drains the old log and starts a fresh recorder
+        // for the current question then processes below; failure refuses
+        // with the session-complete state — no state advance, nothing
+        // recorded. (The view model already refuses submissions behind a
+        // complete composer; this is the engine boundary's own guarantee.)
+        if resumeBlockedOnPersistence {
+            guard drainPendingAndResume(questionId: item.result.question.questionId,
+                                        skill: item.result.question.skill) else {
+                return ChatEngineUpdate(composer: .sessionComplete)
+            }
         }
         // A pending probe takes this submission as the child's
         // explanation: acknowledge the thinking, do not grade it
@@ -376,6 +456,17 @@ final class DemoTutorEngine: ChatTutorEngine {
             // Finished session: restate the explicit complete state
             // instead of silently returning nothing.
             return ChatEngineUpdate(composer: items.isEmpty ? nil : .sessionComplete)
+        }
+        // Round 3 item 1: while blocked on persistence, a hint request
+        // retries the pending enqueue instead of consuming a ladder hint
+        // that could not be recorded. Success drains and starts a fresh
+        // recorder, then the request processes below; failure refuses with
+        // the session-complete state.
+        if resumeBlockedOnPersistence {
+            guard drainPendingAndResume(questionId: item.result.question.questionId,
+                                        skill: item.result.question.skill) else {
+                return ChatEngineUpdate(composer: .sessionComplete)
+            }
         }
         guard let hint = item.ladder.requestHint() else {
             return ChatEngineUpdate()

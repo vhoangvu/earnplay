@@ -88,12 +88,18 @@ protocol ChatTutorEngine: AnyObject {
     /// the engine records a timing anchor on the current question, never
     /// an attempt or hint count. Default is a no-op.
     func recordComposerActivity()
-    /// The CURRENT session's hint-listen sink (round 2 item 5): the live
-    /// effort recorder while a session is actively recording, nil when
-    /// recording is disabled, no session is active, or the session
-    /// already finished — so a stale recorder never receives events for
+    /// The CURRENT session's hint-listen sink (round 2 item 5, round 3
+    /// item 2): the live session recorder while a session is actively
+    /// recording, nil when recording is disabled, no session is active,
+    /// input is blocked awaiting persistence, or the session already
+    /// finished — so a stale recorder never receives events for
     /// a new session. Default is nil.
     var currentHintListenSink: (any HintListenEventSink)? { get }
+    /// True while the engine blocks input awaiting persistence (round 3
+    /// item 1): a mid-run resume whose pending-log retry still failed. The
+    /// view model renders the session-complete state (which refuses all
+    /// submissions) until the block lifts. Default is false.
+    var isInputBlocked: Bool { get }
 }
 
 extension ChatTutorEngine {
@@ -101,6 +107,7 @@ extension ChatTutorEngine {
     func resumeSession() {}
     func recordComposerActivity() {}
     var currentHintListenSink: (any HintListenEventSink)? { nil }
+    var isInputBlocked: Bool { false }
 }
 
 // MARK: - Untrusted child input
@@ -186,12 +193,12 @@ final class ChatConversationViewModel: ObservableObject {
     init(engine: any ChatTutorEngine, speech: ReadAloudService) {
         self.engine = engine
         self.speech = speech
-        // Round 2 item 5: successful hint playback reaches the CURRENT
-        // session's effort recorder (listen effort + timing anchor; the
-        // recorder's `recordHintListen` never touches `hintsUsed`, which
-        // stays tied to ladder-show events). The forwarder resolves the
-        // live session per event, tracking restarts with no manual
-        // re-wiring and never delivering to a stale recorder.
+        // Round 2 item 5, round 3 item 2: successful hint playback reaches
+        // the CURRENT session's recorder (question timing anchor + listen
+        // effort; the recorder's `recordHintListen` never touches
+        // `hintsUsed`, which stays tied to ladder-show events). The
+        // forwarder resolves the live session per event, tracking restarts
+        // with no manual re-wiring and never delivering to a stale recorder.
         let forwarder = CurrentSessionHintListenForwarder { [engine] in
             engine.currentHintListenSink
         }
@@ -236,14 +243,21 @@ final class ChatConversationViewModel: ObservableObject {
     func startIfNeeded() {
         if started {
             // Reappearance after a mid-session disappearance (round 2
-            // item 3): resume a fresh recording session for the continued
-            // run. Recording-only — no thread/progress/composer change —
-            // so the decision stays at the engine/view-model boundary
-            // and the view holds no behavior logic.
+            // item 3, round 3 item 1): resume a fresh recording session
+            // for the continued run. A drained resume is recording-only —
+            // no thread/progress/composer change — so the decision stays
+            // at the engine/view-model boundary and the view holds no
+            // behavior logic. A resume whose persistence retry still fails
+            // blocks input instead: the completion state refuses every
+            // submission until a later retry observes the drain (the
+            // restart action replays the retry).
             if needsResumeAfterDisappear {
                 needsResumeAfterDisappear = false
                 if !isSessionComplete {
                     engine.resumeSession()
+                    if engine.isInputBlocked {
+                        apply(ChatEngineUpdate(composer: .sessionComplete))
+                    }
                 }
             }
             return

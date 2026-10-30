@@ -391,6 +391,10 @@ final class PipelineRound2Item5Tests: XCTestCase {
         XCTAssertEqual(log?.questionRecords.count, 1)
         XCTAssertEqual(log?.questionRecords.first?.hintsUsed, 1,
                        "listen must not double-count hintsUsed")
+        // Round 3 item 2: the listen at t0+70 must anchor question timing,
+        // splitting the 130s gap: 10 + 20 + 20 = 50s active.
+        XCTAssertEqual(log?.questionRecords.first?.activeMs, 50000,
+                       "hint listen must anchor question timing")
         // Listen effort + anchor: 2 hint interactions (show + listen),
         // 1 genuine attempt, and 60s active (10 + 20 + 20 + 10) = 1
         // minute: 4 + 2 + 1 = 7 vs threshold 10. Without the wiring the

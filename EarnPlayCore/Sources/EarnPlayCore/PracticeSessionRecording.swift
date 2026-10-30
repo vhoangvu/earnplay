@@ -31,7 +31,7 @@ import Foundation
 /// effort reuses the owned `EffortSessionRecorder` directly, so the snapshot
 /// score/threshold always equals the T1.4 evaluation of the recorded
 /// session.
-public final class PracticeSessionRecorder: @unchecked Sendable {
+public final class PracticeSessionRecorder: HintListenEventSink, @unchecked Sendable {
     public let sessionId: String
     public let startedAt: Date
     public let idlePauseSeconds: TimeInterval
@@ -139,6 +139,26 @@ public final class PracticeSessionRecorder: @unchecked Sendable {
         lock.unlock()
         effortRecorder.recordFollowUpInteraction(at: at)
         effortRecorder.recordExplanation(at: at)
+    }
+
+    /// `HintListenEventSink` (round 3 item 2): one listen event does BOTH
+    /// the question timing anchor for the current question AND the session
+    /// effort event. The event carries no question id, so the anchor goes
+    /// to the recorder's current question — the most recently started one
+    /// (`order.last`, which is the unfinished question while a session is
+    /// actively recording). `hintsUsed` is untouched: it stays tied to
+    /// ladder-show events (`recordHint` is its only writer). Out-of-window
+    /// anchors are filtered by `activeMs`, so a late listen after its
+    /// question ended contributes no time.
+    public func recordHintListen(_ event: HintListenEvent) {
+        let at = event.emittedAt
+        lock.lock()
+        if let currentId = order.last, var state = states[currentId] {
+            state.interactionDates.append(at)
+            states[currentId] = state
+        }
+        lock.unlock()
+        effortRecorder.recordHintListen(event)
     }
 
     /// Generic interaction (typing, non-substantive reply): question timing
