@@ -102,15 +102,13 @@ if redTeam {
     print(RedTeamScorecard.render(batteryReport))
     do {
         let data = try RedTeamReportIO.encode(batteryReport)
-        let reportURL = URL(fileURLWithPath: redTeamReportPath)
-        let parent = reportURL.deletingLastPathComponent()
-        if !parent.path.isEmpty {
-            try FileManager.default.createDirectory(
-                at: parent, withIntermediateDirectories: true)
-        }
-        try data.write(to: reportURL, options: [.atomic])
+        try EvalPaths.writeRedTeamReport(
+            data, to: redTeamReportPath, refusingBaseline: baselinePath)
         print("")
         print("Report written to \(redTeamReportPath)")
+    } catch EvalPaths.ClashError.reportEqualsBaseline(let report, let baseline) {
+        fail("--red-team-report (\(report)) resolves to the same file as"
+            + " --baseline (\(baseline)); refusing to overwrite the baseline")
     } catch {
         fail("could not write red-team report to \(redTeamReportPath): \(error)")
     }

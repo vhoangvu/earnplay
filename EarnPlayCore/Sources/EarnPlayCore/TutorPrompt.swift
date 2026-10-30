@@ -97,22 +97,45 @@ public enum TutorPrompt {
     /// not exactly the escaped form of its decoding (e.g. a raw
     /// marker inside the payload, or text after the end marker).
     public static func extractChildInput(from assembled: String) -> String? {
-        guard let begin = assembled.range(of: dataBeginMarker) else { return nil }
-        let closing = "\n" + dataEndMarker
-        guard assembled.hasSuffix(closing) else { return nil }
-        // Payload lies between "\n" after the begin marker and the
-        // "\n" before the closing end marker.
-        let afterBegin = begin.upperBound
-        guard afterBegin < assembled.endIndex,
-              assembled[afterBegin] == "\n" else { return nil }
-        let payloadStart = assembled.index(after: afterBegin)
-        let payloadEnd = assembled.index(
-            assembled.endIndex, offsetBy: -closing.count)
-        guard payloadStart <= payloadEnd else { return nil }
-        let payload = String(assembled[payloadStart..<payloadEnd])
-        guard let decoded = unescapedChildInput(payload),
-              escapedChildInput(decoded) == payload else { return nil }
-        return decoded
+        // Scalar view: delimiter matching and slicing must not fuse a
+        // trailing \r in the payload with the appended \n (\r\n is one
+        // grapheme, which broke Character-based indexing).
+        let beginScalars = Array(dataBeginMarker.unicodeScalars)
+        let endScalars = Array(dataEndMarker.unicodeScalars)
+        let all = Array(assembled.unicodeScalars)
+
+        // All begin-marker offsets, ascending.
+        var beginStarts: [Int] = []
+        if beginScalars.count <= all.count {
+            for start in 0...(all.count - beginScalars.count)
+            where Array(all[start..<(start + beginScalars.count)]) == beginScalars {
+                beginStarts.append(start)
+            }
+        }
+        guard !beginStarts.isEmpty else { return nil }
+        // Closing is exactly "\n" + endMarker at the very end, scalar-wise.
+        let closing: [Unicode.Scalar] = ["\n"] + endScalars
+        guard all.count >= closing.count,
+              Array(all.suffix(closing.count)) == closing else { return nil }
+        let payloadEnd = all.count - closing.count
+        // The real section is the first begin candidate whose payload is
+        // exactly the escaped form of its decoding. A marker echoed in
+        // session context cannot qualify: its candidate payload contains
+        // the real begin marker raw, which re-escaping would prefix.
+        // Escaped markers inside the payload are never reached because
+        // the real begin precedes them.
+        for start in beginStarts {
+            let afterBegin = start + beginScalars.count
+            guard afterBegin < all.count, all[afterBegin] == "\n" else { continue }
+            let payloadStart = afterBegin + 1
+            guard payloadStart <= payloadEnd else { continue }
+            let payload = String(String.UnicodeScalarView(all[payloadStart..<payloadEnd]))
+            if let decoded = unescapedChildInput(payload),
+               escapedChildInput(decoded) == payload {
+                return decoded
+            }
+        }
+        return nil
     }
 
     /// True when an assembled call's data section provably encloses

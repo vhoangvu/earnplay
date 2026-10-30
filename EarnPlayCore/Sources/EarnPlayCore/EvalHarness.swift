@@ -1238,6 +1238,18 @@ public enum EvalPaths: Sendable {
     /// creation, no data write), so a clash leaves the baseline byte-identical.
     public static func writeReport(_ data: Data, to reportPath: String,
                                    refusingBaseline baselinePath: String) throws {
+        try writeGuarded(data, to: reportPath, refusingBaseline: baselinePath)
+    }
+
+    /// Red-team report destination guard: refuses baseline paths
+    /// with the same semantics as `writeReport`.
+    public static func writeRedTeamReport(_ data: Data, to reportPath: String,
+                                          refusingBaseline baselinePath: String) throws {
+        try writeGuarded(data, to: reportPath, refusingBaseline: baselinePath)
+    }
+
+    private static func writeGuarded(_ data: Data, to reportPath: String,
+                                     refusingBaseline baselinePath: String) throws {
         if resolveToSameFile(reportPath, baselinePath) {
             throw ClashError.reportEqualsBaseline(
                 reportPath: reportPath, baselinePath: baselinePath)
