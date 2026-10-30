@@ -24,6 +24,10 @@ import MultipeerConnectivity
 /// handles are allocated by MCPeerID equality per session
 /// generation (item 5); stop() preserves the durable pairing and
 /// secret, clearing only transient state (item 6).
+/// Round 7: a failed outgoing invitation is owned by handle, so a
+/// pre-connection failure of a trusted (persisted-pairing) invitation
+/// retries with backoff instead of stranding the peer as invited
+/// (item 1).
 /// Allocates transport handles for peer instances (fix round 6,
 /// item 5): by `MCPeerID` equality (`isEqual`), not object
 /// reference. Two separately created `MCPeerID(displayName:)`
@@ -90,6 +94,18 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
     private var dataPlaneBinding = DataPlaneBinding()
     // Round 5 (item 5): one outstanding browser-side handshake.
     private var activeHandshakeHandle: String?
+    // Fix round 7 (item 1): the handle an outgoing invitation was
+    // issued to, kept separately from the handshake/data-plane
+    // bindings. An invitation that fails BEFORE .connected owns
+    // neither binding, so without this record its .notConnected was
+    // scoped out of cleanup by the round-6 handle checks and the
+    // peer stayed marked invited forever. All access under stateLock.
+    private var outstandingInvitationHandle: String?
+    /// Lock-guarded read for @testable tests asserting the
+    /// invitation-ownership lifecycle (fix round 7, item 1).
+    var outstandingInvitationHandleForTesting: String? {
+        stateLock.lock(); defer { stateLock.unlock() }; return outstandingInvitationHandle
+    }
     // Round 5 (item 6): a challenge this side cannot answer yet (no
     // corrected code after a mismatch) is stashed, not dropped, so
     // acceptance can answer it and restart both directions.
@@ -241,6 +257,7 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         issuedChallenge = nil; trustedNonce = nil; trustedPending = false
         remoteVerified = false; verifiedPeer = nil; dataPlanePeer = nil
         dataPlaneBinding.clear(); activeHandshakeHandle = nil
+        outstandingInvitationHandle = nil
         pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
         stateLock.unlock()
         resolver.forgetAll(); handleAllocator.reset()
@@ -296,6 +313,10 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
         for candidate in candidates {
             guard let mcPeer = mcPeersByStableID[candidate.stableID] else { continue }
             peerBook.markInvited(candidate)
+            // Fix round 7 (item 1): own the invitation by handle so
+            // its pre-connection failure is attributable to exactly
+            // this peer instance (one candidate at a time, round 5).
+            outstandingInvitationHandle = handle(for: mcPeer)
             targets.append((candidate, mcPeer))
         }
         stateLock.unlock()
@@ -609,6 +630,9 @@ extension MultipeerSyncTransport: MCSessionDelegate {
             stateLock.lock()
             let boundHandle = dataPlaneBinding.sessionHandle
             let activeHandle = activeHandshakeHandle
+            // Fix round 7 (item 1): connected — the handshake takes
+            // ownership from the invitation.
+            if outstandingInvitationHandle == mcHandle { outstandingInvitationHandle = nil }
             stateLock.unlock()
             if let boundHandle, boundHandle != mcHandle { return }
             if boundHandle == nil, let activeHandle, activeHandle != mcHandle { return }
@@ -632,12 +656,25 @@ extension MultipeerSyncTransport: MCSessionDelegate {
             stateLock.lock()
             let ownsAttempt = dataPlaneBinding.sessionHandle == departingHandle
                 || activeHandshakeHandle == departingHandle
-            if ownsAttempt {
+            // Fix round 7 (item 1): an invitation that failed before
+            // .connected owns no binding and no handshake, but it IS
+            // owned by its invitation handle. Only that exact handle's
+            // failure counts — a duplicate claimant's disconnect still
+            // changes nothing (round 6, item 7).
+            let ownsInvitation = outstandingInvitationHandle == departingHandle
+            if ownsInvitation { outstandingInvitationHandle = nil }
+            if ownsAttempt || ownsInvitation {
                 peerBook.markFailed(remote)
                 if pairing.pairedPeer == remote {
-                    verifiedPeer = nil; remoteVerified = false; dataPlanePeer = nil
-                    dataPlaneBinding.unbind(sessionHandle: departingHandle)
-                    trustedNonce = nil; trustedPending = false
+                    // Verified/data-plane state exists only once a
+                    // handshake ran; clear it only for its owner.
+                    if ownsAttempt {
+                        verifiedPeer = nil; remoteVerified = false; dataPlanePeer = nil
+                        dataPlaneBinding.unbind(sessionHandle: departingHandle)
+                        trustedNonce = nil; trustedPending = false
+                    }
+                    // Trusted (persisted-pairing) failures retry with
+                    // backoff; untrusted invitations never auto-retry.
                     shouldReconnect = (role == .browser)
                 }
                 if activeHandshakeHandle == departingHandle { activeHandshakeHandle = nil }
