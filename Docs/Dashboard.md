@@ -19,6 +19,27 @@ still decode and sync unchanged. No producer invents detail: sessions
 without recorded practice (e.g. the child sync-debug session) sync with
 empty detail, and the dashboard renders those cards as "not yet" states.
 
+## Known gap: no child-side detail producer yet (fix round 1)
+
+No production path attaches practice detail to `SessionLog` before
+upload — the only producer is the child sync-debug demo session, which
+carries decisions only (`SessionLog.make` defaults). Wiring the five
+detail-dependent aggregates (accuracy, active time, hint rate, top
+error, effort trend) requires a child-side practice pipeline that does
+not exist on this branch: there is no TutorEngine/practice chat
+recording per-question results, and the only effort scorers run in
+demo-scoped or interaction-only contexts that never reach sync.
+
+The missing producer must record, per session, before `sendSessionLog`:
+per-question `SessionQuestionRecord`s (questionId, skill, correct,
+idle-paused activeMs, hintsUsed, errorType for incorrect answers) plus
+the session's T1.4 `EffortScore` as a `SessionEffortRecord` (score,
+threshold). Until that pipeline exists, child-produced logs leave the
+five detail cards in their "not yet" states by design (never zero-filled
+or invented); the manual two-session check below can only verify the
+trade card end to end, and the other five aggregates are verified
+against the hand-calculated fixture in `DashboardTests`.
+
 ## The six aggregates (`Dashboard.compute`)
 
 Pure and deterministic over `([SessionLog], now, calendar)`:
@@ -59,4 +80,5 @@ decisions-only, producer-wording guard, and pre-T4.2 decode tests).
    accuracy by hand). 2. Sync. 3. Open the Progress tab — accuracy,
    active time, hint rate, top error, effort trend, and trade count are
    all populated. 4. Compare accuracy and trade count to your hand record.
-   Expected: exact match.
+   Expected: exact match. (Until the producer in the known gap above
+   exists, only the trade count populates from child logs.)

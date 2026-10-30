@@ -206,6 +206,33 @@ public enum Dashboard {
         return .other
     }
 
+    // MARK: - View copy (fix round 1: tested seams for DashboardView)
+
+    /// Empty-state copy for the accuracy card. Aggregate 1 covers this
+    /// week and last week only, while sibling cards span all synced
+    /// sessions — so the message names the window instead of claiming
+    /// nothing synced.
+    public static let noRecentQuestionsMessage = "No questions synced for this week or last week."
+
+    /// Empty-state copy for the mistake card when questions exist but no
+    /// incorrect answer carries a recorded error type. An untyped
+    /// incorrect answer is still a known incorrect answer, so the message
+    /// names the missing classification, not the mistakes.
+    public static let noMistakeTypesMessage = "No mistake types recorded yet."
+
+    /// Combined accessibility description for one effort-bar row: the
+    /// row's date plus its engagement relative to the preceding session
+    /// (points are oldest-first, so the predecessor is the previous
+    /// index). Raw scores never appear — the direction words carry the
+    /// same relative shape the bars show visually.
+    public static func effortBarAccessibilityLabel(dateText: String, score: Int,
+                                                 previousScore: Int?) -> String {
+        guard let previousScore else { return "\(dateText), first trying snapshot" }
+        if score > previousScore { return "\(dateText), trying higher than previous session" }
+        if score < previousScore { return "\(dateText), trying lower than previous session" }
+        return "\(dateText), trying unchanged from previous session"
+    }
+
     // MARK: - Week bucketing
 
     private enum WeekBucket { case thisWeek, lastWeek }

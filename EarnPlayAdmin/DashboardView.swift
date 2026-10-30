@@ -98,7 +98,7 @@ struct DashboardView: View {
     private var accuracyCard: some View {
         dashboardCard(title: "Correct answers by skill", subtitle: "This week vs last week") {
             if report.skillAccuracies.isEmpty {
-                Text("No questions synced yet.")
+                Text(Dashboard.noRecentQuestionsMessage)
                     .font(.body)
                     .foregroundStyle(.secondary)
             } else {
@@ -184,7 +184,7 @@ struct DashboardView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
             } else {
-                Text("No mistakes recorded yet.")
+                Text(Dashboard.noMistakeTypesMessage)
                     .font(.body)
                     .foregroundStyle(.secondary)
             }
@@ -222,12 +222,17 @@ struct DashboardView: View {
 
     /// Relative per-session bars: width carries the shape, dates carry
     /// identity — no raw numbers are shown, per the no-scores rule.
+    /// Each row is one accessibility element labelled with its date plus
+    /// its engagement relative to the preceding session, so VoiceOver
+    /// perceives the same rises and dips the bars show visually.
     private func effortBars(_ points: [Dashboard.EffortPoint]) -> some View {
         let maxScore = max(1, points.map(\.score).max() ?? 1)
         return VStack(alignment: .leading, spacing: 6) {
-            ForEach(points, id: \.sessionId) { point in
+            ForEach(points.indices, id: \.self) { index in
+                let point = points[index]
+                let dateText = Self.shortDayFormatter.string(from: point.startedAt)
                 HStack(spacing: 8) {
-                    Text(Self.shortDayFormatter.string(from: point.startedAt))
+                    Text(dateText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(width: 64, alignment: .leading)
@@ -237,10 +242,14 @@ struct DashboardView: View {
                             .fill(Color.accentColor.opacity(0.7))
                             .frame(width: geometry.size.width * fraction)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .accessibilityHidden(true)
                     }
                     .frame(height: 12)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Dashboard.effortBarAccessibilityLabel(
+                    dateText: dateText,
+                    score: point.score,
+                    previousScore: index > 0 ? points[index - 1].score : nil))
             }
         }
         .padding(.top, 4)
