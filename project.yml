@@ -80,15 +80,31 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.0"
         BUNDLE_LOADER: "$(TEST_HOST)"
+  EarnPlayUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - EarnPlayUITests
+    dependencies:
+      - target: EarnPlay
+    settings:
+      base:
+        PRODUCT_NAME: EarnPlayUITests
+        PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: EarnPlay
 schemes:
   EarnPlay:
     build:
       targets:
         EarnPlay: all
         EarnPlayTests: [test]
+        EarnPlayUITests: [test]
     test:
       targets:
-        - EarnPlayTests
+        - name: EarnPlayTests
+        - name: EarnPlayUITests
   EarnPlayAdmin:
     build:
       targets:

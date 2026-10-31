@@ -55,6 +55,8 @@ struct ModelDownloadView: View {
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // Stable handle for the issue #69 UI smoke tests. No behavior change.
+        .accessibilityIdentifier("modelDownloadView")
     }
 }
 
