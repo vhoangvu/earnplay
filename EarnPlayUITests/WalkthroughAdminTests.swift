@@ -6,7 +6,7 @@ import XCTest
 /// Version. Reachable steps assert the expected screen and FAIL when a
 /// screen cannot be reached; states that need live-synced sessions are
 /// recorded as named gaps with reasons, never skipped.
-final class WalkthroughAdminTests: XCTestCase {
+final class WalkthroughAdminTests: WalkthroughTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
         continueAfterFailure = false
@@ -76,8 +76,9 @@ final class WalkthroughAdminTests: XCTestCase {
 
     /// Policy tab: walks every section including below-the-fold ones,
     /// stocks one example chore from SeededChorePool, saves, and
-    /// asserts the save status. Re-runnable: the chore count is
-    /// asserted relatively and the version relatively.
+    /// asserts the save status. Re-runnable: the appended row is
+    /// identified by exclusion (never by predicting its label) and
+    /// the version relatively.
     func testWalkthroughAdmin03_PolicyEditor() {
         XCTAssertNil(
             SeededChorePool.validationError(),
@@ -114,24 +115,41 @@ final class WalkthroughAdminTests: XCTestCase {
         walkthroughScreenshot(app, named: "admin-policy-sections-step03")
 
         // Stock one example chore from the seeded pool. A fresh row is
-        // labelled "Chore N"; typing a name relabels it to the name, so
-        // rows are counted as named (seeded name) + unnamed ("Chore ")
-        // and the growth assertion tracks the seeded name.
+        // labelled "Chore N" (positional: N is the pool size after the
+        // append); typing a name relabels it to the name. The pool may
+        // already hold saved chores under ANY name from earlier runs,
+        // and the Form recycles off-screen rows, so the appended row
+        // is identified by exclusion — the one "Chore " label that was
+        // not visible before the tap — never by predicting N from
+        // visible-label counts. Appending never relabels the existing
+        // rows, so exactly one such label appears.
         let seededName = SeededChorePool.entries[0].chore
         let addChore = app.buttons["policyAddChoreButton"]
         scrollIntoView(addChore, in: app)
         XCTAssertTrue(addChore.waitForExistence(timeout: 10), "Admin03: Add chore button is missing")
-        let namedRows = app.buttons.matching(NSPredicate(format: "label == %@", seededName))
         let unnamedRows = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Chore "))
-        let beforeNamed = namedRows.count
-        let beforeTotal = beforeNamed + unnamedRows.count
+        let beforeLabels = Set(unnamedRows.allElementsBoundByIndex.map(\.label))
         addChore.tap()
-        let newRowLabel = "Chore \(beforeTotal + 1)"
-        let newRow = app.buttons[newRowLabel]
-        XCTAssertTrue(
-            newRow.waitForExistence(timeout: 10),
-            "Admin03: new chore row '\(newRowLabel)' did not appear"
+        let appended = XCTWaiter().wait(
+            for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "count == %d", beforeLabels.count + 1),
+                object: unnamedRows
+            )],
+            timeout: 10
         )
+        XCTAssertTrue(
+            appended == .completed,
+            "Admin03: appended chore row did not appear"
+        )
+        let freshRows = unnamedRows.allElementsBoundByIndex.filter {
+            !beforeLabels.contains($0.label)
+        }
+        XCTAssertEqual(
+            freshRows.count, 1,
+            "Admin03: expected exactly one appended chore row"
+        )
+        guard let newRow = freshRows.first else { return }
+        let newRowLabel = newRow.label
         newRow.tap()
         let nameField = app.textFields["policyChoreNameField"].firstMatch
         XCTAssertTrue(
@@ -145,11 +163,24 @@ final class WalkthroughAdminTests: XCTestCase {
             textStartingWith(app, "Unlock minutes:").waitForExistence(timeout: 10),
             "Admin03: chore unlock-minutes stepper is missing"
         )
-        // Count while the rows are on screen: the Form recycles
-        // off-screen rows, so this must precede the scroll to Save.
+        // The appended row must now carry the seeded name: its old
+        // "Chore N" label is gone and the name field holds the typed
+        // name. Checked while the row is on screen, before scrolling
+        // to Save (the Form recycles off-screen rows).
         XCTAssertEqual(
-            namedRows.count, beforeNamed + 1,
-            "Admin03: seeded chore row count did not grow by one"
+            nameField.value as? String, seededName,
+            "Admin03: chore name field does not hold the seeded name"
+        )
+        let relabeled = XCTWaiter().wait(
+            for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"),
+                object: app.buttons[newRowLabel]
+            )],
+            timeout: 10
+        )
+        XCTAssertTrue(
+            relabeled == .completed,
+            "Admin03: appended row '\(newRowLabel)' did not relabel to the seeded name"
         )
         walkthroughScreenshot(app, named: "admin-policy-chore-step03")
 

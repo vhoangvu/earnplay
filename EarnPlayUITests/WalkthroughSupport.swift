@@ -7,7 +7,8 @@ import XCTest
 ///   on a dirty simulator) and captures at least one screenshot
 ///   artifact named `<app>-<screen>-step<NN>`.
 /// - Screenshot capture never fails a test: the capture helper asserts
-///   nothing and throws nothing.
+///   nothing and throws nothing, and issues recorded while it runs
+///   are suppressed by WalkthroughTestCase (see below).
 /// - Reachable steps assert the expected screen/element and FAIL when a
 ///   screen cannot be reached. Unreachable features are recorded with
 ///   `recordGap` (reason + unblock path), never silently skipped.
@@ -39,10 +40,17 @@ enum Walkthrough {
     }
 
     /// Launches the child app with any inherited model-path override
-    /// neutralized, so the first-launch download gate shows.
+    /// neutralized, so the first-launch download gate shows. BOTH
+    /// supported override keys are cleared: production
+    /// `ModelRuntime.defaultModelURL` consults `EARNPLAY_MODEL_PATH`
+    /// then `SIMCTL_CHILD_EARNPLAY_MODEL_PATH`, and an inherited
+    /// `SIMCTL_CHILD_` value would otherwise satisfy the gate. (The
+    /// model-ready launcher needs no such clearing: its non-empty
+    /// plain key is consulted first and always wins.)
     static func launchChildFresh() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["EARNPLAY_MODEL_PATH"] = ""
+        app.launchEnvironment["SIMCTL_CHILD_EARNPLAY_MODEL_PATH"] = ""
         app.launch()
         return app
     }
@@ -70,10 +78,54 @@ enum Walkthrough {
     }
 }
 
+/// Base class for the walkthrough test cases. `app.screenshot()` is
+/// an XCTest automation operation: a capture-only IPC failure would
+/// otherwise record an issue on the test, and with
+/// `continueAfterFailure = false` that would stop the test — even
+/// though the capture helper asserts nothing. While the helper runs
+/// it raises `suppressingCaptureIssues`, and the overrides below
+/// drop any issue recorded in that window, so a capture problem can
+/// neither fail nor stop the suite. (An Objective-C exception raised
+/// out of the capture IPC itself is not catchable in Swift and
+/// remains a residual risk; no such failure has been observed.)
+class WalkthroughTestCase: XCTestCase {
+    /// While true, issues recorded on this test are capture-only
+    /// noise from `walkthroughScreenshot` and are dropped.
+    var suppressingCaptureIssues = false
+
+    override func record(_ issue: XCTIssue) {
+        if suppressingCaptureIssues { return }
+        super.record(issue)
+    }
+
+    override func recordFailure(
+        withDescription description: String,
+        inFile filePath: String,
+        atLine lineNumber: Int,
+        expected: Bool
+    ) {
+        if suppressingCaptureIssues { return }
+        super.recordFailure(
+            withDescription: description,
+            inFile: filePath,
+            atLine: lineNumber,
+            expected: expected
+        )
+    }
+}
+
 extension XCTestCase {
-    /// Captures a screenshot test artifact. Asserts nothing: a capture
-    /// problem must never fail the suite.
+    /// Captures a screenshot test artifact. Asserts nothing, and any
+    /// XCTest issue recorded by the capture itself is suppressed (see
+    /// WalkthroughTestCase): a capture problem must never fail the
+    /// suite.
     func walkthroughScreenshot(_ app: XCUIApplication, named name: String) {
+        // Both walkthrough classes inherit WalkthroughTestCase, so
+        // this cast succeeds on every call site; without the flag the
+        // capture still proceeds, only unsuppressed.
+        let walkthroughCase = self as? WalkthroughTestCase
+        walkthroughCase?.suppressingCaptureIssues = true
+        defer { walkthroughCase?.suppressingCaptureIssues = false }
         XCTContext.runActivity(named: "screenshot \(name)") { activity in
             let attachment = XCTAttachment(screenshot: app.screenshot())
             attachment.name = name

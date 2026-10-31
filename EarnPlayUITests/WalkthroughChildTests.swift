@@ -8,7 +8,7 @@ import XCTest
 /// No test taps the download button or waits for a download. Steps
 /// past the model gate launch with EARNPLAY_MODEL_PATH pointed at a
 /// nonexistent path (see Walkthrough.dummyModelPath).
-final class WalkthroughChildTests: XCTestCase {
+final class WalkthroughChildTests: WalkthroughTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
         continueAfterFailure = false

@@ -26,7 +26,9 @@ untouched) with:
   relative changes, never random codes or exact versions).
 - Every step captures at least one screenshot artifact named by app +
   screen + step (e.g. `child-gate-step01`, `admin-policy-saved-step03`).
-  Capture never fails a test: the helper asserts nothing.
+  Capture never fails a test: the helper asserts nothing, and issues
+  recorded by the capture itself are suppressed
+  (`WalkthroughTestCase.suppressingCaptureIssues`).
 - Reachable steps assert the expected screen/element and FAIL when a
   screen cannot be reached. Unreachable features are recorded as named
   gaps (reason + unblock path) via `recordGap`, attached to the test

@@ -56,13 +56,34 @@ stop_recording() {
 }
 trap stop_recording EXIT INT TERM
 
-# Wait until the recorder has processed its first frame.
+# Wait until the recorder has processed its first frame. Both the
+# startup acknowledgement AND a live recorder process are required:
+# without them the suite would run and report success for a
+# recording that may not exist.
+RECORDING_STARTED=0
 for _ in $(seq 1 30); do
     if grep -q "Recording started" "$RECORDER_LOG" 2>/dev/null; then
+        RECORDING_STARTED=1
+        break
+    fi
+    if ! kill -0 "$RECORDER_PID" 2>/dev/null; then
         break
     fi
     sleep 1
 done
+
+if [ "$RECORDING_STARTED" -ne 1 ] || ! kill -0 "$RECORDER_PID" 2>/dev/null; then
+    # Grace period so a dying recorder flushes its diagnostics.
+    sleep 1
+    echo "error: simulator video capture did not start; not running the suite" >&2
+    echo "--- recorder log ($RECORDER_LOG) ---" >&2
+    if [ -s "$RECORDER_LOG" ]; then
+        cat "$RECORDER_LOG" >&2
+    else
+        echo "(recorder produced no diagnostics)" >&2
+    fi
+    exit 1
+fi
 
 echo "Running walkthrough suite..."
 # NOTE: ONLY_ACTIVE_ARCH=YES is passed as a BUILD SETTING (not an env
