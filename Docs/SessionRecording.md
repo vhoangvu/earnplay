@@ -145,19 +145,25 @@ way and retention stays memory-only — a quit before any retry trigger
 then loses the log. This is accepted as a bounded residue (no second
 storage subsystem); the in-memory list is always retained regardless.
 
-## Known gap: first-time pairing has no reachable confirmation surface
+## Pairing confirmation: production surface (issue #65, closes the known gap)
 
-`ChildSyncController` sets no `onPairingRequest` handler (its own comment
-says so): while no confirmation UI is attached, the transport refuses
-untrusted invitations instead of holding them unanswerable. The only
-confirmation UI is in `SyncDebugView`, which lives only in the unreachable
-`previewHarnesses`. First-time (untrusted) pairing therefore has no
-reachable confirmation surface in production; trusted reconnect works once
-the service runs (the persisted gate key and display name match the debug
-view's previous values, so an already-paired device reconnects
-automatically once started).
+First-time (untrusted) pairing previously had no reachable confirmation
+surface: `ChildSyncController` set no `onPairingRequest` handler, and the
+only confirmation UI lived in `SyncDebugView` inside the unreachable
+`previewHarnesses` — so a fresh install could not pair in production (the
+transport refuses untrusted invitations while no handler is set).
 
-Accepted limitation for this merge (same standing as the H5 deferral in
-`Docs/Sync.md`): building any pairing UI — setup/settings route or
-confirmation screen — is Vu's pending product decision, not this
-pipeline's. This note lets the merge decision be made with eyes open.
+The controller is now the sole owner of the pairing-request surface: it
+sets `transport.onPairingRequest` (and `onPairingFailure`) in `init` and
+publishes the pending request (peer, instructions, pending flag) plus
+accept/decline actions. `ContentView` presents the confirmation sheet
+whenever a request is pending, from any app state (including
+mid-practice-chat) — never gated behind setup or settings. The sheet
+shows the peer name, this device's local code, an admin-code entry
+field, Accept, and Decline; Accept records the entered code and proceeds
+through the existing challenge-response handshake, Decline rejects the
+invitation. `SyncDebugView` sets no pairing handlers (opening it cannot
+clobber the production handler); its code-entry/Accept row observes the
+same controller state. Trusted reconnect stays automatic (no UI), and a
+failed attempt restores the request for a corrected-code retry. No
+handshake, transport, or cryptography changes.

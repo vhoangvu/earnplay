@@ -6,7 +6,9 @@ struct EarnPlayApp: App {
     /// App-scope child sync (issue #63 fix 3), mirroring the admin app:
     /// one shared service, retained for the app's life, started on
     /// launch — delivery no longer depends on any debug screen.
-    @State private var syncController = ChildSyncController()
+    /// StateObject (issue #65) so the pairing-request sheet observes
+    /// the controller's published pending state.
+    @StateObject private var syncController = ChildSyncController()
     var body: some Scene {
         WindowGroup {
             ContentView(syncController: syncController)
@@ -20,7 +22,9 @@ struct ContentView: View {
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
     /// Shared sync; the practice engine enqueues into its outbox
     /// instance and notifies its service after each durable enqueue.
-    let syncController: ChildSyncController
+    /// Observed (issue #65) so the pairing-request sheet presents
+    /// whenever the controller holds a pending request.
+    @ObservedObject var syncController: ChildSyncController
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -68,6 +72,21 @@ struct ContentView: View {
         }
         .task {
             downloadModel.refreshIfNeeded()
+        }
+        // Production pairing confirmation (issue #65): presented
+        // whenever a pending request exists, from ANY app state —
+        // invitations arrive asynchronously and must interrupt wherever
+        // the child is (including mid-practice-chat), never gated
+        // behind setup or settings navigation. Dismissal is by explicit
+        // Accept/Decline only (no swipe-away of a security decision).
+        .sheet(isPresented: Binding(
+            get: { syncController.pendingPairingPeer != nil },
+            set: { _ in }
+        )) {
+            if let peer = syncController.pendingPairingPeer {
+                ChildPairingRequestSheet(controller: syncController, peer: peer)
+                    .interactiveDismissDisabled()
+            }
         }
         // Round 2 item 2: retry retained failed-enqueue logs when the app
         // foregrounds — a real lifecycle trigger, never a timer.

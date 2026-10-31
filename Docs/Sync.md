@@ -40,8 +40,12 @@ verifiable as: Airplane Mode on child, run a session, Airplane Mode
 off with both apps open → same result;
 (4) pairing: admin enters the code shown on the child and taps Pair
 (retries the invitation even if the child was found before the code
-was entered), child enters the code shown on the admin and taps
-Accept → both show paired, then (1)/(2) flow.
+was entered); the child confirmation sheet appears over whatever the
+child is doing (including mid-practice-chat) showing the admin's name,
+this device's code, and an admin-code entry field — child enters the
+code shown on the admin and taps Accept (Decline rejects) → both show
+paired, then (1)/(2) flow. A mismatched code restores the sheet for a
+corrected-code retry; trusted reconnects show no sheet.
 
 ## Pairing protocol & threat model (fix round 3)
 
@@ -60,8 +64,12 @@ Accept → both show paired, then (1)/(2) flow.
   nothing and grants no paired state and no data.
 - **Out-of-band comparison:** each device displays its own 6-digit
   code. Each user enters the *peer's* code on their own device
-  (admin: Sessions tab; child: pairing-request row). That entry is
-  each side's local confirmation; the entered code is stored
+  (admin: Sessions tab; child: production pairing-confirmation sheet
+  in `ContentView`, presented from any app state whenever the shared
+  `ChildSyncController` — the sole owner of the pairing-request
+  surface — holds a pending request; the debug view's code-entry row
+  observes that same state and sets no handlers of its own). That
+  entry is each side's local confirmation; the entered code is stored
   locally and never transmitted.
 - **Mutual challenge-response:** after the MPC session connects,
   each side sends a fresh per-session challenge (UUID nonce) over
