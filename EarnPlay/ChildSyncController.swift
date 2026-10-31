@@ -134,6 +134,17 @@ final class ChildSyncController: ObservableObject {
     }
 
     private func handlePairingRequest(_ peer: PeerIdentity) {
+        // Fix round 3: recheck at execution time, on main. This
+        // handler runs via `publishOnMain` from the transport's
+        // `onPairingRequest` callback, which arrives off the main
+        // thread — so it can sit queued while main-thread code
+        // (Decline/unpair) clears the transport's pending request,
+        // then run and reopen the sheet for a request that no longer
+        // exists (a dead sheet Accept cannot complete). Every firing
+        // site sets pending state BEFORE firing, so an empty pending
+        // slot here means this notification is stale: drop it without
+        // publishing either the peer or the message.
+        guard transport.hasPendingPairingRequest else { return }
         pendingPairingPeer = peer
         pairingStatusMessage = "Pairing request from \(peer.displayName) — compare codes out-of-band: this device shows \(pairing.localCode); enter the code shown on the admin device, then Accept. Acceptance alone proves nothing; both devices verify by challenge-response before any data flows."
     }

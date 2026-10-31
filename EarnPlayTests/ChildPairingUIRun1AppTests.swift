@@ -19,6 +19,7 @@ import EarnPlayCore
 /// exercise the production paths, including the held invitation handler.
 final class ChildPairingUIRun1AppTests: XCTestCase {
     private let admin = PeerIdentity(stableID: "test-admin-65", displayName: "EarnPlay-Admin")
+    private let adminB = PeerIdentity(stableID: "test-admin-65-b", displayName: "EarnPlay-Admin-2")
 
     private func tempDir(_ tag: String) -> URL {
         let base = FileManager.default.temporaryDirectory
@@ -81,6 +82,23 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         let failed = "{\"pairingFailed\":{\"from\":{\"stableID\":\"\(peer.stableID)\",\"displayName\":\"\(peer.displayName)\"}}}"
         controller.transport.session(
             session, didReceive: handshakeData(failed),
+            fromPeer: MCPeerID(displayName: peer.displayName))
+    }
+
+    /// Delivers an ACTUAL `.trustedChallenge` handshake message from
+    /// the peer through the transport's session entry point (fix round
+    /// 3) — no direct callback injection. On an unpaired child this
+    /// takes the transport's untrusted branch, which sets the manual
+    /// pending pair and fires `onPairingRequest` unconditionally (it
+    /// carries no pending-invitation guard, unlike the advertiser
+    /// delegate) — so it can fire for a second peer while a first
+    /// invitation is still held.
+    private func deliverTrustedChallenge(_ controller: ChildSyncController, from peer: PeerIdentity) {
+        let session = MCSession(peer: MCPeerID(displayName: "probe"),
+                                securityIdentity: nil, encryptionPreference: .required)
+        let challenge = "{\"trustedChallenge\":{\"nonce\":\"probe-nonce-65\",\"from\":{\"stableID\":\"\(peer.stableID)\",\"displayName\":\"\(peer.displayName)\"}}}"
+        controller.transport.session(
+            session, didReceive: handshakeData(challenge),
             fromPeer: MCPeerID(displayName: peer.displayName))
     }
 
@@ -303,5 +321,120 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         XCTAssertFalse(controller.pairing.isPaired)
         XCTAssertEqual(controller.preInvitePairingCode, controller.pairing.localCode,
                        "stale paired-state callback must not erase the current pre-invite code")
+    }
+
+    /// Fix round 3: a pairing-request callback queued off-main must not
+    /// reopen the sheet after Decline cleared the request. Sheet open
+    /// for A; B's request fires off-main (its publish queues to main,
+    /// which cannot run while main waits below); Decline rejects
+    /// everything and clears the UI on main; the queued B handler then
+    /// runs and must find no pending request and drop the notification.
+    func testQueuedPairingRequestDroppedAfterDecline() throws {
+        guard let controller = controller("queueddecline") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertTrue(Thread.isMainThread, "test relies on main inline/async ordering")
+        let box = try invite(controller, from: admin, verdicts: VerdictBox())
+        XCTAssertEqual(controller.pendingPairingPeer, admin)
+
+        // Fire B's request off-main (as production MPC callbacks do).
+        var sawOffMain = false
+        let enqueued = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            sawOffMain = !Thread.isMainThread
+            self.deliverTrustedChallenge(controller, from: self.adminB)
+            enqueued.signal()
+        }
+        XCTAssertEqual(enqueued.wait(timeout: .now() + 5), .success,
+                       "off-main pairing request must fire")
+        XCTAssertTrue(sawOffMain, "B request must fire off-main for the async hop")
+
+        // User Declines on main: rejects everything, clears the UI.
+        controller.declinePairingRequest()
+        XCTAssertEqual(box.verdicts, [false], "decline must reject the held invitation")
+        XCTAssertNil(controller.pendingPairingPeer)
+        XCTAssertNil(controller.pairingStatusMessage)
+        XCTAssertFalse(controller.transport.hasPendingPairingRequest)
+
+        // Drain main: the queued B handler runs last.
+        let drained = expectation(description: "main drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+
+        XCTAssertNil(controller.pendingPairingPeer,
+                    "queued request for a declined pairing must not reopen the sheet")
+        XCTAssertNil(controller.pairingStatusMessage,
+                    "queued request for a declined pairing must not publish a message")
+    }
+
+    /// Fix round 3: same queued-callback drop, but the clear arrives via
+    /// unpair instead of Decline (`transport.unpair()` also rejects any
+    /// pending invitation).
+    func testQueuedPairingRequestDroppedAfterUnpair() throws {
+        guard let controller = controller("queuedunpair") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertTrue(Thread.isMainThread, "test relies on main inline/async ordering")
+        let box = try invite(controller, from: admin, verdicts: VerdictBox())
+        XCTAssertEqual(controller.pendingPairingPeer, admin)
+
+        var sawOffMain = false
+        let enqueued = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            sawOffMain = !Thread.isMainThread
+            self.deliverTrustedChallenge(controller, from: self.adminB)
+            enqueued.signal()
+        }
+        XCTAssertEqual(enqueued.wait(timeout: .now() + 5), .success,
+                       "off-main pairing request must fire")
+        XCTAssertTrue(sawOffMain, "B request must fire off-main for the async hop")
+
+        controller.unpair()
+        XCTAssertEqual(box.verdicts, [false], "unpair must reject the held invitation")
+        XCTAssertNil(controller.pendingPairingPeer)
+        XCTAssertNil(controller.pairingStatusMessage)
+        XCTAssertFalse(controller.transport.hasPendingPairingRequest)
+
+        let drained = expectation(description: "main drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+
+        XCTAssertNil(controller.pendingPairingPeer,
+                    "queued request for an unpaired-away pairing must not reopen the sheet")
+        XCTAssertNil(controller.pairingStatusMessage,
+                    "queued request for an unpaired-away pairing must not publish a message")
+    }
+
+    /// Fix round 3 (positive control): a queued off-main request whose
+    /// pending state is STILL SET at execution time still surfaces the
+    /// sheet — the execution-time recheck drops only cleared requests.
+    func testQueuedPairingRequestSurfacesWhenPending() throws {
+        guard let controller = controller("queuedpending") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertTrue(Thread.isMainThread, "test relies on main inline/async ordering")
+        _ = try invite(controller, from: admin, verdicts: VerdictBox())
+        XCTAssertEqual(controller.pendingPairingPeer, admin)
+
+        var sawOffMain = false
+        let enqueued = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            sawOffMain = !Thread.isMainThread
+            self.deliverTrustedChallenge(controller, from: self.adminB)
+            enqueued.signal()
+        }
+        XCTAssertEqual(enqueued.wait(timeout: .now() + 5), .success,
+                       "off-main pairing request must fire")
+        XCTAssertTrue(sawOffMain, "B request must fire off-main for the async hop")
+
+        // No clear: the queued handler must surface B on drain.
+        XCTAssertTrue(controller.transport.hasPendingPairingRequest)
+        let drained = expectation(description: "main drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+
+        XCTAssertEqual(controller.pendingPairingPeer, adminB,
+                       "legitimate queued request must still surface the sheet")
+        XCTAssertNotNil(controller.pairingStatusMessage)
     }
 }
