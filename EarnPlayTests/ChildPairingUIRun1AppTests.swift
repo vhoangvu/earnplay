@@ -71,6 +71,19 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         return d
     }
 
+    /// Delivers an ACTUAL `.pairingFailed` handshake message from the
+    /// peer through the transport's session entry point (fix round 1,
+    /// finding 3) — no `failHandshake` simulation, no direct callback
+    /// injection.
+    private func deliverPairingFailed(_ controller: ChildSyncController, from peer: PeerIdentity) {
+        let session = MCSession(peer: MCPeerID(displayName: "probe"),
+                                securityIdentity: nil, encryptionPreference: .required)
+        let failed = "{\"pairingFailed\":{\"from\":{\"stableID\":\"\(peer.stableID)\",\"displayName\":\"\(peer.displayName)\"}}}"
+        controller.transport.session(
+            session, didReceive: handshakeData(failed),
+            fromPeer: MCPeerID(displayName: peer.displayName))
+    }
+
     /// An untrusted invitation surfaces pending state on the controller
     /// (peer + instructions) and the invitation is HELD for the user —
     /// not answered until Accept/Decline.
@@ -164,11 +177,15 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         XCTAssertTrue(box.verdicts.isEmpty, "invitation must still be held for UI confirmation")
     }
 
-    /// A failed attempt restores pending state for a corrected-code
-    /// retry: after accept + mismatch, the transport's failure sequence
-    /// (manual request restored, then failure) leaves the request
-    /// pending with retry guidance, and accepting with the corrected
-    /// code restarts the handshake on the live session.
+    /// A wrong-code failure arrives as a REAL `.pairingFailed`
+    /// handshake message (fix round 1, finding 3 — rewritten: the old
+    /// version simulated the `failHandshake` aftermath and invoked
+    /// `onPairingFailure` directly, never delivering the message): the
+    /// transport restores the manual request BEFORE firing the
+    /// failure, so the sheet reopens with the peer restored and named
+    /// (finding 2's headline) plus retry guidance, and a
+    /// corrected-code Accept proceeds through the manual handshake
+    /// branch of the existing accept path.
     func testFailedAttemptRestoresPendingForCorrectedCodeRetry() throws {
         guard let controller = controller("retry") else {
             return XCTFail("test defaults unavailable")
@@ -176,21 +193,16 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         let box = try invite(controller, from: admin, verdicts: VerdictBox())
         XCTAssertTrue(controller.acceptPairingRequest(enteredCode: "000000"))
         XCTAssertEqual(box.verdicts, [true], "first accept must answer the held invitation")
+        XCTAssertNil(controller.pendingPairingPeer)
 
-        // Simulate the mismatch aftermath exactly as `failHandshake`
-        // leaves it: entered code cleared, then the admin's next
-        // challenge restores the child's manual request (round-5 item 6;
-        // same driver shape as `testR5_6`), then the failure callback.
-        controller.pairing.failProvisionalAttempt(peer: admin)
-        let session = MCSession(peer: MCPeerID(displayName: "probe"),
-                                securityIdentity: nil, encryptionPreference: .required)
-        let challenge = "{\"challenge\":{\"nonce\":\"retry-nonce\",\"from\":{\"stableID\":\"\(admin.stableID)\",\"displayName\":\"\(admin.displayName)\"}}}"
-        controller.transport.session(
-            session, didReceive: handshakeData(challenge),
-            fromPeer: MCPeerID(displayName: admin.displayName))
-        controller.transport.onPairingFailure?(admin)
+        // The admin's side rejects the wrong code and notifies this
+        // device with an actual handshake message.
+        deliverPairingFailed(controller, from: admin)
         XCTAssertEqual(controller.pendingPairingPeer, admin,
                        "failed attempt must restore the request for retry")
+        XCTAssertEqual(controller.pairingRequestHeadline,
+                       "Pairing request from \(admin.displayName)",
+                       "reopened sheet must still name the peer")
         XCTAssertNotNil(controller.pairingStatusMessage)
         XCTAssertTrue(controller.transport.hasPendingPairingRequest)
 
@@ -199,5 +211,54 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         XCTAssertTrue(controller.acceptPairingRequest(enteredCode: "482916"))
         XCTAssertEqual(controller.pairing.expectedPeerCode, "482916")
         XCTAssertNil(controller.pendingPairingPeer)
+    }
+
+    /// Fix round 1 (finding 1): the unpaired child publishes its local
+    /// code with NO invitation delivered — the admin reads it off the
+    /// child's screen to start pairing. The display pairs nothing: no
+    /// pending request exists and the gate stays unpaired.
+    func testUnpairedChildShowsPreInviteCode() throws {
+        guard let controller = controller("preinvite") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertEqual(controller.preInvitePairingCode, controller.pairing.localCode,
+                       "unpaired child must show its local code before any invitation")
+        XCTAssertNil(controller.pendingPairingPeer)
+        XCTAssertFalse(controller.pairing.isPaired)
+        XCTAssertFalse(controller.transport.hasPendingPairingRequest,
+                       "displaying the code must pair nothing")
+    }
+
+    /// Fix round 1 (finding 1): the pre-invite code hides once paired
+    /// and returns on unpair.
+    func testPreInviteCodeHidesWhenPaired() throws {
+        guard let controller = controller("prehides") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertNotNil(controller.preInvitePairingCode)
+        XCTAssertTrue(controller.pairing.markPaired(peer: admin))
+        XCTAssertNil(controller.preInvitePairingCode,
+                     "paired child no longer needs the pre-invite code")
+        controller.unpair()
+        XCTAssertEqual(controller.preInvitePairingCode, controller.pairing.localCode)
+    }
+
+    /// Fix round 1 (finding 2): after a failure replaces the status
+    /// message with generic retry text, the sheet headline still names
+    /// the peer — it derives from the pending peer, not the message.
+    func testFailureHeadlineStillNamesPeer() throws {
+        guard let controller = controller("headline") else {
+            return XCTFail("test defaults unavailable")
+        }
+        let box = try invite(controller, from: admin, verdicts: VerdictBox())
+        XCTAssertTrue(controller.acceptPairingRequest(enteredCode: "000000"))
+        XCTAssertEqual(box.verdicts, [true], "first accept must answer the held invitation")
+        deliverPairingFailed(controller, from: admin)
+        XCTAssertEqual(controller.pairingRequestHeadline,
+                       "Pairing request from \(admin.displayName)",
+                       "reopened sheet must still name the peer")
+        XCTAssertNotNil(controller.pairingStatusMessage)
+        XCTAssertFalse(controller.pairingStatusMessage?.contains(admin.displayName) ?? true,
+                       "retry text is generic; the headline carries the peer name")
     }
 }

@@ -65,6 +65,22 @@ final class ChildSyncController: ObservableObject {
     /// the corrected-code retry text after a verification failure, nil
     /// when no pairing message applies.
     @Published private(set) var pairingStatusMessage: String?
+    /// Pre-invite pairing code (fix round 1, finding 1): this device's
+    /// local code, published for a reachable production surface while
+    /// unpaired — the admin reads it off the child's screen BEFORE
+    /// inviting (invitations require an entered code). Nil once paired
+    /// (no longer needed). Displaying this pairs NOTHING: the
+    /// confirmation sheet plus the challenge-response handshake still
+    /// gate every pairing.
+    @Published private(set) var preInvitePairingCode: String?
+    /// Sheet headline (fix round 1, finding 2): names the requesting
+    /// peer independently of the status message, so a code-retry
+    /// failure — which replaces the message with generic retry text —
+    /// never hides which peer is being accepted. Nil when no request
+    /// is pending.
+    var pairingRequestHeadline: String? {
+        pendingPairingPeer.map { "Pairing request from \($0.displayName)" }
+    }
     init(policyStore: PolicyStore = PolicyStore(),
          sessionQueue: SessionLogQueue = SessionLogQueue(),
          pairing: SyncPairingGate? = nil,
@@ -88,6 +104,19 @@ final class ChildSyncController: ObservableObject {
         }
         self.transport.onPairingFailure = { [weak self] _ in
             self?.publishOnMain { self?.handlePairingFailure() }
+        }
+        // Fix round 1 (finding 1): publish the pre-invite code while
+        // unpaired, cleared on pairing. Chained AFTER the store's
+        // persistence handler (set at gate creation) so persistence
+        // keeps working; gate callbacks may arrive off the main
+        // thread, hence publishOnMain.
+        self.preInvitePairingCode = self.pairing.isPaired ? nil : self.pairing.localCode
+        let previousStateChange = self.pairing.onStateChange
+        self.pairing.onStateChange = { [weak self] in
+            previousStateChange?()
+            guard let self else { return }
+            let code = self.pairing.isPaired ? nil : self.pairing.localCode
+            self.publishOnMain { self.preInvitePairingCode = code }
         }
     }
 

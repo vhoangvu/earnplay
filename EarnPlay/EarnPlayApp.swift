@@ -28,8 +28,18 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Group {
-            if downloadModel.isReady {
+        VStack(spacing: 0) {
+            // Fix round 1 (finding 1): the unpaired child's local code
+            // on a reachable production surface BEFORE any invitation —
+            // the admin reads it off this screen to start pairing.
+            // Hidden once paired; display alone pairs nothing.
+            if let code = syncController.preInvitePairingCode {
+                Text("Pairing code (show to admin): \(code)")
+                    .font(.body.monospacedDigit())
+                    .padding(8)
+            }
+            Group {
+                if downloadModel.isReady {
                 if setup.step == .complete, !setup.summaryDismissed {
                     SetupCompleteView(viewModel: setup)
                 } else if setup.step == .complete {
@@ -68,6 +78,7 @@ struct ContentView: View {
                 }
             } else {
                 ModelDownloadView(viewModel: downloadModel)
+            }
             }
         }
         .task {

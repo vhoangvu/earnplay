@@ -20,7 +20,10 @@ struct ChildPairingRequestSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pairing request")
+            // Fix round 1 (finding 2): the headline names the peer
+            // independently of the status message, so a code-retry
+            // failure (generic retry text) never hides who is accepted.
+            Text(controller.pairingRequestHeadline ?? "Pairing request from \(peer.displayName)")
                 .font(.headline)
             Text("This device's code (show to admin): \(controller.pairing.localCode)")
                 .font(.body.monospacedDigit())

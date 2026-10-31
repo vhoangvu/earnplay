@@ -38,14 +38,17 @@ open both apps → queued session arrives once in the admin list
 (the trusted child reconnects automatically, no re-pairing); also
 verifiable as: Airplane Mode on child, run a session, Airplane Mode
 off with both apps open → same result;
-(4) pairing: admin enters the code shown on the child and taps Pair
-(retries the invitation even if the child was found before the code
-was entered); the child confirmation sheet appears over whatever the
-child is doing (including mid-practice-chat) showing the admin's name,
-this device's code, and an admin-code entry field — child enters the
+(4) pairing: the unpaired child shows its pairing code on its main
+screen before any invitation arrives — the admin reads it off the
+child's screen, enters it, and taps Pair (retries the invitation
+even if the child was found before the code was entered); the child
+confirmation sheet appears over whatever the child is doing
+(including mid-practice-chat) showing the admin's name, this
+device's code, and an admin-code entry field — child enters the
 code shown on the admin and taps Accept (Decline rejects) → both show
-paired, then (1)/(2) flow. A mismatched code restores the sheet for a
-corrected-code retry; trusted reconnects show no sheet.
+paired (the child's pre-invite code row hides), then (1)/(2) flow.
+A mismatched code restores the sheet for a corrected-code retry;
+trusted reconnects show no sheet.
 
 ## Pairing protocol & threat model (fix round 3)
 
@@ -68,9 +71,12 @@ corrected-code retry; trusted reconnects show no sheet.
   in `ContentView`, presented from any app state whenever the shared
   `ChildSyncController` — the sole owner of the pairing-request
   surface — holds a pending request; the debug view's code-entry row
-  observes that same state and sets no handlers of its own). That
-  entry is each side's local confirmation; the entered code is stored
-  locally and never transmitted.
+  observes that same state and sets no handlers of its own). The
+  child's own code is additionally shown on its main screen while
+  unpaired (fix round 1, finding 1), before any invitation, so the
+  admin can read it to start pairing; that display alone pairs
+  nothing. That entry is each side's local confirmation; the entered
+  code is stored locally and never transmitted.
 - **Mutual challenge-response:** after the MPC session connects,
   each side sends a fresh per-session challenge (UUID nonce) over
   the encrypted session. Each side replies with
