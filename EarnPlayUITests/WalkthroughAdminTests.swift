@@ -107,7 +107,7 @@ final class WalkthroughAdminTests: XCTestCase {
             "Movement trade",
         ]
         for header in sections {
-            let element = app.staticTexts[header]
+            let element = sectionHeader(app, header)
             scrollIntoView(element, in: app)
             XCTAssertTrue(element.exists, "Admin03: '\(header)' section is missing")
         }
@@ -268,9 +268,24 @@ final class WalkthroughAdminTests: XCTestCase {
             app.navigationBars["Auditor"].waitForExistence(timeout: 10),
             "Gap AUDITOR-FINDING: auditor screen did not appear"
         )
+        // The empty-findings section header. iOS 18 exposes List
+        // section headers differently than iOS 26+ (see
+        // sectionHeader), and may announce the header grouped with
+        // its content, so match the exact "Findings (0)" label or any
+        // label containing it (no other element on this screen
+        // contains that literal). Then pin the section's clean-state
+        // row with its exact query as well.
+        let findingsHeader = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "Findings (0)", "FINDINGS (0)")
+        ).firstMatch
+        scrollIntoView(findingsHeader, in: app)
         XCTAssertTrue(
-            app.staticTexts["Findings (0)"].waitForExistence(timeout: 10),
+            findingsHeader.waitForExistence(timeout: 10),
             "Gap AUDITOR-FINDING: empty findings section is missing"
+        )
+        XCTAssertTrue(
+            app.staticTexts["No open findings"].exists,
+            "Gap AUDITOR-FINDING: clean-state findings row is missing"
         )
         walkthroughScreenshot(app, named: "admin-auditor-blocked-step06")
         recordGap(

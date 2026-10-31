@@ -115,14 +115,44 @@ extension XCTestCase {
         ).firstMatch
     }
 
-    /// Scrolls up until the element is hittable (or the swipe budget
-    /// runs out). For top-to-bottom forms and below-the-fold sections.
-    func scrollIntoView(_ element: XCUIElement, in app: XCUIApplication, maxSwipes: Int = 14) {
+    /// Scrolls up in small steps until the element is hittable (or
+    /// the step budget runs out). For top-to-bottom forms and
+    /// below-the-fold sections.
+    ///
+    /// Small press-drags instead of full `swipeUp` flicks: one flick
+    /// can traverse several Form sections (flick distance differs
+    /// between iOS 18's table-backed Form and iOS 26+'s
+    /// collection-backed one), so a flick-then-check loop can stride
+    /// clean over its target between two checks while Form recycling
+    /// removes the target from the tree (issue #71 fix-1: CI-only
+    /// Admin03 failure on "Unlock durations"). Each step here moves
+    /// ~1/3 of the screen, so any target stays observable across
+    /// several consecutive checks, and slow drags carry no flick
+    /// momentum for a check to race with.
+    func scrollIntoView(_ element: XCUIElement, in app: XCUIApplication, maxSwipes: Int = 24) {
         var swipes = 0
         while !element.isHittable && swipes < maxSwipes {
-            app.swipeUp()
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65))
+            let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+            start.press(forDuration: 0.1, thenDragTo: end)
             swipes += 1
         }
+    }
+
+    /// Section-header element tolerant of iOS-version AX variance.
+    /// iOS 26+ exposes SwiftUI `Section` headers as StaticText with
+    /// the exact string; iOS 18 (table-backed Form/List) may expose
+    /// the same header as a non-StaticText element or with a
+    /// transformed label (issue #71 fix-1: CI-only Admin06 failure on
+    /// "Findings (0)", which renders but never matches `staticTexts`
+    /// on iOS 18). Matches the exact label or its UPPERCASE variant
+    /// across any element type, so callers keep asserting the same
+    /// production string. No CONTAINS fallback here: some headers
+    /// ("Movement trade") are prefixes of row labels.
+    func sectionHeader(_ app: XCUIApplication, _ name: String) -> XCUIElement {
+        return app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@ OR label == %@", name, name.uppercased())
+        ).firstMatch
     }
 
     /// Waits for an element to become enabled (e.g. a button gated on
