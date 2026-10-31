@@ -24,6 +24,7 @@ targets:
       base:
         PRODUCT_NAME: EarnPlay
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "EarnPlay syncs with the nearby parent/child app over Bluetooth and local peer-to-peer only. No account, server, or internet is used."
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "EarnPlay syncs policy and session logs with the nearby admin/child app over Bluetooth."
@@ -53,6 +54,7 @@ targets:
       base:
         PRODUCT_NAME: EarnPlayAdmin
         PRODUCT_BUNDLE_IDENTIFIER: com.vhoangvu.earnplay.admin
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "EarnPlay syncs with the nearby parent/child app over Bluetooth and local peer-to-peer only. No account, server, or internet is used."
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "EarnPlay syncs policy and session logs with the nearby admin/child app over Bluetooth."
