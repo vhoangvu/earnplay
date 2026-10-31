@@ -58,6 +58,7 @@ untouched) with:
 | 08 | Chore trade (offer, accept, confirm, granted) | GAP CHORE-TRADE |
 | 09 | Simulated shield (ON state, challenge, countdown) | GAP SHIELDS |
 | 10 | Pairing sheet presentation + decline path (pre-invite row reached) | GAP PAIRING-SHEET |
+| 11 | Child sync-debug view (T4.6 surface) | GAP SYNC-DEBUG |
 
 ## Admin steps (WalkthroughAdminTests)
 

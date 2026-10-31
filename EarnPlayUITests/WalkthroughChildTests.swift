@@ -30,8 +30,12 @@ final class WalkthroughChildTests: WalkthroughTestCase {
             app.staticTexts["Download tutor model"].waitForExistence(timeout: 10),
             "Step 1: gate title is missing"
         )
+        // The gate title renders while the view model is still
+        // .checking; the button appears only when the async local
+        // readiness check resolves to .needsDownload. This waits for
+        // that check, never a download — the button stays untapped.
         XCTAssertTrue(
-            app.buttons["Download over Wi-Fi"].exists,
+            app.buttons["Download over Wi-Fi"].waitForExistence(timeout: 10),
             "Step 1: download button is missing (it must stay untapped)"
         )
         let code = textStartingWith(app, "Pairing code (show to admin):")
@@ -327,6 +331,38 @@ final class WalkthroughChildTests: WalkthroughTestCase {
                 "and is not attempted here.",
             unblock: "Manual two-device pairing rehearsal (T5.4/T7.5), which exercises " +
                 "the sheet's Accept/Decline paths."
+        )
+    }
+
+    // MARK: - Sync-debug view gap
+
+    /// Gap SYNC-DEBUG: the child sync-debug view (T4.6 manual-test
+    /// surface: applied policy, sync state, pending uploads, demo
+    /// session) is unreachable — its only host is the dead harness.
+    /// The admin SessionsView sync surface IS walked (Admin04).
+    func testWalkthroughChild11_SyncDebugGap() {
+        let app = Walkthrough.launchChildModelReady()
+        XCTAssertTrue(
+            app.navigationBars["Set up EarnPlay"].waitForExistence(timeout: 30),
+            "Gap SYNC-DEBUG: setup wizard did not appear"
+        )
+        XCTAssertFalse(
+            textContaining(app, "Sync (T4.6, Bluetooth)").waitForExistence(timeout: 5),
+            "Gap SYNC-DEBUG: sync-debug view is unexpectedly reachable"
+        )
+        walkthroughScreenshot(app, named: "child-sync-debug-blocked-step11")
+        recordGap(
+            id: "SYNC-DEBUG",
+            feature: "Child sync-debug view (T4.6 manual-test surface)",
+            reached: "Nothing: no production screen presents SyncDebugView (the admin " +
+                "SessionsView sync surface is walked in Admin04).",
+            reason: "SyncDebugView is referenced only by ContentView.previewHarnesses " +
+                "(EarnPlayApp.swift), which is dead code (never rendered from " +
+                "ContentView.body). Its applied-policy, sync-state, and pending-uploads " +
+                "display and demo-session trigger have no production navigation path.",
+            unblock: "Add a production navigation path to the sync-debug surface (an " +
+                "app behavior change, out of scope for this task), then drive applied " +
+                "policy -> pending uploads -> demo session -> retry/reset."
         )
     }
 }

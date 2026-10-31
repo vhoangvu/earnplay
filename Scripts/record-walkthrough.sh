@@ -50,7 +50,13 @@ xcrun simctl io "$UDID" recordVideo --codec=h264 "$OUTPUT" 2>"$RECORDER_LOG" &
 RECORDER_PID=$!
 
 RECORDER_EXIT=0
+RECORDER_DIED_EARLY=0
 stop_recording() {
+    # The recorder never finishes normally before shutdown: a death
+    # observed here happened mid-suite, even with a zero exit status.
+    if ! kill -0 "$RECORDER_PID" 2>/dev/null; then
+        RECORDER_DIED_EARLY=1
+    fi
     kill -INT "$RECORDER_PID" 2>/dev/null || true
     wait "$RECORDER_PID" 2>/dev/null
     RECORDER_EXIT=$?
@@ -103,14 +109,19 @@ trap - EXIT INT TERM
 
 # A recorder that dies after acknowledging startup leaves a missing or
 # incomplete video; passing tests must not report a full recording.
-# Capture failure is a nonzero recorder exit OR a missing/empty output
-# after finalization. Either failure propagates; a recorder failure
-# never masks a test failure (both are reported, test exit wins).
+# Capture failure is a nonzero recorder exit, an early death even with
+# status 0 (the recorder never finishes normally before shutdown), OR
+# a missing/empty output after finalization. Any failure propagates; a
+# recorder failure never masks a test failure (both are reported, test
+# exit wins).
 RECORDER_FAILED=0
 RECORDER_REASON=""
 if [ "$RECORDER_EXIT" -ne 0 ]; then
     RECORDER_FAILED=1
     RECORDER_REASON="recorder exited with status $RECORDER_EXIT"
+elif [ "$RECORDER_DIED_EARLY" -ne 0 ]; then
+    RECORDER_FAILED=1
+    RECORDER_REASON="recorder exited early with status $RECORDER_EXIT before shutdown"
 elif [ ! -s "$OUTPUT" ]; then
     RECORDER_FAILED=1
     if [ ! -e "$OUTPUT" ]; then
@@ -127,6 +138,12 @@ if [ "$RECORDER_FAILED" -ne 0 ]; then
         cat "$RECORDER_LOG" >&2
     else
         echo "(recorder produced no diagnostics)" >&2
+    fi
+    echo "--- partial output state ---" >&2
+    if [ -e "$OUTPUT" ]; then
+        wc -c "$OUTPUT" >&2
+    else
+        echo "(no output at $OUTPUT)" >&2
     fi
     rm -f "$RECORDER_LOG"
     if [ "$TEST_EXIT" -ne 0 ]; then
