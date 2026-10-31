@@ -207,6 +207,11 @@ public final class ChildSyncService: @unchecked Sendable {
         transport.start(); flushPending(); publishSnapshot()
     }
     public func stop() { retryEngine.cancelAll(); transport.stop() }
+    /// Called after a successful session-log enqueue (issue #63 fix 3):
+    /// mirrors the admin notifyPolicyEnqueued->flushPending pattern.
+    /// The outbox is not polled, so the production path (which enqueues
+    /// directly) needs this explicit kick to deliver.
+    public func notifySessionEnqueued() { flushPending() }
     public func retryPairing() { transport.retryPairing(); flushPending() }
     public func sendSessionLog(_ log: SessionLog) throws {
         try sessionQueue.enqueue(log); publishSnapshot(); flushPending()

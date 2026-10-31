@@ -75,6 +75,39 @@ protocol ChatTutorEngine: AnyObject {
     func startSession() -> ChatEngineUpdate
     func submitAnswer(_ plainText: String) -> ChatEngineUpdate
     func requestHint() -> ChatEngineUpdate
+    /// Ends the active session (the practice view disappeared): the
+    /// engine finalizes any unfinished recording. Default is a no-op.
+    func endSession()
+    /// Resumes after reappearance (round 2 item 3): the engine starts a
+    /// fresh recording session for the continued run when the prior one
+    /// was finalized mid-run via `endSession`. No-op when recording is
+    /// disabled, already active, or the session is complete (restart
+    /// owns that). Default is a no-op.
+    func resumeSession()
+    /// Composer activity (a keystroke, number-pad tap, or draft edit):
+    /// the engine records a timing anchor on the current question, never
+    /// an attempt or hint count. Default is a no-op.
+    func recordComposerActivity()
+    /// The CURRENT session's hint-listen sink (round 2 item 5, round 3
+    /// item 2): the live session recorder while a session is actively
+    /// recording, nil when recording is disabled, no session is active,
+    /// input is blocked awaiting persistence, or the session already
+    /// finished — so a stale recorder never receives events for
+    /// a new session. Default is nil.
+    var currentHintListenSink: (any HintListenEventSink)? { get }
+    /// True while the engine blocks input awaiting persistence (round 3
+    /// item 1): a mid-run resume whose pending-log retry still failed. The
+    /// view model renders the session-complete state (which refuses all
+    /// submissions) until the block lifts. Default is false.
+    var isInputBlocked: Bool { get }
+}
+
+extension ChatTutorEngine {
+    func endSession() {}
+    func resumeSession() {}
+    func recordComposerActivity() {}
+    var currentHintListenSink: (any HintListenEventSink)? { nil }
+    var isInputBlocked: Bool { false }
 }
 
 // MARK: - Untrusted child input
@@ -111,6 +144,21 @@ enum ChatDesign {
 
 // MARK: - View model (no behaviour logic)
 
+/// Forwards hint-listen events to the engine's CURRENT session recorder
+/// (round 2 item 5). Retained by the view model and installed as the
+/// speech service's (weak) sink; every event resolves the live session
+/// at delivery time, so a stale recorder never receives events for a new
+/// session across restarts, and an ended session receives nothing.
+private final class CurrentSessionHintListenForwarder: HintListenEventSink {
+    private let resolve: () -> (any HintListenEventSink)?
+    init(resolve: @escaping () -> (any HintListenEventSink)?) {
+        self.resolve = resolve
+    }
+    func recordHintListen(_ event: HintListenEvent) {
+        resolve()?.recordHintListen(event)
+    }
+}
+
 /// Holds the rendered thread and forwards intents to the engine.
 /// It contains no scoring, timing, answer-checking, hint, probe, or
 /// pass/fail logic of any kind.
@@ -119,7 +167,13 @@ final class ChatConversationViewModel: ObservableObject {
     @Published private(set) var messages: [ChatTurn] = []
     @Published private(set) var progress = ChatProgress()
     @Published private(set) var composer: ChatComposerSpec = .text
-    @Published var draft = ""
+    /// Every mutation (typing, number-pad taps, backspace, the
+    /// submit clear) is composer activity: forwarded to the engine as a
+    /// timing anchor. The submit clear coincides with the submission's
+    /// own anchor, so it adds no time.
+    @Published var draft = "" {
+        didSet { engine.recordComposerActivity() }
+    }
     /// Mirrors `speech.isVoiceUnavailable` so the thread can show a
     /// plain notice when no bundled voice is available.
     @Published private(set) var isVoiceUnavailable = false
@@ -128,11 +182,28 @@ final class ChatConversationViewModel: ObservableObject {
     private let engine: any ChatTutorEngine
     private var childSequence = 0
     private var started = false
+    /// Set when the view disappears mid-session (round 2 item 3): the
+    /// next appearance resumes a fresh recording session for the
+    /// continued run, so no answer is accepted without an active
+    /// recording. Never set for a completed session (restart owns that).
+    private var needsResumeAfterDisappear = false
+    private let hintListenForwarder: CurrentSessionHintListenForwarder
     private var cancellable: AnyCancellable?
 
     init(engine: any ChatTutorEngine, speech: ReadAloudService) {
         self.engine = engine
         self.speech = speech
+        // Round 2 item 5, round 3 item 2: successful hint playback reaches
+        // the CURRENT session's recorder (question timing anchor + listen
+        // effort; the recorder's `recordHintListen` never touches
+        // `hintsUsed`, which stays tied to ladder-show events). The
+        // forwarder resolves the live session per event, tracking restarts
+        // with no manual re-wiring and never delivering to a stale recorder.
+        let forwarder = CurrentSessionHintListenForwarder { [engine] in
+            engine.currentHintListenSink
+        }
+        self.hintListenForwarder = forwarder
+        speech.hintListenSink = forwarder
         cancellable = speech.$isVoiceUnavailable.sink { [weak self] in self?.isVoiceUnavailable = $0 }
     }
 
@@ -170,7 +241,27 @@ final class ChatConversationViewModel: ObservableObject {
     // MARK: Lifecycle and intents
 
     func startIfNeeded() {
-        guard !started else { return }
+        if started {
+            // Reappearance after a mid-session disappearance (round 2
+            // item 3, round 3 item 1): resume a fresh recording session
+            // for the continued run. A drained resume is recording-only —
+            // no thread/progress/composer change — so the decision stays
+            // at the engine/view-model boundary and the view holds no
+            // behavior logic. A resume whose persistence retry still fails
+            // blocks input instead: the completion state refuses every
+            // submission until a later retry observes the drain (the
+            // restart action replays the retry).
+            if needsResumeAfterDisappear {
+                needsResumeAfterDisappear = false
+                if !isSessionComplete {
+                    engine.resumeSession()
+                    if engine.isInputBlocked {
+                        apply(ChatEngineUpdate(composer: .sessionComplete))
+                    }
+                }
+            }
+            return
+        }
         started = true
         apply(engine.startSession())
     }
@@ -199,6 +290,7 @@ final class ChatConversationViewModel: ObservableObject {
         messages = []
         draft = ""
         childSequence = 0
+        needsResumeAfterDisappear = false
         apply(engine.startSession())
     }
 
@@ -256,8 +348,41 @@ final class ChatConversationViewModel: ObservableObject {
         apply(ChatEngineUpdate(turns: turns, progress: progress, composer: composer))
     }
 
+    /// The practice view disappeared: end the engine session (it
+    /// finalizes any unfinished recording) and stop any reading. A
+    /// mid-session disappearance arms a recording resume for the next
+    /// appearance (round 2 item 3); a completed session needs none.
     func handleDisappeared() {
+        engine.endSession()
         speech.handleViewDisappeared()
+        if !isSessionComplete {
+            needsResumeAfterDisappear = true
+        }
+    }
+
+    /// Scene-phase transitions (round 4 item 1): backgrounding the app does
+    /// NOT trigger `onDisappear` on the root chat view, so without this the
+    /// partial session stayed only in memory and an iOS termination lost it
+    /// even with healthy storage. Background finalizes exactly like a
+    /// disappearance (the engine's `endSession` hook, idempotent via its
+    /// ended guard — a second finalize is a no-op, never a second log — and
+    /// a failed enqueue arms the round-3 blocked state on resume instead of
+    /// resuming live). Foreground re-enters the existing reappearance path
+    /// (`startIfNeeded`, which resumes a fresh recording session). A
+    /// transient `.inactive` (notification shade, control center) is not a
+    /// backgrounding and does nothing. The view forwards the phase here;
+    /// every decision stays at this engine/view-model boundary.
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            handleDisappeared()
+        case .active:
+            startIfNeeded()
+        case .inactive:
+            break
+        @unknown default:
+            break
+        }
     }
 }
 
@@ -265,6 +390,7 @@ final class ChatConversationViewModel: ObservableObject {
 
 struct ChatConversationView: View {
     @StateObject private var viewModel: ChatConversationViewModel
+    @Environment(\.scenePhase) private var scenePhase
 
     init(viewModel: ChatConversationViewModel) {
         _viewModel = StateObject(wrappedValue: viewModel)
@@ -288,6 +414,13 @@ struct ChatConversationView: View {
         .accessibilityIdentifier("chatConversationView")
         .onAppear { viewModel.startIfNeeded() }
         .onDisappear { viewModel.handleDisappeared() }
+        // Round 4 item 1: backgrounding finalizes the active session
+        // (backgrounding never triggers onDisappear on this root view),
+        // and foregrounding resumes recording — the same two view-model
+        // hooks as disappear/reappear, so no new finalization path.
+        .onChange(of: scenePhase) { _, newPhase in
+            viewModel.handleScenePhase(newPhase)
+        }
     }
 
     // Slim header: star progress only. No score, clock, or text count.

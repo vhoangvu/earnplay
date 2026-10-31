@@ -5,15 +5,18 @@ import EarnPlayCore
 /// this device has applied, sync/peer state, and pending uploads.
 /// Displayed values come from the published sync snapshot (finding 4),
 /// so a policy applied or an ack received refreshes them automatically.
+///
+/// Issue #63 fix 3: this view reuses the app's shared `ChildSyncController`
+/// service instead of starting a second service over the same outbox
+/// directory — two services are NOT safe (dedupe + removeDelivered are
+/// per-instance-locked read-modify-write persists with no cross-instance
+/// lock, so concurrent writers can clobber). The view only attaches its
+/// confirmation UI (pairing request/failure handlers, snapshot observer)
+/// to the shared transport/service on appear; starting is the app's job.
+/// First-time (untrusted) pairing is confirmed here via the shared gate:
+/// record the admin's shown code, then accept the pending invitation.
 struct SyncDebugView: View {
-    @State private var policyStore = PolicyStore()
-    @State private var sessionQueue = SessionLogQueue()
-    // Round 4 (M7): persisted installation identity, pairing, and
-    // secret — the same device across relaunches.
-    @State private var pairing = SyncPairingStore.loadOrCreateGate(displayName: "EarnPlay-Child",
-                                                                   key: "earnplay.pairing.child.v1")
-    @State private var transport: MultipeerSyncTransport?
-    @State private var service: ChildSyncService?
+    let controller: ChildSyncController
     @StateObject private var ui = ChildSyncUIState(snapshot: ChildSyncSnapshot(
         policyVersion: 0, practiceMinutes: 0, pendingUploads: 0, isPaired: false))
     @State private var logger = DecisionLogger()
@@ -30,10 +33,10 @@ struct SyncDebugView: View {
                 .font(.body.monospacedDigit())
             Text("Pending session uploads: \(ui.snapshot.pendingUploads)")
                 .font(.body.monospacedDigit())
-            Text("Paired: \(ui.snapshot.isPaired ? "yes" : "no") · Pairing code (show to admin): \(pairing.localCode)")
+            Text("Paired: \(ui.snapshot.isPaired ? "yes" : "no") · Pairing code (show to admin): \(controller.pairing.localCode)")
                 .font(.caption.monospaced())
             if let pendingPeer {
-                Text("Pairing request from \(pendingPeer.displayName) — compare codes out-of-band: this device shows \(pairing.localCode); enter the code shown on the admin device, then Accept. Acceptance alone proves nothing; both devices verify by challenge-response before any data flows.")
+                Text("Pairing request from \(pendingPeer.displayName) — compare codes out-of-band: this device shows \(controller.pairing.localCode); enter the code shown on the admin device, then Accept. Acceptance alone proves nothing; both devices verify by challenge-response before any data flows.")
                     .font(.caption)
                 HStack {
                     TextField("Code shown on admin", text: $peerCode)
@@ -42,38 +45,37 @@ struct SyncDebugView: View {
                     Button("Accept pairing") {
                         // Out-of-band confirmation: record the admin's
                         // code as shown on the admin screen (F2).
-                        _ = pairing.preparePairing(enteredCode: peerCode)
-                        if transport?.acceptPendingInvitation() == true {
+                        _ = controller.pairing.preparePairing(enteredCode: peerCode)
+                        if controller.transport.acceptPendingInvitation() {
                             status = "Verifying with \(pendingPeer.displayName)…"
                         }
                         self.pendingPeer = nil
                     }
                     .disabled(peerCode.trimmingCharacters(in: .whitespaces).isEmpty)
                     Button("Reject", role: .destructive) {
-                        transport?.rejectPendingInvitation()
+                        controller.transport.rejectPendingInvitation()
                         self.pendingPeer = nil
                     }
                 }
             }
             Text(status).font(.caption).foregroundStyle(.secondary)
             Button("Run demo session (log decision + queue for sync)") { runDemoSession() }
-            Button("Retry sync now") { service?.handleReconnect() }
+            Button("Retry sync now") { controller.service.handleReconnect() }
             Button("Reset / Unpair", role: .destructive) {
-                transport?.unpair()
-                // Round 5 (item 3): republish the snapshot now, mirroring
-                // the admin controller, so Paired flips immediately.
-                service?.flushPending()
+                controller.unpair()
                 pendingPeer = nil; peerCode = ""
                 status = "Unpaired — pair again from the admin device."
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear { startSync() }
+        .onAppear { attachSync() }
     }
 
-    private func startSync() {
-        guard service == nil else { return }
-        let t = MultipeerSyncTransport(role: .advertiser, displayName: "EarnPlay-Child", pairing: pairing)
+    private func attachSync() {
+        // The app owns starting; attaching is idempotent (re-appear
+        // only rebinds this view's observers to the same service).
+        controller.startIfNeeded()
+        let t = controller.transport
         // Finding 3: transport callbacks arrive off the main thread;
         // dispatch SwiftUI state updates to the main queue.
         t.onPairingRequest = { peer in
@@ -90,10 +92,8 @@ struct SyncDebugView: View {
                 if !t.hasPendingPairingRequest { pendingPeer = nil }
             }
         }
-        let s = ChildSyncService(policyStore: policyStore, sessionQueue: sessionQueue,
-                                 transport: t, pairing: pairing)
+        let s = controller.service
         s.onSnapshotChange = { snap in DispatchQueue.main.async { ui.snapshot = snap } }
-        transport = t; service = s; s.start()
         ui.snapshot = s.snapshot
         status = "Sync started — waiting for admin nearby…"
     }
@@ -110,8 +110,8 @@ struct SyncDebugView: View {
                 alternativeConsidered: "Discard session; rejected — admin audit needs it",
                 confidence: 0.9)
             let log = SessionLog.make(sessionId: sessionId, startedAt: Date(), endedAt: Date(),
-                                      logger: logger, policyVersion: policyStore.storedVersion)
-            try service?.sendSessionLog(log)
+                                      logger: logger, policyVersion: controller.policyStore.storedVersion)
+            try controller.service.sendSessionLog(log)
             status = "Queued \(sessionId)"
         } catch { status = "Demo session failed: \(error)" }
     }
