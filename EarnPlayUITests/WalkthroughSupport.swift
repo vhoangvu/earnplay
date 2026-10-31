@@ -3,9 +3,9 @@ import XCTest
 /// Shared helpers for the issue #71 feature-walkthrough suite.
 ///
 /// Conventions (see Docs/Walkthrough.md):
-/// - Every step launches its app fresh (order-independent, re-runnable
-///   on a dirty simulator) and captures at least one screenshot
-///   artifact named `<app>-<screen>-step<NN>`.
+/// - Every step launches its app fresh (order-independent; reruns
+///   require an erased simulator, erased between reruns) and captures
+///   at least one screenshot artifact named `<app>-<screen>-step<NN>`.
 /// - Screenshot capture never fails a test: the capture helper asserts
 ///   nothing and throws nothing, and issues recorded while it runs
 ///   are suppressed by WalkthroughTestCase (see below).
@@ -46,7 +46,9 @@ enum Walkthrough {
     /// then `SIMCTL_CHILD_EARNPLAY_MODEL_PATH`, and an inherited
     /// `SIMCTL_CHILD_` value would otherwise satisfy the gate. (The
     /// model-ready launcher needs no such clearing: its non-empty
-    /// plain key is consulted first and always wins.)
+    /// plain key is consulted first and always wins.) Clears env
+    /// overrides only; does NOT erase app data. Requires an erased
+    /// simulator for reruns: a retained model bypasses the gate.
     static func launchChildFresh() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["EARNPLAY_MODEL_PATH"] = ""
@@ -57,7 +59,9 @@ enum Walkthrough {
 
     /// Launches the admin app from this same UI-test target. The
     /// EarnPlay scheme builds EarnPlayAdmin (see project.yml) so the
-    /// test run installs it alongside the child app.
+    /// test run installs it alongside the child app. Does nothing
+    /// about saved state. Requires an erased simulator for reruns:
+    /// saved sessions/pairing violate the empty/unpaired assertions.
     static func launchAdmin() -> XCUIApplication {
         let app = XCUIApplication(bundleIdentifier: adminBundleID)
         app.launch()
@@ -233,6 +237,183 @@ extension XCTestCase {
                 key.tap()
                 return
             }
+        }
+    }
+
+    /// Waits for the child download gate. On a dirty simulator a
+    /// retained model shows the setup wizard or chat UI instead; fails
+    /// with an erased-simulator message then, otherwise with
+    /// missingMessage. Test-side only, no production hooks.
+    func requireChildDownloadGate(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        timeout: TimeInterval = 30,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let gate = app.descendants(matching: .any)["modelDownloadView"].firstMatch
+        if gate.waitForExistence(timeout: timeout) { return }
+        if app.navigationBars["Set up EarnPlay"].exists {
+            XCTFail(
+                "\(label): download gate missing but setup wizard is showing — simulator retains app data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else if app.descendants(matching: .any)["chatConversationView"].exists {
+            XCTFail(
+                "\(label): download gate missing but chat UI is showing — simulator retains app data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Waits for the admin dashboard empty state. On a dirty simulator
+    /// synced sessions show the filled header instead; fails with an
+    /// erased-simulator message then, otherwise with missingMessage.
+    func requireAdminDashboardEmpty(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        timeout: TimeInterval = 10,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let empty = app.descendants(matching: .any)["dashboard-empty-state"].firstMatch
+        if empty.waitForExistence(timeout: timeout) { return }
+        if app.descendants(matching: .any)["dashboard-header"].exists {
+            XCTFail(
+                "\(label): dashboard shows synced sessions — simulator retains admin data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Asserts the admin unpaired line. On a dirty simulator saved
+    /// pairing shows "Paired: yes" instead; fails with an
+    /// erased-simulator message then, otherwise with missingMessage.
+    func requireAdminUnpaired(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        if textContaining(app, "Paired: no").exists { return }
+        if textContaining(app, "Paired: yes").exists {
+            XCTFail(
+                "\(label): admin is paired — simulator retains pairing; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Asserts the admin empty sessions list. On a dirty simulator
+    /// synced sessions show rows instead; fails with an
+    /// erased-simulator message then, otherwise with missingMessage.
+    func requireAdminEmptySessions(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let emptySessions = app.staticTexts["No sessions yet"]
+        scrollIntoView(emptySessions, in: app)
+        if emptySessions.exists { return }
+        if textContaining(app, "decision(s) · policy v").exists {
+            XCTFail(
+                "\(label): sessions list shows synced sessions — simulator retains admin data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Asserts the admin clean-findings row. On a dirty simulator open
+    /// findings show rows instead; fails with an erased-simulator
+    /// message then, otherwise with missingMessage.
+    func requireAdminCleanFindings(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        if app.staticTexts["No open findings"].exists { return }
+        if textContaining(app, "Severity:").exists {
+            XCTFail(
+                "\(label): auditor shows open findings — simulator retains admin data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Waits for the clean auditor run status (0 findings). On a dirty
+    /// simulator the run reports a nonzero count instead; fails with an
+    /// erased-simulator message then, otherwise with missingMessage.
+    func requireAdminCleanRunStatus(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        timeout: TimeInterval = 15,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        if textContaining(app, "Auditor run complete. 0 open finding(s)").waitForExistence(timeout: timeout) {
+            return
+        }
+        if textContaining(app, "Auditor run complete.").exists {
+            XCTFail(
+                "\(label): auditor run reports open findings — simulator retains admin data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
+        }
+    }
+
+    /// Waits for the empty findings section header ("Findings (0)").
+    /// Preserves the fix-1 tolerant query (exact-or-UPPERCASE,
+    /// containing, any type) and scroll. On a dirty simulator a
+    /// nonzero header shows instead; fails with an erased-simulator
+    /// message then, otherwise with missingMessage.
+    func requireAdminEmptyFindingsSection(
+        _ app: XCUIApplication,
+        label: String,
+        missingMessage: String,
+        timeout: TimeInterval = 10,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let findingsHeader = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "Findings (0)", "FINDINGS (0)")
+        ).firstMatch
+        scrollIntoView(findingsHeader, in: app)
+        if findingsHeader.waitForExistence(timeout: timeout) { return }
+        if textContaining(app, "Severity:").exists {
+            XCTFail(
+                "\(label): auditor shows open findings — simulator retains admin data; erase the simulator and re-run",
+                file: file,
+                line: line
+            )
+        } else {
+            XCTFail(missingMessage, file: file, line: line)
         }
     }
 }

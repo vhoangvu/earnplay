@@ -21,10 +21,10 @@ final class WalkthroughChildTests: WalkthroughTestCase {
     /// The download button is asserted present and NEVER tapped.
     func testWalkthroughChild01_ModelDownloadGate() {
         let app = Walkthrough.launchChildFresh()
-        let gate = app.descendants(matching: .any)["modelDownloadView"].firstMatch
-        XCTAssertTrue(
-            gate.waitForExistence(timeout: 30),
-            "Step 1: model-download gate did not appear on fresh launch"
+        requireChildDownloadGate(
+            app,
+            label: "Step 1",
+            missingMessage: "Step 1: model-download gate did not appear on fresh launch"
         )
         XCTAssertTrue(
             app.staticTexts["Download tutor model"].waitForExistence(timeout: 10),
@@ -54,10 +54,10 @@ final class WalkthroughChildTests: WalkthroughTestCase {
     /// here because About lives on the gate screen.)
     func testWalkthroughChild02_AboutAndLicense() {
         let app = Walkthrough.launchChildFresh()
-        let gate = app.descendants(matching: .any)["modelDownloadView"].firstMatch
-        XCTAssertTrue(
-            gate.waitForExistence(timeout: 30),
-            "Step 7: model-download gate did not appear on fresh launch"
+        requireChildDownloadGate(
+            app,
+            label: "Step 7",
+            missingMessage: "Step 7: model-download gate did not appear on fresh launch"
         )
         XCTAssertTrue(
             app.staticTexts["About"].waitForExistence(timeout: 10),
@@ -298,10 +298,10 @@ final class WalkthroughChildTests: WalkthroughTestCase {
     /// invitation, which stays a manual item.
     func testWalkthroughChild10_PairingSheetGap() {
         let app = Walkthrough.launchChildFresh()
-        let gate = app.descendants(matching: .any)["modelDownloadView"].firstMatch
-        XCTAssertTrue(
-            gate.waitForExistence(timeout: 30),
-            "Gap PAIRING-SHEET: model-download gate did not appear"
+        requireChildDownloadGate(
+            app,
+            label: "Gap PAIRING-SHEET",
+            missingMessage: "Gap PAIRING-SHEET: model-download gate did not appear"
         )
         let code = textStartingWith(app, "Pairing code (show to admin):")
         XCTAssertTrue(

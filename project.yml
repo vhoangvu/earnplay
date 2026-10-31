@@ -87,6 +87,7 @@ targets:
       - EarnPlayUITests
     dependencies:
       - target: EarnPlay
+      - target: EarnPlayAdmin
     settings:
       base:
         PRODUCT_NAME: EarnPlayUITests

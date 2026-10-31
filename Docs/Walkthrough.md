@@ -21,9 +21,12 @@ untouched) with:
 
 ## Conventions
 
-- Every step launches its app fresh: steps are order-independent and
-  re-runnable on a dirty simulator (assertions pin formats and
-  relative changes, never random codes or exact versions).
+- Every step launches its app fresh: steps are order-independent, but
+  reruns require an erased simulator (erase between reruns).
+  Relaunching preserves app data: a retained child model bypasses the
+  download gate, and saved admin sessions/pairing violate the
+  empty/unpaired assertions. Assertions pin formats and relative
+  changes, never random codes or exact versions.
 - Every step captures at least one screenshot artifact named by app +
   screen + step (e.g. `child-gate-step01`, `admin-policy-saved-step03`).
   Capture never fails a test: the helper asserts nothing, and issues

@@ -34,10 +34,10 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
     func testWalkthroughAdmin01_DashboardEmpty() {
         let app = Walkthrough.launchAdmin()
         openTab(app, "Progress")
-        let empty = app.descendants(matching: .any)["dashboard-empty-state"].firstMatch
-        XCTAssertTrue(
-            empty.waitForExistence(timeout: 10),
-            "Admin01: dashboard empty state did not appear"
+        requireAdminDashboardEmpty(
+            app,
+            label: "Admin01",
+            missingMessage: "Admin01: dashboard empty state did not appear"
         )
         XCTAssertTrue(
             app.staticTexts["No synced sessions yet"].exists,
@@ -53,10 +53,10 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
     func testWalkthroughAdmin02_DashboardFilledGap() {
         let app = Walkthrough.launchAdmin()
         openTab(app, "Progress")
-        let empty = app.descendants(matching: .any)["dashboard-empty-state"].firstMatch
-        XCTAssertTrue(
-            empty.waitForExistence(timeout: 10),
-            "Gap DASHBOARD-FILLED: dashboard empty state did not appear"
+        requireAdminDashboardEmpty(
+            app,
+            label: "Gap DASHBOARD-FILLED",
+            missingMessage: "Gap DASHBOARD-FILLED: dashboard empty state did not appear"
         )
         walkthroughScreenshot(app, named: "admin-dashboard-blocked-step02")
         recordGap(
@@ -128,11 +128,13 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
         scrollIntoView(addChore, in: app)
         XCTAssertTrue(addChore.waitForExistence(timeout: 10), "Admin03: Add chore button is missing")
         let unnamedRows = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Chore "))
-        let beforeLabels = Set(unnamedRows.allElementsBoundByIndex.map(\.label))
+        let beforeRows = unnamedRows.allElementsBoundByIndex
+        let beforeLabels = Set(beforeRows.map(\.label))
+        let beforeCount = beforeRows.count
         addChore.tap()
         let appended = XCTWaiter().wait(
             for: [XCTNSPredicateExpectation(
-                predicate: NSPredicate(format: "count == %d", beforeLabels.count + 1),
+                predicate: NSPredicate(format: "count == %d", beforeCount + 1),
                 object: unnamedRows
             )],
             timeout: 10
@@ -222,9 +224,10 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
             textContaining(app, "Sync started").waitForExistence(timeout: 10),
             "Admin04: sync status line is missing"
         )
-        XCTAssertTrue(
-            textContaining(app, "Paired: no").exists,
-            "Admin04: unpaired sync line is missing"
+        requireAdminUnpaired(
+            app,
+            label: "Admin04",
+            missingMessage: "Admin04: unpaired sync line is missing"
         )
         let localCode = textStartingWith(app, "This device pairing code:")
         XCTAssertTrue(
@@ -252,9 +255,11 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
         walkthroughScreenshot(app, named: "admin-sessions-pairing-step04")
         XCTAssertTrue(app.buttons["Retry sync now"].exists, "Admin04: retry-sync button is missing")
         XCTAssertTrue(app.buttons["Reset / Unpair"].exists, "Admin04: reset/unpair button is missing")
-        let emptySessions = app.staticTexts["No sessions yet"]
-        scrollIntoView(emptySessions, in: app)
-        XCTAssertTrue(emptySessions.exists, "Admin04: empty sessions list is missing")
+        requireAdminEmptySessions(
+            app,
+            label: "Admin04",
+            missingMessage: "Admin04: empty sessions list is missing"
+        )
         walkthroughScreenshot(app, named: "admin-sessions-list-step04")
     }
 
@@ -272,13 +277,15 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
         let run = app.buttons["Run auditor over synced sessions"]
         XCTAssertTrue(run.waitForExistence(timeout: 10), "Admin05: run-auditor button is missing")
         run.tap()
-        XCTAssertTrue(
-            textContaining(app, "Auditor run complete. 0 open finding(s)").waitForExistence(timeout: 15),
-            "Admin05: clean auditor run status did not appear"
+        requireAdminCleanRunStatus(
+            app,
+            label: "Admin05",
+            missingMessage: "Admin05: clean auditor run status did not appear"
         )
-        XCTAssertTrue(
-            app.staticTexts["No open findings"].exists,
-            "Admin05: clean-state findings line is missing"
+        requireAdminCleanFindings(
+            app,
+            label: "Admin05",
+            missingMessage: "Admin05: clean-state findings line is missing"
         )
         walkthroughScreenshot(app, named: "admin-auditor-clean-step05")
     }
@@ -306,17 +313,15 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
         // label containing it (no other element on this screen
         // contains that literal). Then pin the section's clean-state
         // row with its exact query as well.
-        let findingsHeader = app.descendants(matching: .any).matching(
-            NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "Findings (0)", "FINDINGS (0)")
-        ).firstMatch
-        scrollIntoView(findingsHeader, in: app)
-        XCTAssertTrue(
-            findingsHeader.waitForExistence(timeout: 10),
-            "Gap AUDITOR-FINDING: empty findings section is missing"
+        requireAdminEmptyFindingsSection(
+            app,
+            label: "Gap AUDITOR-FINDING",
+            missingMessage: "Gap AUDITOR-FINDING: empty findings section is missing"
         )
-        XCTAssertTrue(
-            app.staticTexts["No open findings"].exists,
-            "Gap AUDITOR-FINDING: clean-state findings row is missing"
+        requireAdminCleanFindings(
+            app,
+            label: "Gap AUDITOR-FINDING",
+            missingMessage: "Gap AUDITOR-FINDING: clean-state findings row is missing"
         )
         walkthroughScreenshot(app, named: "admin-auditor-blocked-step06")
         recordGap(
@@ -388,11 +393,10 @@ final class WalkthroughAdminTests: WalkthroughTestCase {
             app.navigationBars["Sessions"].waitForExistence(timeout: 10),
             "Gap SESSIONS-FILLED: sessions screen did not appear"
         )
-        let emptySessions = app.staticTexts["No sessions yet"]
-        scrollIntoView(emptySessions, in: app)
-        XCTAssertTrue(
-            emptySessions.exists,
-            "Gap SESSIONS-FILLED: empty sessions list is missing"
+        requireAdminEmptySessions(
+            app,
+            label: "Gap SESSIONS-FILLED",
+            missingMessage: "Gap SESSIONS-FILLED: empty sessions list is missing"
         )
         walkthroughScreenshot(app, named: "admin-sessions-blocked-step08")
         recordGap(
