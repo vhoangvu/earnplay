@@ -524,7 +524,21 @@ public final class MultipeerSyncTransport: NSObject, SyncTransport, @unchecked S
                 dataPlaneBinding.clear()
                 if activeHandshakeHandle == senderHandle { activeHandshakeHandle = nil }
                 pendingRemoteChallengeNonce = nil; pendingRemoteChallengeFrom = nil
+                // Fix round 1 (finding 3): restore the retryable manual
+                // request exactly like `failHandshake` does, or the sheet
+                // stays closed after a wrong-code failure (Accept already
+                // cleared the held invitation) and the child cannot enter
+                // a corrected code until the admin starts a new attempt.
+                var restoreManual = false
+                if role == .advertiser, pendingInvitationHandler == nil {
+                    pendingManualPeerID = mcPeer; pendingManualIdentity = from
+                    restoreManual = true
+                }
                 stateLock.unlock()
+                // Order matters: the request callback re-publishes the
+                // peer first, then the failure callback replaces the
+                // message while the pending request keeps the peer.
+                if restoreManual { onPairingRequest?(from) }
                 onPairingFailure?(from)
             }
         case .pairingSecret(let secret, let from):

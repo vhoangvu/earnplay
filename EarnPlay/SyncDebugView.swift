@@ -11,17 +11,21 @@ import EarnPlayCore
 /// directory — two services are NOT safe (dedupe + removeDelivered are
 /// per-instance-locked read-modify-write persists with no cross-instance
 /// lock, so concurrent writers can clobber). The view only attaches its
-/// confirmation UI (pairing request/failure handlers, snapshot observer)
-/// to the shared transport/service on appear; starting is the app's job.
-/// First-time (untrusted) pairing is confirmed here via the shared gate:
-/// record the admin's shown code, then accept the pending invitation.
+/// snapshot observer to the shared service on appear; starting is the
+/// app's job.
+/// Issue #65: the controller is the SOLE owner of the pairing-request
+/// surface (it sets the transport's pairing handlers in `init`). This
+/// view sets NO pairing handlers — opening it must not clobber the
+/// production handler. Its code-entry/Accept row observes the
+/// controller's pending state and acts through the controller's
+/// accept/decline actions; the production confirmation sheet in
+/// `ContentView` is the same state from any app state.
 struct SyncDebugView: View {
-    let controller: ChildSyncController
+    @ObservedObject var controller: ChildSyncController
     @StateObject private var ui = ChildSyncUIState(snapshot: ChildSyncSnapshot(
         policyVersion: 0, practiceMinutes: 0, pendingUploads: 0, isPaired: false))
     @State private var logger = DecisionLogger()
     @State private var status = "Sync not started"
-    @State private var pendingPeer: PeerIdentity?
     @State private var peerCode = ""
 
     var body: some View {
@@ -35,35 +39,33 @@ struct SyncDebugView: View {
                 .font(.body.monospacedDigit())
             Text("Paired: \(ui.snapshot.isPaired ? "yes" : "no") · Pairing code (show to admin): \(controller.pairing.localCode)")
                 .font(.caption.monospaced())
-            if let pendingPeer {
-                Text("Pairing request from \(pendingPeer.displayName) — compare codes out-of-band: this device shows \(controller.pairing.localCode); enter the code shown on the admin device, then Accept. Acceptance alone proves nothing; both devices verify by challenge-response before any data flows.")
+            if let pendingPeer = controller.pendingPairingPeer {
+                // Out-of-band confirmation row, driven by the
+                // controller's pending state (issue #65): the same
+                // request the production sheet shows.
+                Text(controller.pairingStatusMessage ?? "Pairing request from \(pendingPeer.displayName).")
                     .font(.caption)
                 HStack {
                     TextField("Code shown on admin", text: $peerCode)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     Button("Accept pairing") {
-                        // Out-of-band confirmation: record the admin's
-                        // code as shown on the admin screen (F2).
-                        _ = controller.pairing.preparePairing(enteredCode: peerCode)
-                        if controller.transport.acceptPendingInvitation() {
+                        if controller.acceptPairingRequest(enteredCode: peerCode) {
                             status = "Verifying with \(pendingPeer.displayName)…"
                         }
-                        self.pendingPeer = nil
                     }
                     .disabled(peerCode.trimmingCharacters(in: .whitespaces).isEmpty)
                     Button("Reject", role: .destructive) {
-                        controller.transport.rejectPendingInvitation()
-                        self.pendingPeer = nil
+                        controller.declinePairingRequest()
                     }
                 }
             }
-            Text(status).font(.caption).foregroundStyle(.secondary)
+            Text(controller.pairingStatusMessage ?? status).font(.caption).foregroundStyle(.secondary)
             Button("Run demo session (log decision + queue for sync)") { runDemoSession() }
             Button("Retry sync now") { controller.service.handleReconnect() }
             Button("Reset / Unpair", role: .destructive) {
                 controller.unpair()
-                pendingPeer = nil; peerCode = ""
+                peerCode = ""
                 status = "Unpaired — pair again from the admin device."
             }
         }
@@ -71,28 +73,18 @@ struct SyncDebugView: View {
         .onAppear { attachSync() }
     }
 
-    private func attachSync() {
+    /// Attaches this view's snapshot observer to the shared service.
+    /// Internal (not private) so tests can verify that attaching the
+    /// debug view does not replace the controller's pairing handlers
+    /// (issue #65: single ownership — the controller sets them in
+    /// `init`, and this method must never assign them).
+    func attachSync() {
         // The app owns starting; attaching is idempotent (re-appear
         // only rebinds this view's observers to the same service).
         controller.startIfNeeded()
-        let t = controller.transport
+        let s = controller.service
         // Finding 3: transport callbacks arrive off the main thread;
         // dispatch SwiftUI state updates to the main queue.
-        t.onPairingRequest = { peer in
-            DispatchQueue.main.async { pendingPeer = peer; status = "Pairing request — compare codes out-of-band, enter the admin code, then Accept" }
-        }
-        // Round 4 (M6): verification failure resets both sides;
-        // surface a retryable status and allow corrected entry.
-        // Round 5 (item 6): the transport restores the manual request
-        // on failure, so keep the code-entry row whenever one is
-        // pending instead of hiding the only way to retry.
-        t.onPairingFailure = { _ in
-            DispatchQueue.main.async {
-                status = "Codes didn't match — re-enter the admin code and Accept, or ask the admin to tap Pair again."
-                if !t.hasPendingPairingRequest { pendingPeer = nil }
-            }
-        }
-        let s = controller.service
         s.onSnapshotChange = { snap in DispatchQueue.main.async { ui.snapshot = snap } }
         ui.snapshot = s.snapshot
         status = "Sync started — waiting for admin nearby…"
