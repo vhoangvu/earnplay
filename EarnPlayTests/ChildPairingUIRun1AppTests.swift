@@ -261,4 +261,47 @@ final class ChildPairingUIRun1AppTests: XCTestCase {
         XCTAssertFalse(controller.pairingStatusMessage?.contains(admin.displayName) ?? true,
                        "retry text is generic; the headline carries the peer name")
     }
+
+    /// Fix round 2: a gate callback captured while paired must not
+    /// overwrite a newer unpaired publish. The stale callback runs
+    /// off-main (async publish, queued while main is blocked); the
+    /// unpair then runs on-main (inline publish of the current
+    /// code); the queued stale block runs last. Reading gate state
+    /// inside the main-queue block publishes the current code;
+    /// capturing before the hop published the stale nil.
+    func testStalePairedCallbackDoesNotErasePreInviteCode() throws {
+        guard let controller = controller("stalepreinvite") else {
+            return XCTFail("test defaults unavailable")
+        }
+        XCTAssertTrue(Thread.isMainThread, "test relies on main inline/async ordering")
+        XCTAssertTrue(controller.pairing.markPaired(peer: admin))
+        XCTAssertNil(controller.preInvitePairingCode)
+
+        // Run the paired-state callback off-main; its publish
+        // enqueues to main, which cannot run while main waits below.
+        let gate = controller.pairing
+        var sawOffMain = false
+        let enqueued = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            sawOffMain = !Thread.isMainThread
+            gate.onStateChange?()
+            enqueued.signal()
+        }
+        XCTAssertEqual(enqueued.wait(timeout: .now() + 5), .success,
+                       "off-main gate callback must run")
+        XCTAssertTrue(sawOffMain, "stale callback must run off-main for the async hop")
+
+        // Newer state arrives on-main: inline publish of the code.
+        controller.unpair()
+        XCTAssertEqual(controller.preInvitePairingCode, controller.pairing.localCode)
+
+        // Drain main: the stale queued block runs last.
+        let drained = expectation(description: "main drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+
+        XCTAssertFalse(controller.pairing.isPaired)
+        XCTAssertEqual(controller.preInvitePairingCode, controller.pairing.localCode,
+                       "stale paired-state callback must not erase the current pre-invite code")
+    }
 }

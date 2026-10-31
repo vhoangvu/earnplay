@@ -115,8 +115,13 @@ final class ChildSyncController: ObservableObject {
         self.pairing.onStateChange = { [weak self] in
             previousStateChange?()
             guard let self else { return }
-            let code = self.pairing.isPaired ? nil : self.pairing.localCode
-            self.publishOnMain { self.preInvitePairingCode = code }
+            // Fix round 2: read gate state INSIDE the main-queue block.
+            // Capturing before the hop left a stale window — a state
+            // change between capture and block execution published the
+            // old value (a stale nil hid the pre-invite code).
+            self.publishOnMain {
+                self.preInvitePairingCode = self.pairing.isPaired ? nil : self.pairing.localCode
+            }
         }
     }
 
