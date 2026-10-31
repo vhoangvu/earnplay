@@ -99,6 +99,10 @@ schemes:
     build:
       targets:
         EarnPlay: all
+        # Issue #71: the walkthrough drives the admin app from the same
+        # UI-test target via its bundle identifier, so the scheme builds
+        # (and the test run installs) EarnPlayAdmin alongside the child.
+        EarnPlayAdmin: all
         EarnPlayTests: [test]
         EarnPlayUITests: [test]
     test:

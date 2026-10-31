@@ -145,6 +145,9 @@ struct PolicyEditorView: View {
                 DisclosureGroup(state.draft.chorePool[index].chore.isEmpty
                     ? "Chore \(index + 1)" : state.draft.chorePool[index].chore) {
                     TextField("Chore", text: $state.draft.chorePool[index].chore)
+                        // Stable handle for the issue #71 walkthrough
+                        // (one per expanded chore row). No behavior change.
+                        .accessibilityIdentifier("policyChoreNameField")
                     Stepper(
                         "Unlock minutes: \(state.draft.chorePool[index].unlockMinutes)",
                         value: $state.draft.chorePool[index].unlockMinutes,
@@ -181,6 +184,9 @@ struct PolicyEditorView: View {
                     verificationMode: .parentConfirm
                 ))
             }
+            // Stable handle for the issue #71 walkthrough.
+            // No behavior change.
+            .accessibilityIdentifier("policyAddChoreButton")
         } header: { Text("Chore pool") } footer: {
             Text("Offers are unusable after expiry. Photo-async grants on trust; the parent reviews later and can revoke.")
         }
@@ -230,17 +236,26 @@ struct PolicyEditorView: View {
         Section {
             Button("Save (creates version \(state.baseVersion + 1))") { save() }
                 .disabled(!state.isLoaded)
+                // Stable handle for the issue #71 walkthrough; the label
+                // carries the dynamic next version. No behavior change.
+                .accessibilityIdentifier("policySaveButton")
             Button("Discard changes", role: .destructive) { reload() }
                 .disabled(!state.isLoaded)
             if !state.statusText.isEmpty {
                 Text(state.statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    // Stable handle for the issue #71 walkthrough.
+                    // No behavior change.
+                    .accessibilityIdentifier("policySaveStatus")
             }
             if !state.errorText.isEmpty {
                 Text(state.errorText)
                     .font(.caption)
                     .foregroundStyle(.red)
+                    // Stable handle for the issue #71 walkthrough.
+                    // No behavior change.
+                    .accessibilityIdentifier("policySaveError")
             }
         } header: { Text("Version") } footer: {
             Text("Saving queues the new version for delivery to the child app at the next sync (T4.6).")
