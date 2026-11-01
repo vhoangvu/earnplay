@@ -1,7 +1,7 @@
 import XCTest
 
 /// T7.8 theme-picker UI tests: both apps launch cleanly, both pickers
-/// list all 14 theme names, switching re-renders, and relaunch keeps
+/// list all 16 theme names, switching re-renders, and relaunch keeps
 /// the selection.
 ///
 /// State: each test normalizes its app to Canonical rounded on entry
@@ -31,6 +31,8 @@ final class ThemePickerUITests: WalkthroughTestCase {
         "Blush Pink, sharp",
         "Hot Pink, rounded",
         "Hot Pink, sharp",
+        "Light Pink, rounded",
+        "Light Pink, sharp",
     ]
 
     static let themeIDs = [
@@ -48,6 +50,8 @@ final class ThemePickerUITests: WalkthroughTestCase {
         "blush-pink-sharp",
         "hot-pink-rounded",
         "hot-pink-sharp",
+        "light-pink-rounded",
+        "light-pink-sharp",
     ]
 
     // MARK: - Child (About screen on the download gate)
@@ -70,7 +74,7 @@ final class ThemePickerUITests: WalkthroughTestCase {
             pickerTitle.waitForExistence(timeout: 10),
             "ThemePicker-Child: theme picker is missing from the About screen"
         )
-        assertAll14Rows(app, label: "ThemePicker-Child")
+        assertAll16Rows(app, label: "ThemePicker-Child")
 
         // Normalize to Canonical rounded (fresh sims already select it,
         // which asserts the default; reruns tap it explicitly).
@@ -124,7 +128,7 @@ final class ThemePickerUITests: WalkthroughTestCase {
             pickerTitle.waitForExistence(timeout: 10),
             "ThemePicker-Admin: theme picker is missing from the Version tab"
         )
-        assertAll14Rows(app, label: "ThemePicker-Admin")
+        assertAll16Rows(app, label: "ThemePicker-Admin")
 
         normalizeSelection(app, label: "ThemePicker-Admin")
         assertSelected(app, id: "canonical-rounded", label: "ThemePicker-Admin")
@@ -156,12 +160,12 @@ final class ThemePickerUITests: WalkthroughTestCase {
 
     // MARK: - Helpers
 
-    /// Every one of the 14 exact names renders as a picker row. The
+    /// Every one of the 16 exact names renders as a picker row. The
     /// pickers live in eager ScrollViews (never lazy), so every row
     /// exists in the tree without scrolling.
-    private func assertAll14Rows(_ app: XCUIApplication, label: String) {
-        XCTAssertEqual(Self.themeNames.count, 14)
-        XCTAssertEqual(Self.themeIDs.count, 14)
+    private func assertAll16Rows(_ app: XCUIApplication, label: String) {
+        XCTAssertEqual(Self.themeNames.count, 16)
+        XCTAssertEqual(Self.themeIDs.count, 16)
         for (name, id) in zip(Self.themeNames, Self.themeIDs) {
             let row = app.descendants(matching: .any)["themeRow_\(id)"].firstMatch
             XCTAssertTrue(

@@ -6,7 +6,7 @@ import EarnPlayCore
 @testable import EarnPlay
 
 /// T7.8 fix-2 (issue #73) rendering tests: progress-star boundaries for
-/// BOTH states and the speaker glyph across all 7 palettes, in light
+/// BOTH states and the speaker glyph across all 8 palettes, in light
 /// and dark appearances — plus the Finding-2 settings-route proof.
 ///
 /// Findings 1+3: each star state keeps its prescribed token color and

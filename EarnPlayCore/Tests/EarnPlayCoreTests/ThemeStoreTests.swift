@@ -66,9 +66,9 @@ final class ThemeStoreTests: XCTestCase {
     // MARK: - Completeness
 
     func testAllThemesCountAndUniqueIDs() {
-        XCTAssertEqual(DesignSystem.allThemes.count, 14)
+        XCTAssertEqual(DesignSystem.allThemes.count, 16)
         let ids = DesignSystem.allThemes.map(\.id)
-        XCTAssertEqual(Set(ids).count, 14)
+        XCTAssertEqual(Set(ids).count, 16)
     }
 
     func testPickerNamesAreExactAndOrdered() {
@@ -87,6 +87,8 @@ final class ThemeStoreTests: XCTestCase {
             "Blush Pink, sharp",
             "Hot Pink, rounded",
             "Hot Pink, sharp",
+            "Light Pink, rounded",
+            "Light Pink, sharp",
         ])
     }
 
@@ -153,6 +155,13 @@ final class ThemeStoreTests: XCTestCase {
             .hotPink: ["#fff0f5", "#a61e4d", "#ffffff", "#ffd6e8",
                        "#4a0e2e", "#f72585", "#ffffff", "#f72585",
                        "#f5c6da", "#f72585", "#ff8fab", "#8e2a5b"],
+            // Light Pink: accent is DELIBERATELY #f9a8d4 (the child
+            // background, following all 7 existing palettes), NOT the
+            // mockup class's --accent (#f472a0). Pinned explicitly so
+            // the deviation cannot silently flip to #f472a0.
+            .lightPink: ["#fff5f8", "#f472a0", "#ffffff", "#fde7ef",
+                         "#7a2148", "#f9a8d4", "#7a2148", "#f9a8d4",
+                         "#f9d6e2", "#f9a8d4", "#f472a0", "#f3c2d3"],
         ]
         for palette in DesignSystem.Palette.allCases {
             let actual = palette.tokens.all.map(\.hex)
@@ -194,8 +203,10 @@ final class ThemeStoreTests: XCTestCase {
 
     /// Secondary labels on theme cards use tutorText at 75% opacity
     /// (`secondaryOnTheme`): still at least 4.5:1 on tutorBackground
-    /// in every palette (measured 5.0-7.7 sRGB-blended), so Dark Mode
-    /// keeps readable supplementary text on the fixed light cards.
+    /// in every palette (measured 4.64-7.7 sRGB-blended; Light Pink
+    /// 4.64 is the tightest margin in the system, still passing), so
+    /// Dark Mode keeps readable supplementary text on the fixed
+    /// light cards.
     func testSecondaryOnThemeMeets4_5To1OnTutorBackgroundInEveryPalette() {
         for palette in DesignSystem.Palette.allCases {
             let mixed = mix(palette.tokens.tutorText, over: palette.tokens.tutorBackground, opacity: 0.75)
@@ -207,10 +218,10 @@ final class ThemeStoreTests: XCTestCase {
     // MARK: - Resolved text floors (fix-3 item B)
 
     /// The text actually rendered ON the child bubble meets WCAG AA
-    /// 4.5:1 in every palette: prescribed white where it passes
-    /// (Calm 5.00, Sky 4.63, Canonical 5.02), else darkOverlayText
-    /// (Warm 6.75, System Native 4.70, Blush 6.30, Hot Pink 5.00).
-    /// The prescribed childText token itself stays #ffffff verbatim
+    /// 4.5:1 in every palette: prescribed childText where it passes
+    /// (Calm 5.00, Sky 4.63, Canonical 5.02, Light Pink 5.41), else
+    /// darkOverlayText (Warm 6.75, System Native 4.70, Blush 6.30,
+    /// Hot Pink 5.00). The prescribed childText tokens stay verbatim
     /// (pinned by testTokenTableMatchesMockupVerbatim); this pins the
     /// resolved pair the chat and picker preview render.
     func testResolvedChildTextMeets4_5To1OnChildBackgroundInEveryPalette() {
@@ -223,9 +234,10 @@ final class ThemeStoreTests: XCTestCase {
 
     /// The text actually rendered ON the header strip meets 4.5:1 in
     /// every palette: prescribed headerText everywhere except Warm
-    /// Playful, which takes darkOverlayText (6.75). All 7 header
-    /// pairs computed; only Warm Playful falls below 4.5:1 with the
-    /// prescribed token (2.80; others 5.02-16.92).
+    /// Playful and Light Pink, which take darkOverlayText (6.75 and
+    /// 6.98). All 8 header pairs computed; only Warm Playful and
+    /// Light Pink fall below 4.5:1 with the prescribed token (2.80
+    /// and 2.71; others 5.02-16.92).
     func testResolvedHeaderTextMeets4_5To1OnHeaderBackgroundInEveryPalette() {
         for palette in DesignSystem.Palette.allCases {
             let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
@@ -247,14 +259,14 @@ final class ThemeStoreTests: XCTestCase {
                 XCTAssertEqual(theme.childTextOnChildBackground,
                                DesignSystem.Theme.darkOverlayText,
                                "\(palette) child text must use the dark overlay")
-            case .calmForest, .skyBlueprint, .canonical:
+            case .calmForest, .skyBlueprint, .canonical, .lightPink:
                 XCTAssertEqual(theme.childTextOnChildBackground, theme.tokens.childText,
                                "\(palette) child text must keep the prescribed token")
             }
-            if palette == .warmPlayful {
+            if palette == .warmPlayful || palette == .lightPink {
                 XCTAssertEqual(theme.headerTextOnHeaderBackground,
                                DesignSystem.Theme.darkOverlayText,
-                               "Warm Playful header text must use the dark overlay")
+                               "\(palette) header text must use the dark overlay")
             } else {
                 XCTAssertEqual(theme.headerTextOnHeaderBackground, theme.tokens.headerText,
                                "\(palette) header text must keep the prescribed token")
@@ -299,6 +311,7 @@ final class ThemeStoreTests: XCTestCase {
             .canonical: ["#4361ee", "#ffb703", "#f7f8fc"],
             .blushPink: ["#c2255c", "#f06595", "#fff7f9"],
             .hotPink: ["#a61e4d", "#f72585", "#fff0f5"],
+            .lightPink: ["#f472a0", "#f9a8d4", "#fff5f8"],
         ]
         for palette in DesignSystem.Palette.allCases {
             XCTAssertEqual(palette.swatches.map(\.hex), expected[palette], "swatch drift in \(palette)")
