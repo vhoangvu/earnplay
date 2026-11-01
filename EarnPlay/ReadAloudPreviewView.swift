@@ -11,6 +11,7 @@ import EarnPlayCore
 /// the service calls below are the integration contract it must keep.
 struct ReadAloudPreviewView: View {
     @StateObject private var service = ReadAloudService(band: GradeBand(grade: "4"))
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     private let messages: [TutorMessage] = [
         TutorMessage(id: "q1", text: "What is 7 plus 5?", kind: .question),
@@ -28,14 +29,17 @@ struct ReadAloudPreviewView: View {
 
             ForEach(messages) { message in
                 HStack(alignment: .top, spacing: 8) {
-                    SpeakerButton(message: message, service: service)
+                    SpeakerButton(message: message, service: service, theme: theme)
+                    // Paired with the fixed light row background below:
+                    // adaptive text would wash out in Dark Mode.
                     Text(message.text)
                         .font(.body)
+                        .foregroundStyle(theme.tokens.tutorText.color)
                     Spacer()
                 }
                 .padding(8)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(theme.tokens.tutorBackground.color)
+                .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
             }
 
             Button("Start new item (stops reading)") {

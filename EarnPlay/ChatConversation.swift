@@ -129,18 +129,12 @@ enum ChildTextSanitizer {
     }
 }
 
-// MARK: - Design tokens (SSOT palette; Band B, grade 4)
-
-enum ChatDesign {
-    static let primary = Color(red: 0x43 / 255, green: 0x61 / 255, blue: 0xEE / 255)
-    static let secondary = Color(red: 0xFF / 255, green: 0xB7 / 255, blue: 0x03 / 255)
-    static let background = Color(red: 0xF7 / 255, green: 0xF8 / 255, blue: 0xFC / 255)
-    static let surface = Color.white
-    static let text = Color(red: 0x1B / 255, green: 0x1B / 255, blue: 0x2F / 255)
-    static let textSecondary = Color(red: 0x6C / 255, green: 0x6C / 255, blue: 0x80 / 255)
-    static let cardRadius: CGFloat = 14
-    static let buttonRadius: CGFloat = 10
-}
+// MARK: - Design tokens (T7.8)
+//
+// Colors and radii come from the switchable `DesignSystem` theme in
+// EarnPlayCore (SSOT); no hardcoded color literal may live in this
+// target. The view renders `theme` (default Canonical rounded): callers
+// pass the app ThemeStore's current theme for live switching.
 
 // MARK: - View model (no behaviour logic)
 
@@ -391,14 +385,17 @@ final class ChatConversationViewModel: ObservableObject {
 struct ChatConversationView: View {
     @StateObject private var viewModel: ChatConversationViewModel
     @Environment(\.scenePhase) private var scenePhase
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
-    init(viewModel: ChatConversationViewModel) {
+    init(viewModel: ChatConversationViewModel, theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        self.theme = theme
     }
 
-    init(engine: any ChatTutorEngine) {
+    init(engine: any ChatTutorEngine, theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
         _viewModel = StateObject(wrappedValue: ChatConversationViewModel(
             engine: engine, speech: ReadAloudService(band: GradeBand(grade: "4"))))
+        self.theme = theme
     }
 
     var body: some View {
@@ -410,7 +407,7 @@ struct ChatConversationView: View {
             thread
             composerBar
         }
-        .background(ChatDesign.background)
+        .background(theme.tokens.background.color)
         .accessibilityIdentifier("chatConversationView")
         .onAppear { viewModel.startIfNeeded() }
         .onDisappear { viewModel.handleDisappeared() }
@@ -427,31 +424,23 @@ struct ChatConversationView: View {
     private var header: some View {
         HStack(spacing: 4) {
             ForEach(0..<max(0, viewModel.progress.totalQuestions), id: \.self) { index in
-                if index < viewModel.progress.attemptedQuestions {
-                    // Filled star keeps its yellow fill, backed by a
-                    // larger primary star so the star's defining
-                    // outline meets 3:1 against the white header
-                    // (the yellow alone is ~1.75:1).
-                    ZStack {
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 20))
-                            .foregroundStyle(ChatDesign.primary)
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 15))
-                            .foregroundStyle(ChatDesign.secondary)
-                    }
-                    .accessibilityHidden(true)
-                } else {
-                    Image(systemName: "star")
-                        .foregroundStyle(ChatDesign.textSecondary)
-                        .accessibilityHidden(true)
-                }
+                // Both states keep their prescribed star colors and
+                // shapes (filled star.fill, empty star outline); the
+                // shared star backs each with the paired tutorText
+                // token so the defining boundary meets 3:1 in every
+                // palette. Shapes never change by theme, and the
+                // header keeps its progress label and value.
+                ThemeProgressStar(
+                    filled: index < viewModel.progress.attemptedQuestions,
+                    theme: theme
+                )
+                .accessibilityHidden(true)
             }
             Spacer()
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .background(ChatDesign.surface)
+        .background(theme.tokens.tutorBackground.color)
         .accessibilityIdentifier("chatSessionHeader")
         .accessibilityLabel("Session progress")
         .accessibilityValue("\(viewModel.progress.attemptedQuestions) of \(viewModel.progress.totalQuestions) questions started")
@@ -462,10 +451,10 @@ struct ChatConversationView: View {
     private var voiceUnavailableNotice: some View {
         Text("Reading is unavailable on this device right now. You can still read the messages.")
             .font(.body)
-            .foregroundStyle(ChatDesign.textSecondary)
+            .foregroundStyle(theme.tokens.tutorText.color)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(ChatDesign.surface)
+            .background(theme.tokens.tutorBackground.color)
             .accessibilityIdentifier("chatVoiceUnavailableNotice")
     }
 
@@ -498,24 +487,24 @@ struct ChatConversationView: View {
                     // interpreted, linked, or executed.
                     Text(message.text)
                         .font(message.kind == .question ? .title3.weight(.semibold) : .body)
-                        .foregroundStyle(ChatDesign.text)
+                        .foregroundStyle(theme.tokens.tutorText.color)
                 }
                 Spacer(minLength: 8)
-                SpeakerButton(message: message, service: viewModel.speech)
+                SpeakerButton(message: message, service: viewModel.speech, theme: theme)
             }
             .padding(12)
-            .background(ChatDesign.surface)
-            .clipShape(RoundedRectangle(cornerRadius: ChatDesign.cardRadius))
+            .background(theme.tokens.tutorBackground.color)
+            .clipShape(RoundedRectangle(cornerRadius: theme.bubbleRadius))
             .accessibilityIdentifier("tutorMessage_\(message.id)")
         case .child(let id, let text, _):
             HStack {
                 Spacer(minLength: 40)
                 Text(text)
                     .font(.body)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(theme.childTextOnChildBackground.color)
                     .padding(12)
-                    .background(ChatDesign.primary)
-                    .clipShape(RoundedRectangle(cornerRadius: ChatDesign.cardRadius))
+                    .background(theme.tokens.childBackground.color)
+                    .clipShape(RoundedRectangle(cornerRadius: theme.bubbleRadius))
             }
             .accessibilityIdentifier("childMessage_\(id)")
         }
@@ -536,16 +525,23 @@ struct ChatConversationView: View {
         VStack(spacing: 8) {
             Text("Practice complete. Nice work.")
                 .font(.body.weight(.semibold))
-                .foregroundStyle(ChatDesign.text)
+                .foregroundStyle(theme.tokens.tutorText.color)
+            // The label sits on the accent chrome: accent matches
+            // childBackground in every palette, so the fix-3 resolver
+            // supplies the readable label (4.63:1-6.75:1, pinned in
+            // ThemeContrastFix4Tests). The old white label fell to
+            // 2.80:1 in Warm Playful. The chrome/tint is unchanged.
             Button("Start again") { viewModel.restartSession() }
                 .buttonStyle(.borderedProminent)
-                .tint(ChatDesign.primary)
+                .tint(theme.tokens.accent.color)
+                .foregroundStyle(theme.childTextOnChildBackground.color)
                 .frame(minHeight: 44)
                 .accessibilityIdentifier("chatRestartButton")
         }
+        .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         .padding(12)
         .frame(maxWidth: .infinity)
-        .background(ChatDesign.surface)
+        .background(theme.tokens.tutorBackground.color)
         .accessibilityIdentifier("chatSessionComplete")
     }
 
@@ -569,11 +565,17 @@ struct ChatConversationView: View {
                 Button {
                     viewModel.requestHint()
                 } label: {
+                    // The label sits on the pale composer, so it takes
+                    // the paired tutorText token (9.94:1-16.88:1, pinned
+                    // in ThemeContrastFix4Tests) like the SpeakerButton
+                    // glyph; the accent tint stays on the button chrome.
+                    // The old accent label fell to 2.40:1 in Warm Playful.
                     Label("Hint", systemImage: "lightbulb")
+                        .foregroundStyle(theme.tokens.tutorText.color)
                         .frame(minHeight: 44)
                 }
                 .buttonStyle(.bordered)
-                .tint(ChatDesign.primary)
+                .tint(theme.tokens.accent.color)
                 .accessibilityIdentifier("chatHintButton")
 
                 TextField("Type your answer", text: $viewModel.draft, axis: .vertical)
@@ -582,15 +584,22 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chatComposerField")
                     .onSubmit { viewModel.submitDraft() }
 
+                // Same resolved label as Start again above: readable
+                // on the accent chrome in every palette; chrome/tint
+                // unchanged.
                 Button("Send") { viewModel.submitDraft() }
                     .buttonStyle(.borderedProminent)
-                    .tint(ChatDesign.primary)
+                    .tint(theme.tokens.accent.color)
+                    .foregroundStyle(theme.childTextOnChildBackground.color)
                     .frame(minHeight: 44)
                     .accessibilityIdentifier("chatSendButton")
             }
         }
+        // Bordered buttons (choices, Hint, Send, number-pad keys) take
+        // the theme's button radius (10 rounded / 8 sharp).
+        .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         .padding(12)
-        .background(ChatDesign.surface)
+        .background(theme.tokens.tutorBackground.color)
     }
 
     private var numberPad: some View {

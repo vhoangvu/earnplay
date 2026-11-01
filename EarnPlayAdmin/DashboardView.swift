@@ -17,6 +17,7 @@ import EarnPlayCore
 /// dates — never raw numbers.
 struct DashboardView: View {
     let controller: AdminSyncController
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     @State private var report: Dashboard.Report
     /// The `now`, time zone, and week definition the cached report was
     /// computed against. Foreground reloads compare the current week,
@@ -30,8 +31,9 @@ struct DashboardView: View {
     @State private var lastReloadCalendarIdentifier: Calendar.Identifier
     @Environment(\.scenePhase) private var scenePhase
 
-    init(controller: AdminSyncController) {
+    init(controller: AdminSyncController, theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
         self.controller = controller
+        self.theme = theme
         let now = Date()
         let calendar = Calendar.current
         _report = State(initialValue: Dashboard.compute(
@@ -167,7 +169,7 @@ struct DashboardView: View {
             if report.skillAccuracies.isEmpty {
                 Text(Dashboard.noRecentQuestionsMessage)
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             } else {
                 ForEach(report.skillAccuracies, id: \.skill) { skill in
                     VStack(alignment: .leading, spacing: 2) {
@@ -177,7 +179,7 @@ struct DashboardView: View {
                             .font(.body)
                         Text("Last week: \(weekLine(correct: skill.lastWeekCorrect, total: skill.lastWeekTotal, rate: skill.lastWeekAccuracy))")
                             .font(.body)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondaryOnTheme)
                     }
                     .padding(.vertical, 2)
                 }
@@ -209,7 +211,7 @@ struct DashboardView: View {
             } else {
                 Text("No questions synced yet.")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             }
         }
     }
@@ -234,7 +236,7 @@ struct DashboardView: View {
             } else {
                 Text("No questions synced yet.")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             }
         }
     }
@@ -249,11 +251,11 @@ struct DashboardView: View {
             } else if report.activeTime.questionCount == 0 {
                 Text("No questions synced yet.")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             } else {
                 Text(Dashboard.noMistakeTypesMessage)
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             }
         }
     }
@@ -270,11 +272,11 @@ struct DashboardView: View {
             } else if trend.points.isEmpty {
                 Text("No trying snapshots yet.")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             } else {
                 Text("Trying trend appears after 2 sessions with practice.")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             }
         }
     }
@@ -301,12 +303,12 @@ struct DashboardView: View {
                 HStack(spacing: 8) {
                     Text(dateText)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondaryOnTheme)
                         .frame(width: 64, alignment: .leading)
                     GeometryReader { geometry in
                         let fraction = max(0.06, Double(point.score) / Double(maxScore))
                         RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.accentColor.opacity(0.7))
+                            .fill(theme.tokens.fill.color)
                             .frame(width: geometry.size.width * fraction)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -331,7 +333,7 @@ struct DashboardView: View {
                 Text("No trades offered yet across \(trades.sessionCount) " +
                      "\(trades.sessionCount == 1 ? "session" : "sessions").")
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             } else {
                 Text("\(trades.totalTrades) \(trades.totalTrades == 1 ? "trade" : "trades") offered " +
                      "across \(trades.sessionCount) \(trades.sessionCount == 1 ? "session" : "sessions")")
@@ -339,11 +341,11 @@ struct DashboardView: View {
                 Text("Movement: \(trades.movementTrades) · Chores: \(trades.choreTrades)" +
                      (trades.otherTrades > 0 ? " · Other: \(trades.otherTrades)" : ""))
                     .font(.body)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
                 if let perSession = trades.tradesPerSession {
                     Text("About \(formatRate(perSession)) per session")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondaryOnTheme)
                 }
             }
         }
@@ -358,17 +360,22 @@ struct DashboardView: View {
 
     private func dashboardCard<Content: View>(title: String, subtitle: String,
                                              @ViewBuilder content: () -> Content) -> some View {
+        // The card sits on the FIXED light tutorBackground, so every
+        // label pairs with theme foregrounds (tutorText /
+        // secondaryOnTheme): adaptive system text would render
+        // white-on-white in Dark Mode.
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.headline)
             Text(subtitle)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryOnTheme)
             content()
         }
+        .foregroundStyle(theme.tokens.tutorText.color)
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .background(theme.tokens.tutorBackground.color)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
     }
 }

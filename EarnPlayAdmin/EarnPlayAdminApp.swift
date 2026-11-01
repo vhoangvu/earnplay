@@ -44,10 +44,14 @@ final class AdminSyncController {
 struct EarnPlayAdminApp: App {
     @State private var syncController = AdminSyncController()
     @State private var selectedTab = 0
+    /// App-scope theme store (T7.8): one selection for the admin app,
+    /// persisted in its own defaults, shared by the dashboard theme
+    /// and the Version-tab picker.
+    @StateObject private var themes = ThemeStore()
     var body: some Scene {
         WindowGroup {
             TabView(selection: $selectedTab) {
-                DashboardView(controller: syncController)
+                DashboardView(controller: syncController, theme: themes.theme)
                     .tabItem { Label("Progress", systemImage: "chart.bar") }
                     .tag(4)
                 PolicyEditorView(onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
@@ -59,7 +63,7 @@ struct EarnPlayAdminApp: App {
                 AuditorView(auditor: syncController.auditor, onOpenPolicy: { selectedTab = 0 })
                     .tabItem { Label("Auditor", systemImage: "checkmark.shield") }
                     .tag(2)
-                AdminVersionView()
+                AdminVersionView(themes: themes)
                     .tabItem { Label("Version", systemImage: "info.circle") }
                     .tag(3)
             }
@@ -76,6 +80,10 @@ struct EarnPlayAdminApp: App {
 /// panel shows, and the buttons below perform a real rollback on
 /// that persisted registry.
 struct AdminVersionView: View {
+    /// The admin app's theme store, passed from the app root so the
+    /// picker here and the dashboard theme stay in sync. Defaults to a
+    /// fresh store (same persisted selection) for previews.
+    @ObservedObject var themes: ThemeStore = ThemeStore()
     @State private var registry: VersionRegistry?
     @State private var activeBundle: VersionBundle?
     @State private var bundles: [VersionBundle] = []
@@ -139,6 +147,8 @@ struct AdminVersionView: View {
                     Text("• \(note)")
                         .font(.subheadline)
                 }
+                Divider()
+                ThemePickerView(store: themes)
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)

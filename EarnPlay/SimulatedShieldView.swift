@@ -17,35 +17,43 @@ struct SimulatedShieldView: View {
     @State private var answerText = ""
     @State private var hintRevealed = false
     @State private var attemptsSubmitted = 0
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         ZStack {
-            Color(.systemBackground)
+            theme.tokens.background.color
                 .ignoresSafeArea()
             ScrollView {
+                // Labels pair with the fixed light theme surfaces (the
+                // screen background and the badge track): adaptive text
+                // would wash out in Dark Mode. The style stays on the
+                // labels so buttons and the answer field keep native
+                // backgrounds and foregrounds.
                 VStack(alignment: .leading, spacing: 12) {
                     Text(SimulatedShieldFlow.simulatedBadgeText)
                         .font(.headline)
+                        .foregroundStyle(theme.tokens.tutorText.color)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(Color.yellow.opacity(0.35))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(theme.tokens.track.color)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
                         .accessibilityIdentifier("simulatedShieldBadge")
 
                     Text("Locked app (simulated): \(flow.app.id)")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondaryOnTheme)
                         .accessibilityIdentifier("lockedAppLabel")
 
                     Text("Complete the practice challenge to unlock. Effort counts — correctness does not.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondaryOnTheme)
 
                     Divider()
 
                     Text(flow.challengePrompt)
                         .font(.body)
+                        .foregroundStyle(theme.tokens.tutorText.color)
                         .accessibilityIdentifier("challengePromptLabel")
 
                     TextField("Your answer", text: $answerText)
@@ -72,7 +80,7 @@ struct SimulatedShieldView: View {
                     if hintRevealed {
                         Text(flow.challengeHint)
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondaryOnTheme)
                             .accessibilityIdentifier("hintText")
                     }
 
@@ -84,11 +92,13 @@ struct SimulatedShieldView: View {
                     if let score = flow.lastScore {
                         Text(score.narration)
                             .font(.callout)
+                            .foregroundStyle(theme.tokens.tutorText.color)
                             .accessibilityIdentifier("challengeResultLabel")
                     }
                     if let decisionText = flow.challengeDecisionText {
                         Text(decisionText)
                             .font(.callout.bold())
+                            .foregroundStyle(theme.tokens.tutorText.color)
                             .accessibilityIdentifier("challengeDecisionLabel")
                     }
                 }

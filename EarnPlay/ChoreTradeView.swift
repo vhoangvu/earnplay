@@ -14,6 +14,7 @@ import SwiftUI
 /// timing. T3.3 owns the real offer-choice logic (when to offer,
 /// movement vs chore, weekly caps) and will replace this button.
 struct ChoreTradeView: View {
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     @StateObject private var viewModel: ChoreTradeViewModel
     /// Unlock-status ticker: fires while this view is rendered (via
     /// `onReceive` on the outer container), driving the view model's
@@ -22,7 +23,8 @@ struct ChoreTradeView: View {
     /// banner both refresh from this single subscription.
     private let statusTicker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    init() {
+    init(theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
+        self.theme = theme
         let policyStore = PolicyStore()
         // Demo mode is the ABSENCE of a parent-authored policy (fix round
         // 3): a cached parent policy with an EMPTY pool is respected
@@ -70,9 +72,14 @@ struct ChoreTradeView: View {
     }
 
     var body: some View {
+        // Every label below pairs with the fixed light card
+        // background (adaptive text would wash out in Dark Mode);
+        // the style stays on the labels so the default-style buttons
+        // keep their native colors.
         VStack(alignment: .leading, spacing: 12) {
             Text("Chore trade")
                 .font(.headline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             switch viewModel.session.phase {
             case .idle:
                 idleView
@@ -96,16 +103,16 @@ struct ChoreTradeView: View {
             if !viewModel.shieldStatus.isEmpty && !viewModel.session.hasGrantedUnlock {
                 Text(viewModel.shieldStatus)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
                     .accessibilityIdentifier("restoredUnlockStatus")
             }
             Text(viewModel.poolSourceCaption)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryOnTheme)
         }
         .padding()
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(12)
+        .background(theme.tokens.tutorBackground.color)
+        .cornerRadius(theme.cardRadius)
         .onReceive(statusTicker) { _ in
             if !viewModel.shieldStatus.isEmpty || viewModel.session.hasGrantedUnlock {
                 viewModel.refreshGrantedStatus()
@@ -118,14 +125,16 @@ struct ChoreTradeView: View {
             if viewModel.declinedCount > 0 {
                 Text("Practice resumes. \(viewModel.declinedCount) chore\(viewModel.declinedCount == 1 ? "" : "s") declined this session — won't be offered again.")
                     .font(.subheadline)
+                    .foregroundStyle(theme.tokens.tutorText.color)
             } else {
                 Text("Practice placeholder — a chore trade can be offered mid-session.")
                     .font(.subheadline)
+                    .foregroundStyle(theme.tokens.tutorText.color)
             }
             if viewModel.lastTriggerFoundNone {
                 Text("No chores available right now.")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryOnTheme)
             }
             Button("Take a chore break") { viewModel.triggerOffer() }
                 .accessibilityIdentifier("triggerOfferButton")
@@ -136,11 +145,14 @@ struct ChoreTradeView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Your AI suggests one chore:")
                 .font(.subheadline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             Text(offer.entry.chore)
                 .font(.title3.bold())
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .accessibilityIdentifier("offerChoreText")
             Text("Earns \(offer.entry.unlockMinutes) minutes when your parent confirms.")
                 .font(.subheadline)
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .accessibilityIdentifier("offerUnlockMinutes")
             HStack {
                 Button("Accept") { viewModel.accept() }
@@ -156,8 +168,10 @@ struct ChoreTradeView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Accepted: \(offer.entry.chore)")
                 .font(.subheadline.bold())
+                .foregroundStyle(theme.tokens.tutorText.color)
             Text("Do the chore, then tap Done.")
                 .font(.subheadline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             Button("Done") { viewModel.markDone() }
                 .accessibilityIdentifier("doneButton")
         }
@@ -167,8 +181,10 @@ struct ChoreTradeView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Waiting for parent…")
                 .font(.subheadline.bold())
+                .foregroundStyle(theme.tokens.tutorText.color)
             Text("Done: \(offer.entry.chore). No unlock yet — your parent must confirm in person.")
                 .font(.subheadline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             // Grant failure feedback (fix round 3): a failed grant leaves
             // the session here, so the failure must show here — otherwise
             // Confirm appears to do nothing. The button stays tappable:
@@ -188,10 +204,11 @@ struct ChoreTradeView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Unlock granted: \(record.grantedUnlockMinutes) minutes for \"\(record.chore)\".")
                 .font(.subheadline.bold())
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .accessibilityIdentifier("grantedText")
             Text(viewModel.shieldStatus)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryOnTheme)
         }
     }
 }

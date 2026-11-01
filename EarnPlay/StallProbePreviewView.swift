@@ -17,6 +17,7 @@ struct StallProbePreviewView: View {
     @StateObject private var model = StallProbePreviewModel()
     @State private var answerText = ""
     @State private var replyText = ""
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -50,9 +51,12 @@ struct StallProbePreviewView: View {
             if let probe = model.pendingProbe {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(alignment: .top, spacing: 8) {
-                        SpeakerButton(message: probe.message, service: model.speech)
+                        SpeakerButton(message: probe.message, service: model.speech, theme: theme)
+                        // Paired with the fixed light card background
+                        // below (inputs keep their native style).
                         Text(probe.message.text)
                             .font(.body)
+                            .foregroundStyle(theme.tokens.tutorText.color)
                         Spacer()
                     }
                     HStack {
@@ -67,8 +71,8 @@ struct StallProbePreviewView: View {
                     }
                 }
                 .padding(8)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(theme.tokens.tutorBackground.color)
+                .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
                 .accessibilityIdentifier("stallProbeCard")
             }
             if let notice = model.replyNotice {

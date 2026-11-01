@@ -15,6 +15,7 @@ import EarnPlayCore
 struct SpeakerButton: View {
     let message: TutorMessage
     @ObservedObject var service: ReadAloudService
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         // Always rendered for every tutor message (Band B Demo scope).
@@ -22,8 +23,12 @@ struct SpeakerButton: View {
         Button {
             service.toggle(message)
         } label: {
+            // The glyph sits on the fixed light tutor-background row, so it
+            // uses the paired tutorText token (9.9:1-16.9:1 across
+            // palettes): the previous accent glyph fell below 3:1 in
+            // Warm Playful, Blush Pink, and Hot Pink.
             Image(systemName: isCurrentAndSpeaking ? "stop.fill" : "speaker.wave.2.fill")
-                .foregroundStyle(ChatDesign.primary)
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .font(.body)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())

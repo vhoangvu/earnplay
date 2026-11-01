@@ -11,6 +11,7 @@ import EarnPlayCore
 /// works fully offline.
 struct ModelDownloadView: View {
     @ObservedObject var viewModel: ModelDownloadViewModel
+    @ObservedObject var themes: ThemeStore = ThemeStore()
 
     var body: some View {
         ScrollView {
@@ -50,7 +51,7 @@ struct ModelDownloadView: View {
                     EmptyView()
                 }
                 Divider()
-                AboutView()
+                AboutView(themes: themes)
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)

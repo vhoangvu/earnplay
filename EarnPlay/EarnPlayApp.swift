@@ -9,9 +9,13 @@ struct EarnPlayApp: App {
     /// StateObject (issue #65) so the pairing-request sheet observes
     /// the controller's published pending state.
     @StateObject private var syncController = ChildSyncController()
+    /// App-scope theme store (T7.8): one selection for the child app,
+    /// persisted in its own defaults, shared by the chat theme and the
+    /// About-screen picker.
+    @StateObject private var themes = ThemeStore()
     var body: some Scene {
         WindowGroup {
-            ContentView(syncController: syncController)
+            ContentView(themes: themes, syncController: syncController)
                 .onAppear { syncController.startIfNeeded() }
         }
     }
@@ -20,6 +24,7 @@ struct EarnPlayApp: App {
 struct ContentView: View {
     @StateObject private var downloadModel = ModelDownloadViewModel()
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
+    @ObservedObject var themes: ThemeStore
     /// Shared sync; the practice engine enqueues into its outbox
     /// instance and notifies its service after each durable enqueue.
     /// Observed (issue #65) so the pairing-request sheet presents
@@ -41,7 +46,11 @@ struct ContentView: View {
             Group {
                 if downloadModel.isReady {
                 if setup.step == .complete, !setup.summaryDismissed {
-                    SetupCompleteView(viewModel: setup)
+                    // The About sheet below is bound to the same
+                    // app-scope store as the chat theme (fix-2
+                    // finding 2), so onboarded installs keep a
+                    // settings route after the download gate lifts.
+                    SetupCompleteView(viewModel: setup, themes: themes)
                 } else if setup.step == .complete {
                     // Main practice screen (T1.8): the chat conversation.
                     // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
@@ -72,12 +81,12 @@ struct ContentView: View {
                             // queue on lifecycle triggers below.
                             onEnqueueFailed: { [syncController] log in
                                 syncController.handleFailedEnqueue(log)
-                            })))
+                            })), theme: themes.theme)
                 } else {
                     SetupFlowView(viewModel: setup)
                 }
             } else {
-                ModelDownloadView(viewModel: downloadModel)
+                ModelDownloadView(viewModel: downloadModel, themes: themes)
             }
             }
         }
@@ -121,19 +130,19 @@ struct ContentView: View {
                 Divider()
                 SyncDebugView(controller: syncController)
                 Divider()
-                ReadAloudPreviewView()
+                ReadAloudPreviewView(theme: themes.theme)
                 Divider()
-                SimulatedShieldDemoView()
+                SimulatedShieldDemoView(theme: themes.theme)
                 Divider()
-                StallProbePreviewView()
+                StallProbePreviewView(theme: themes.theme)
                 Divider()
                 SpikeView()
                 Divider()
-                ChoreTradeView()
+                ChoreTradeView(theme: themes.theme)
                 Divider()
-                MovementTradePreviewView()
+                MovementTradePreviewView(theme: themes.theme)
                 Divider()
-                AboutView()
+                AboutView(themes: themes)
             }
             .padding()
         }

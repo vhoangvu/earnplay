@@ -49,20 +49,24 @@ final class ChatFixRound3Tests: XCTestCase {
     // MARK: Item 1 — contrast in both appearances (pixel-provable)
     // Round 4: sampling normalizes into an explicitly configured
     // RGBA8 bitmap first; the renderer guarantees no byte layout.
+    // T7.8 fix-2: the glyph is now the paired tutorText token (the old
+    // accent glyph fell below 3:1 in 3 palettes), so sampling counts
+    // non-white glyph pixels instead of blue-classified ones. The host
+    // holds only the glyph on the white row surface.
     func testSpeakerGlyphContrastsWithRowSurfaceInLightAndDark() throws {
         for style: UIUserInterfaceStyle in [.light, .dark] {
             let fake = FakeEngine()
             let speech = ReadAloudService(band: GradeBand(grade: "4"), engine: fake)
             let msg = TutorMessage(id: "q1", text: "What is 7 times 8?", kind: .question)
-            let host = UIHostingController(rootView: SpeakerButton(message: msg, service: speech).background(ChatDesign.surface))
+            let host = UIHostingController(rootView: SpeakerButton(message: msg, service: speech).background(DesignSystem.defaultTheme.tokens.tutorBackground.color))
             let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 80, height: 60))
             win.overrideUserInterfaceStyle = style
             win.rootViewController = host; win.makeKeyAndVisible()
             host.view.setNeedsLayout(); host.view.layoutIfNeeded()
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
             let sample = normalizedRGBASample(in: host.view)
-            print("R4-ITEM1 style=\(style.rawValue) bluePixels=\(sample.blueCount) contrast=\(sample.contrastVsWhite)")
-            XCTAssertGreaterThan(sample.blueCount, 5, "speaker glyph (ChatDesign.primary on white surface) must render visible in style \(style.rawValue)")
+            print("R4-ITEM1 style=\(style.rawValue) glyphPixels=\(sample.glyphCount) contrast=\(sample.contrastVsWhite)")
+            XCTAssertGreaterThan(sample.glyphCount, 5, "speaker glyph (paired tutorText on white surface) must render visible in style \(style.rawValue)")
             XCTAssertGreaterThan(sample.contrastVsWhite, 3.0, "normalized glyph/white contrast must exceed 3:1 in style \(style.rawValue)")
         }
     }
@@ -70,7 +74,7 @@ final class ChatFixRound3Tests: XCTestCase {
     /// Renders the view, then redraws the result into a bitmap with a
     /// fixed layout — 8-bit RGBA, 4 bytes/pixel, byteOrder32Big,
     /// premultipliedLast — before any byte is sampled.
-    private func normalizedRGBASample(in view: UIView) -> (blueCount: Int, contrastVsWhite: Double) {
+    private func normalizedRGBASample(in view: UIView) -> (glyphCount: Int, contrastVsWhite: Double) {
         let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
         let image = renderer.image { _ in view.drawHierarchy(in: view.bounds, afterScreenUpdates: true) }
         guard let cg = image.cgImage else { return (0, 1) }
@@ -85,7 +89,7 @@ final class ChatFixRound3Tests: XCTestCase {
         for i in 0..<(w * h) {
             let o = i * 4
             let (rr, gg, bb) = (Int(bytes[o]), Int(bytes[o + 1]), Int(bytes[o + 2]))
-            if bb > rr + 30 && bb > gg + 10 && bb > 120 {
+            if rr < 200 || gg < 200 || bb < 200 {
                 n += 1; sr += Double(rr); sg += Double(gg); sb += Double(bb)
             }
         }

@@ -28,7 +28,11 @@ public struct SetupFlowView: View {
                 case .preventDeletingGuidance:
                     PreventDeletingGuidanceView(viewModel: viewModel)
                 case .complete:
-                    SetupCompleteView(viewModel: viewModel)
+                    // Unreachable in production (ContentView renders its
+                    // own SetupCompleteView for `.complete` with the
+                    // app-scope store); the fresh store reads the same
+                    // persisted selection for previews and tests.
+                    SetupCompleteView(viewModel: viewModel, themes: ThemeStore())
                 }
             }
             .navigationTitle("Set up EarnPlay")
@@ -291,11 +295,23 @@ private struct PreventDeletingGuidanceView: View {
 /// including the category-backstop-disabled warning when an allowlisted
 /// app's unknown category disables the backstop. Public so `ContentView`
 /// can keep it visible instead of jumping straight to the main screen.
+///
+/// T7.8 fix-2 finding 2: this screen also carries the About & theme
+/// entry for the model-ready UI. Once the download gate lifts, this is
+/// the only non-chat model-ready surface every onboarded install sees
+/// (each launch, before Continue), and the slim chat header stays
+/// stars-only per spec — so the settings route lives here, bound to
+/// the same app-scope ThemeStore as the chat theme.
 public struct SetupCompleteView: View {
     @ObservedObject var viewModel: SetupFlowViewModel
+    /// The child app's theme store, passed from the app root so the
+    /// About sheet's picker drives the live app theme.
+    @ObservedObject var themes: ThemeStore
+    @State private var showingAbout = false
 
-    public init(viewModel: SetupFlowViewModel) {
+    public init(viewModel: SetupFlowViewModel, themes: ThemeStore) {
         self.viewModel = viewModel
+        self.themes = themes
     }
 
     public var body: some View {
@@ -303,6 +319,11 @@ public struct SetupCompleteView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Setup complete")
                     .font(.title2.bold())
+                Button("About & app theme") {
+                    showingAbout = true
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("setupCompleteAboutButton")
                 if let summary = viewModel.summary {
                     VStack(alignment: .leading, spacing: 8) {
                         summaryRow("Policy version", "\(summary.policyVersion)")
@@ -345,6 +366,21 @@ public struct SetupCompleteView: View {
                 .buttonStyle(.borderedProminent)
             }
             .padding()
+        }
+        .sheet(isPresented: $showingAbout) {
+            NavigationStack {
+                ScrollView {
+                    AboutView(themes: themes)
+                        .padding()
+                }
+                .navigationTitle("About")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showingAbout = false }
+                    }
+                }
+            }
         }
     }
 
