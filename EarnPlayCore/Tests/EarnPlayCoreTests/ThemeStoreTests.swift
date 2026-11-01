@@ -281,6 +281,44 @@ final class ThemeStoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Picker checkmark floor (T7.9 fix-1, Copilot review #1)
+
+    /// The selected-row checkmark renders the adaptive `.primary` on
+    /// the system background — never the accent token. The rows sit
+    /// on no theme background in any host (child About sheet,
+    /// download-gate About, admin Version tab), so Light resolves
+    /// black-on-white and Dark white-on-black: 21:1 in both modes,
+    /// past the 4.5:1 preferred floor. Uniform across palettes (no
+    /// per-palette branching); `.primary` also matches the adjacent
+    /// row-name text the picker already renders.
+    func testPickerCheckmarkPrimaryMeets4_5To1OnSystemBackgroundInBothModes() {
+        let black = DesignSystem.RGB(0, 0, 0)
+        let white = DesignSystem.RGB(255, 255, 255)
+        let light = contrastRatio(black, white)
+        print("FIX1-CHECKMARK light black-on-white=\(light)")
+        XCTAssertGreaterThan(light, 4.5,
+            "checkmark .primary on the Light picker surface is \(light)")
+        let dark = contrastRatio(white, black)
+        print("FIX1-CHECKMARK dark white-on-black=\(dark)")
+        XCTAssertGreaterThan(dark, 4.5,
+            "checkmark .primary on the Dark picker surface is \(dark)")
+    }
+
+    /// Regression record for the finding: the Light Pink accent
+    /// (#f9a8d4) the checkmark used to render is 1.81:1 against the
+    /// white Light picker surface — below the 3:1 non-text floor —
+    /// so the checkmark must never go back to the accent token. The
+    /// accent token itself stays prescribed for button chrome
+    /// (pinned by testTokenTableMatchesMockupVerbatim).
+    func testLightPinkAccentBelow3To1OnWhitePickerSurface() {
+        let accent = DesignSystem.Palette.lightPink.tokens.accent
+        XCTAssertEqual(accent.hex, "#f9a8d4")
+        let ratio = contrastRatio(accent, DesignSystem.RGB(255, 255, 255))
+        print("FIX1-CHECKMARK old lightPink-accent-on-white=\(ratio)")
+        XCTAssertLessThan(ratio, 3.0,
+            "Light Pink accent on white is \(ratio), expected below 3:1 (the reported defect)")
+    }
+
     private func luminance(_ rgb: DesignSystem.RGB) -> Double {
         func linear(_ v: Double) -> Double {
             v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)

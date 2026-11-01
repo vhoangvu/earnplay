@@ -42,8 +42,15 @@ public struct ThemePickerView: View {
                             .foregroundStyle(.primary)
                         Spacer()
                         if selected {
+                            // Adaptive .primary, NOT the accent token: the
+                            // rows sit on the system background (no theme
+                            // background in either host), and the Light
+                            // Pink accent is 1.81:1 on white Light Mode —
+                            // below the 3:1 floor. .primary is 21:1 in
+                            // both modes and matches the row-name text.
+                            // Accent stays prescribed for button chrome.
                             Image(systemName: "checkmark")
-                                .foregroundStyle(store.theme.tokens.accent.color)
+                                .foregroundStyle(.primary)
                                 .accessibilityHidden(true)
                         }
                     }
