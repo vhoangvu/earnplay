@@ -52,8 +52,11 @@ struct StallProbePreviewView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(alignment: .top, spacing: 8) {
                         SpeakerButton(message: probe.message, service: model.speech, theme: theme)
+                        // Paired with the fixed light card background
+                        // below (inputs keep their native style).
                         Text(probe.message.text)
                             .font(.body)
+                            .foregroundStyle(theme.tokens.tutorText.color)
                         Spacer()
                     }
                     HStack {

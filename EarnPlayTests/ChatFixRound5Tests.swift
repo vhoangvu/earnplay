@@ -8,12 +8,17 @@ import EarnPlayCore
 /// Item 1: filled progress stars (#FFB703 on the white header,
 /// ~1.75:1) are the only visual progress indication, so their
 /// defining boundary must meet 3:1 against the white header. The
-/// fix keeps the yellow fill and adds a theme-accent outline
+/// fix keeps the yellow fill and adds a contrasting outline
 /// behind each filled star; this test samples the rendered header
 /// and proves yellow fill pixels remain AND adjacent outline
-/// pixels (blue-classified, next to the fill) exceed 3:1, in both
+/// pixels (dark-classified, next to the fill) exceed 3:1, in both
 /// appearances. Item 2 lives in ChatFixRound4Tests (blue fixture).
 /// Items 3-5 are verify-only on this head (see progress log).
+///
+/// T7.8 fix-2: the outline is now the paired tutorText token — the
+/// old accent outline fell below 3:1 in Warm Playful, Blush Pink,
+/// and Hot Pink — so sampling counts dark outline pixels instead
+/// of blue-classified ones.
 @MainActor
 final class ChatFixRound5Tests: XCTestCase {
 
@@ -81,7 +86,7 @@ final class ChatFixRound5Tests: XCTestCase {
     }
 
     /// Yellow fill pixels define the star region; outline pixels are
-    /// blue-classified pixels inside that region expanded by a
+    /// dark-classified pixels inside that region expanded by a
     /// margin (excludes distant primary chrome such as bubbles).
     private func starSample(in view: UIView) -> (yellowCount: Int, outlineCount: Int, outlineContrastVsWhite: Double) {
         guard let bmp = normalizedBitmap(in: view) else { return (0, 0, 1) }
@@ -108,7 +113,7 @@ final class ChatFixRound5Tests: XCTestCase {
         for y in y0...y1 {
             for x in x0...x1 {
                 let (r, g, b) = px(y * bmp.width + x)
-                if b > r + 30 && b > g + 10 && b > 120 {
+                if r < 120 && g < 120 && b < 150 {
                     n += 1; sr += Double(r); sg += Double(g); sb += Double(b)
                 }
             }

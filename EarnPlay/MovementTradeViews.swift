@@ -13,18 +13,24 @@ struct MovementTradeOfferCard: View {
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
+        // Labels pair with the fixed light card background below
+        // (adaptive text would wash out in Dark Mode); the style stays
+        // on the labels so button chrome keeps its native colors.
         VStack(alignment: .leading, spacing: 8) {
             Text("Movement break?")
                 .font(.headline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             Text("Let's move for a minute! Do \(targetReps) \(activityName.lowercased()) "
                 + "with the phone in your pocket to earn \(unlockMinutes) minutes.")
                 .font(.body)
+                .foregroundStyle(theme.tokens.tutorText.color)
             HStack {
                 Button("Let's go", action: onAccept)
                     .buttonStyle(.borderedProminent)
                 Button("Not now", action: onDecline)
                     .buttonStyle(.bordered)
             }
+            .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         }
         .padding()
         .background(theme.tokens.tutorBackground.color)
@@ -41,19 +47,25 @@ struct MovementTradeActiveView: View {
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
+        // Labels pair with the fixed light card background below;
+        // the style stays on the labels so the Stop button keeps its
+        // native bordered colors.
         VStack(alignment: .leading, spacing: 8) {
             Text(activityName)
                 .font(.headline)
+                .foregroundStyle(theme.tokens.tutorText.color)
             Text("\(verifiedCount) / \(targetReps)")
                 .font(.system(size: 48, weight: .bold))
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .accessibilityLabel("Verified reps: \(verifiedCount) of \(targetReps)")
             ProgressView(value: Double(verifiedCount), total: Double(max(1, targetReps)))
                 .tint(theme.tokens.fill.color)
             Text("Phone in your pocket — only real reps count.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryOnTheme)
             Button("Stop", action: onAbandon)
                 .buttonStyle(.bordered)
+                .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         }
         .padding()
         .background(theme.tokens.tutorBackground.color)

@@ -30,8 +30,11 @@ struct ReadAloudPreviewView: View {
             ForEach(messages) { message in
                 HStack(alignment: .top, spacing: 8) {
                     SpeakerButton(message: message, service: service, theme: theme)
+                    // Paired with the fixed light row background below:
+                    // adaptive text would wash out in Dark Mode.
                     Text(message.text)
                         .font(.body)
+                        .foregroundStyle(theme.tokens.tutorText.color)
                     Spacer()
                 }
                 .padding(8)

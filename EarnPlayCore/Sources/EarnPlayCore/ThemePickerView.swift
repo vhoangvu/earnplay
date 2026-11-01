@@ -60,6 +60,37 @@ public struct ThemePickerView: View {
     }
 }
 
+/// Progress star (T7.8 fix-2 finding 1), shared by the chat header
+/// and the picker preview so both render identical stars.
+///
+/// Each state keeps its prescribed token color and SF Symbol shape
+/// (filled is always star.fill, empty is always the star outline); a
+/// larger backing glyph in the paired tutorText token (9.9:1-16.9:1
+/// against the header across palettes) gives BOTH states a defining
+/// boundary meeting 3:1. The previous accent backing fell below 3:1
+/// in Warm Playful, Blush Pink, and Hot Pink, and the empty star had
+/// no boundary at all (~1.5:1 in Canonical).
+public struct ThemeProgressStar: View {
+    var filled: Bool
+    var theme: DesignSystem.Theme
+
+    public init(filled: Bool, theme: DesignSystem.Theme) {
+        self.filled = filled
+        self.theme = theme
+    }
+
+    public var body: some View {
+        ZStack {
+            Image(systemName: filled ? "star.fill" : "star")
+                .font(.system(size: 20))
+                .foregroundStyle(theme.tokens.tutorText.color)
+            Image(systemName: filled ? "star.fill" : "star")
+                .font(.system(size: 15))
+                .foregroundStyle((filled ? theme.tokens.starFill : theme.tokens.starEmpty).color)
+        }
+    }
+}
+
 /// Live preview rendering the selected theme's full token set:
 /// header strip, tutor and child bubbles, a track/fill bar, and one
 /// filled plus one empty star. Decorative as a whole (one labelled
@@ -102,10 +133,8 @@ struct ThemePreviewCard: View {
             }
             .frame(height: 8)
             HStack(spacing: 4) {
-                Image(systemName: "star.fill")
-                    .foregroundStyle(theme.tokens.starFill.color)
-                Image(systemName: "star")
-                    .foregroundStyle(theme.tokens.starEmpty.color)
+                ThemeProgressStar(filled: true, theme: theme)
+                ThemeProgressStar(filled: false, theme: theme)
             }
             .font(.caption)
         }

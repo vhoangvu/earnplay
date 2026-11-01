@@ -49,7 +49,10 @@ final class ChatFixRound4Tests: XCTestCase {
         XCTAssertTrue(abs(center.2 - 0xEE) <= 1, "normalized blue \(center.2) != 238")
     }
 
-    func testNormalizedSamplingFindsBlueGlyphWithContrastInLightAndDark() throws {
+    // T7.8 fix-2: the glyph is now the paired tutorText token (the
+    // old accent glyph fell below 3:1 in 3 palettes), so sampling
+    // counts non-white glyph pixels instead of blue-classified ones.
+    func testNormalizedSamplingFindsGlyphWithContrastInLightAndDark() throws {
         for style: UIUserInterfaceStyle in [.light, .dark] {
             let fake = FakeEngine()
             let speech = ReadAloudService(band: GradeBand(grade: "4"), engine: fake)
@@ -61,8 +64,8 @@ final class ChatFixRound4Tests: XCTestCase {
             host.view.setNeedsLayout(); host.view.layoutIfNeeded()
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
             let sample = normalizedRGBASample(in: host.view)
-            print("R4-ITEM1 style=\(style.rawValue) bluePixels=\(sample.blueCount) contrast=\(sample.contrastVsWhite)")
-            XCTAssertGreaterThan(sample.blueCount, 5, "normalized sampling must find the blue glyph in style \(style.rawValue)")
+            print("R4-ITEM1 style=\(style.rawValue) glyphPixels=\(sample.glyphCount) contrast=\(sample.contrastVsWhite)")
+            XCTAssertGreaterThan(sample.glyphCount, 5, "normalized sampling must find the glyph in style \(style.rawValue)")
             XCTAssertGreaterThan(sample.contrastVsWhite, 3.0, "normalized glyph/white contrast must exceed 3:1 in style \(style.rawValue)")
         }
     }
@@ -71,7 +74,7 @@ final class ChatFixRound4Tests: XCTestCase {
     /// low-contrast fixture: a low-contrast BLUE glyph on the white
     /// surface (~2.72:1), chosen blue so pixels are actually sampled
     /// and the measured-contrast path is exercised (a pale-gray
-    /// fixture sampled zero blue pixels and hit the (0, 1) fallback).
+    /// fixture sampled zero glyph pixels and hit the (0, 1) fallback).
     func testNormalizedSamplingFailsOnLowContrastFixture() throws {
         let fixture = Image(systemName: "speaker.wave.2.fill")
             .foregroundStyle(Color(red: 0x80 / 255, green: 0x99 / 255, blue: 0xEE / 255))
@@ -84,8 +87,8 @@ final class ChatFixRound4Tests: XCTestCase {
         host.view.setNeedsLayout(); host.view.layoutIfNeeded()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
         let sample = normalizedRGBASample(in: host.view)
-        print("R4-ITEM1-LOW bluePixels=\(sample.blueCount) contrast=\(sample.contrastVsWhite)")
-        XCTAssertGreaterThan(sample.blueCount, 5, "low-contrast fixture must sample pixels before the contrast check")
+        print("R4-ITEM1-LOW glyphPixels=\(sample.glyphCount) contrast=\(sample.contrastVsWhite)")
+        XCTAssertGreaterThan(sample.glyphCount, 5, "low-contrast fixture must sample pixels before the contrast check")
         XCTAssertLessThanOrEqual(sample.contrastVsWhite, 3.0, "low-contrast fixture must not satisfy the 3:1 check")
     }
 
@@ -136,13 +139,13 @@ final class ChatFixRound4Tests: XCTestCase {
         return (Int(bmp.bytes[o]), Int(bmp.bytes[o + 1]), Int(bmp.bytes[o + 2]))
     }
 
-    private func normalizedRGBASample(in view: UIView) -> (blueCount: Int, contrastVsWhite: Double) {
+    private func normalizedRGBASample(in view: UIView) -> (glyphCount: Int, contrastVsWhite: Double) {
         guard let bmp = normalizedBitmap(in: view) else { return (0, 1) }
         var n = 0, sr = 0.0, sg = 0.0, sb = 0.0
         for i in 0..<(bmp.width * bmp.height) {
             let o = i * 4
             let (rr, gg, bb) = (Int(bmp.bytes[o]), Int(bmp.bytes[o + 1]), Int(bmp.bytes[o + 2]))
-            if bb > rr + 30 && bb > gg + 10 && bb > 120 {
+            if rr < 200 || gg < 200 || bb < 200 {
                 n += 1; sr += Double(rr); sg += Double(gg); sb += Double(bb)
             }
         }

@@ -298,6 +298,14 @@ public enum DesignSystem {
         public var cardRadius: CGFloat { shape.cardRadius }
         public var buttonRadius: CGFloat { shape.buttonRadius }
         public var bubbleRadius: CGFloat { shape.bubbleRadius }
+
+        /// Secondary text on fixed light theme surfaces (cards, badges,
+        /// the simulated-shield screen): tutorText at 75% opacity, which
+        /// measures >= 5:1 against every palette's tutorBackground (see
+        /// ThemeStoreTests), so supplementary labels stay readable in
+        /// Dark Mode, where the adaptive `.secondary` would wash out
+        /// against the fixed light surface.
+        public var secondaryOnTheme: Color { tokens.tutorText.color.opacity(0.75) }
     }
 
     /// All 14 themes in picker order: the 7 palettes, rounded then

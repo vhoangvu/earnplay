@@ -424,28 +424,17 @@ struct ChatConversationView: View {
     private var header: some View {
         HStack(spacing: 4) {
             ForEach(0..<max(0, viewModel.progress.totalQuestions), id: \.self) { index in
-                if index < viewModel.progress.attemptedQuestions {
-                    // Filled star keeps its star-fill token, backed by a
-                    // larger accent star so the star's defining
-                    // outline meets 3:1 against the header
-                    // (the fill alone is ~1.75:1 in Canonical).
-                    // Shapes never change by theme: filled is always
-                    // star.fill, empty is always the star outline, and
-                    // the header keeps its progress label and value.
-                    ZStack {
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 20))
-                            .foregroundStyle(theme.tokens.accent.color)
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 15))
-                            .foregroundStyle(theme.tokens.starFill.color)
-                    }
-                    .accessibilityHidden(true)
-                } else {
-                    Image(systemName: "star")
-                        .foregroundStyle(theme.tokens.starEmpty.color)
-                        .accessibilityHidden(true)
-                }
+                // Both states keep their prescribed star colors and
+                // shapes (filled star.fill, empty star outline); the
+                // shared star backs each with the paired tutorText
+                // token so the defining boundary meets 3:1 in every
+                // palette. Shapes never change by theme, and the
+                // header keeps its progress label and value.
+                ThemeProgressStar(
+                    filled: index < viewModel.progress.attemptedQuestions,
+                    theme: theme
+                )
+                .accessibilityHidden(true)
             }
             Spacer()
         }
@@ -543,6 +532,7 @@ struct ChatConversationView: View {
                 .frame(minHeight: 44)
                 .accessibilityIdentifier("chatRestartButton")
         }
+        .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         .padding(12)
         .frame(maxWidth: .infinity)
         .background(theme.tokens.tutorBackground.color)
@@ -589,6 +579,9 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chatSendButton")
             }
         }
+        // Bordered buttons (choices, Hint, Send, number-pad keys) take
+        // the theme's button radius (10 rounded / 8 sharp).
+        .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         .padding(12)
         .background(theme.tokens.tutorBackground.color)
     }

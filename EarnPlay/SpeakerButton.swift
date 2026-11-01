@@ -23,8 +23,12 @@ struct SpeakerButton: View {
         Button {
             service.toggle(message)
         } label: {
+            // The glyph sits on the fixed light tutor-background row, so it
+            // uses the paired tutorText token (9.9:1-16.9:1 across
+            // palettes): the previous accent glyph fell below 3:1 in
+            // Warm Playful, Blush Pink, and Hot Pink.
             Image(systemName: isCurrentAndSpeaking ? "stop.fill" : "speaker.wave.2.fill")
-                .foregroundStyle(theme.tokens.accent.color)
+                .foregroundStyle(theme.tokens.tutorText.color)
                 .font(.body)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())

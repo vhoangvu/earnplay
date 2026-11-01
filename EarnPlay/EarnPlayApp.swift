@@ -46,7 +46,11 @@ struct ContentView: View {
             Group {
                 if downloadModel.isReady {
                 if setup.step == .complete, !setup.summaryDismissed {
-                    SetupCompleteView(viewModel: setup)
+                    // The About sheet below is bound to the same
+                    // app-scope store as the chat theme (fix-2
+                    // finding 2), so onboarded installs keep a
+                    // settings route after the download gate lifts.
+                    SetupCompleteView(viewModel: setup, themes: themes)
                 } else if setup.step == .complete {
                     // Main practice screen (T1.8): the chat conversation.
                     // Band B (grade 4) demo engine over T1.2/T1.3 APIs.

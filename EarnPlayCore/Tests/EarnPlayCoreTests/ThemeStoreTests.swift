@@ -165,6 +165,64 @@ final class ThemeStoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Contrast floors (fix-2 findings 1, 3, 4)
+
+    /// The paired tutorText token is the defining boundary for stars
+    /// (finding 1) and speaker glyphs (finding 3) on the fixed light
+    /// header/row surfaces, and the label foreground on every fixed
+    /// light card (finding 4): it must exceed 3:1 on tutorBackground
+    /// in every palette. (The old accent boundary fell to ~2.4:1 in
+    /// Warm Playful; the token table above pins the values, this pins
+    /// the floor so a future palette cannot regress it.)
+    func testTutorTextMeets3To1OnTutorBackgroundInEveryPalette() {
+        for palette in DesignSystem.Palette.allCases {
+            let ratio = contrastRatio(palette.tokens.tutorText, palette.tokens.tutorBackground)
+            XCTAssertGreaterThan(ratio, 3.0, "\(palette) tutorText/tutorBackground is \(ratio)")
+        }
+    }
+
+    /// TutorText also labels the full-screen theme background and the
+    /// track badge (SimulatedShieldView): 3:1 there too, every palette.
+    func testTutorTextMeets3To1OnBackgroundAndTrackInEveryPalette() {
+        for palette in DesignSystem.Palette.allCases {
+            let onBackground = contrastRatio(palette.tokens.tutorText, palette.tokens.background)
+            XCTAssertGreaterThan(onBackground, 3.0, "\(palette) tutorText/background is \(onBackground)")
+            let onTrack = contrastRatio(palette.tokens.tutorText, palette.tokens.track)
+            XCTAssertGreaterThan(onTrack, 3.0, "\(palette) tutorText/track is \(onTrack)")
+        }
+    }
+
+    /// Secondary labels on theme cards use tutorText at 75% opacity
+    /// (`secondaryOnTheme`): still at least 4.5:1 on tutorBackground
+    /// in every palette (measured 5.0-7.7 sRGB-blended), so Dark Mode
+    /// keeps readable supplementary text on the fixed light cards.
+    func testSecondaryOnThemeMeets4_5To1OnTutorBackgroundInEveryPalette() {
+        for palette in DesignSystem.Palette.allCases {
+            let mixed = mix(palette.tokens.tutorText, over: palette.tokens.tutorBackground, opacity: 0.75)
+            let ratio = contrastRatio(mixed, palette.tokens.tutorBackground)
+            XCTAssertGreaterThan(ratio, 4.5, "\(palette) secondaryOnTheme/tutorBackground is \(ratio)")
+        }
+    }
+
+    private func luminance(_ rgb: DesignSystem.RGB) -> Double {
+        func linear(_ v: Double) -> Double {
+            v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(rgb.red) + 0.7152 * linear(rgb.green) + 0.0722 * linear(rgb.blue)
+    }
+
+    private func contrastRatio(_ a: DesignSystem.RGB, _ b: DesignSystem.RGB) -> Double {
+        let la = luminance(a), lb = luminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+    }
+
+    private func mix(_ fg: DesignSystem.RGB, over bg: DesignSystem.RGB, opacity: Double) -> DesignSystem.RGB {
+        func blend(_ f: Double, _ b: Double) -> Int {
+            Int(round((opacity * f + (1 - opacity) * b) * 255))
+        }
+        return DesignSystem.RGB(blend(fg.red, bg.red), blend(fg.green, bg.green), blend(fg.blue, bg.blue))
+    }
+
     /// The swatch trios verbatim (header / middle / background). The
     /// middle swatch is NOT always the accent token.
     func testSwatchTriosMatchMockupVerbatim() {
