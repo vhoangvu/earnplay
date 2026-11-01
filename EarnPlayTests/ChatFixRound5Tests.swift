@@ -8,7 +8,7 @@ import EarnPlayCore
 /// Item 1: filled progress stars (#FFB703 on the white header,
 /// ~1.75:1) are the only visual progress indication, so their
 /// defining boundary must meet 3:1 against the white header. The
-/// fix keeps the yellow fill and adds a ChatDesign.primary outline
+/// fix keeps the yellow fill and adds a theme-accent outline
 /// behind each filled star; this test samples the rendered header
 /// and proves yellow fill pixels remain AND adjacent outline
 /// pixels (blue-classified, next to the fill) exceed 3:1, in both

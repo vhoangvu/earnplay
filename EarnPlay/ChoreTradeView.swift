@@ -14,6 +14,7 @@ import SwiftUI
 /// timing. T3.3 owns the real offer-choice logic (when to offer,
 /// movement vs chore, weekly caps) and will replace this button.
 struct ChoreTradeView: View {
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     @StateObject private var viewModel: ChoreTradeViewModel
     /// Unlock-status ticker: fires while this view is rendered (via
     /// `onReceive` on the outer container), driving the view model's
@@ -22,7 +23,8 @@ struct ChoreTradeView: View {
     /// banner both refresh from this single subscription.
     private let statusTicker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    init() {
+    init(theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
+        self.theme = theme
         let policyStore = PolicyStore()
         // Demo mode is the ABSENCE of a parent-authored policy (fix round
         // 3): a cached parent policy with an EMPTY pool is respected
@@ -104,8 +106,8 @@ struct ChoreTradeView: View {
                 .foregroundStyle(.secondary)
         }
         .padding()
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(12)
+        .background(theme.tokens.tutorBackground.color)
+        .cornerRadius(theme.cardRadius)
         .onReceive(statusTicker) { _ in
             if !viewModel.shieldStatus.isEmpty || viewModel.session.hasGrantedUnlock {
                 viewModel.refreshGrantedStatus()

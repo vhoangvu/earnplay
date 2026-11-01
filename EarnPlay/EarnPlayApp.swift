@@ -9,9 +9,13 @@ struct EarnPlayApp: App {
     /// StateObject (issue #65) so the pairing-request sheet observes
     /// the controller's published pending state.
     @StateObject private var syncController = ChildSyncController()
+    /// App-scope theme store (T7.8): one selection for the child app,
+    /// persisted in its own defaults, shared by the chat theme and the
+    /// About-screen picker.
+    @StateObject private var themes = ThemeStore()
     var body: some Scene {
         WindowGroup {
-            ContentView(syncController: syncController)
+            ContentView(themes: themes, syncController: syncController)
                 .onAppear { syncController.startIfNeeded() }
         }
     }
@@ -20,6 +24,7 @@ struct EarnPlayApp: App {
 struct ContentView: View {
     @StateObject private var downloadModel = ModelDownloadViewModel()
     @StateObject private var setup = SetupFlowViewModel.makeDefault()
+    @ObservedObject var themes: ThemeStore
     /// Shared sync; the practice engine enqueues into its outbox
     /// instance and notifies its service after each durable enqueue.
     /// Observed (issue #65) so the pairing-request sheet presents
@@ -72,12 +77,12 @@ struct ContentView: View {
                             // queue on lifecycle triggers below.
                             onEnqueueFailed: { [syncController] log in
                                 syncController.handleFailedEnqueue(log)
-                            })))
+                            })), theme: themes.theme)
                 } else {
                     SetupFlowView(viewModel: setup)
                 }
             } else {
-                ModelDownloadView(viewModel: downloadModel)
+                ModelDownloadView(viewModel: downloadModel, themes: themes)
             }
             }
         }
@@ -121,19 +126,19 @@ struct ContentView: View {
                 Divider()
                 SyncDebugView(controller: syncController)
                 Divider()
-                ReadAloudPreviewView()
+                ReadAloudPreviewView(theme: themes.theme)
                 Divider()
                 SimulatedShieldDemoView()
                 Divider()
-                StallProbePreviewView()
+                StallProbePreviewView(theme: themes.theme)
                 Divider()
                 SpikeView()
                 Divider()
-                ChoreTradeView()
+                ChoreTradeView(theme: themes.theme)
                 Divider()
-                MovementTradePreviewView()
+                MovementTradePreviewView(theme: themes.theme)
                 Divider()
-                AboutView()
+                AboutView(themes: themes)
             }
             .padding()
         }

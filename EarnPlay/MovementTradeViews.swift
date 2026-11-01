@@ -10,6 +10,7 @@ struct MovementTradeOfferCard: View {
     var unlockMinutes: Int
     var onAccept: () -> Void
     var onDecline: () -> Void
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -26,8 +27,8 @@ struct MovementTradeOfferCard: View {
             }
         }
         .padding()
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.tokens.tutorBackground.color)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
     }
 }
 
@@ -37,6 +38,7 @@ struct MovementTradeActiveView: View {
     var verifiedCount: Int
     var targetReps: Int
     var onAbandon: () -> Void
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -46,6 +48,7 @@ struct MovementTradeActiveView: View {
                 .font(.system(size: 48, weight: .bold))
                 .accessibilityLabel("Verified reps: \(verifiedCount) of \(targetReps)")
             ProgressView(value: Double(verifiedCount), total: Double(max(1, targetReps)))
+                .tint(theme.tokens.fill.color)
             Text("Phone in your pocket — only real reps count.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -53,8 +56,8 @@ struct MovementTradeActiveView: View {
                 .buttonStyle(.bordered)
         }
         .padding()
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(theme.tokens.tutorBackground.color)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
     }
 }
 
@@ -71,6 +74,7 @@ struct MovementTradePreviewView: View {
     @State private var previewSession = PreviewSession()
     @State private var refusalText = ""
     @State private var replayChoice = 0 // 0 genuine, 1 shaking, 2 still
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -102,7 +106,8 @@ struct MovementTradePreviewView: View {
                         model.accept(with: MotionProviderFactory.makeAcceptProvider(
                             replayProvider: replayProvider()))
                     },
-                    onDecline: { model.decline() })
+                    onDecline: { model.decline() },
+                    theme: theme)
                 #if DEBUG
                     Picker("Preview motion", selection: $replayChoice) {
                         Text("Genuine").tag(0)
@@ -120,7 +125,8 @@ struct MovementTradePreviewView: View {
                     activityName: activityLabel,
                     verifiedCount: model.verifiedCount,
                     targetReps: model.targetReps,
-                    onAbandon: { model.abandon() })
+                    onAbandon: { model.abandon() },
+                    theme: theme)
             case .finished:
                 Text(model.statusText)
                     .font(.body)

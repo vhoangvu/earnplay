@@ -15,6 +15,7 @@ import EarnPlayCore
 struct SpeakerButton: View {
     let message: TutorMessage
     @ObservedObject var service: ReadAloudService
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         // Always rendered for every tutor message (Band B Demo scope).
@@ -23,7 +24,7 @@ struct SpeakerButton: View {
             service.toggle(message)
         } label: {
             Image(systemName: isCurrentAndSpeaking ? "stop.fill" : "speaker.wave.2.fill")
-                .foregroundStyle(ChatDesign.primary)
+                .foregroundStyle(theme.tokens.accent.color)
                 .font(.body)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())

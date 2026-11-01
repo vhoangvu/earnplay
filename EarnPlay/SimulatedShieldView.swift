@@ -17,10 +17,11 @@ struct SimulatedShieldView: View {
     @State private var answerText = ""
     @State private var hintRevealed = false
     @State private var attemptsSubmitted = 0
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         ZStack {
-            Color(.systemBackground)
+            theme.tokens.background.color
                 .ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -29,8 +30,8 @@ struct SimulatedShieldView: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(Color.yellow.opacity(0.35))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(theme.tokens.track.color)
+                        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
                         .accessibilityIdentifier("simulatedShieldBadge")
 
                     Text("Locked app (simulated): \(flow.app.id)")

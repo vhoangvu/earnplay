@@ -17,6 +17,7 @@ import EarnPlayCore
 /// dates — never raw numbers.
 struct DashboardView: View {
     let controller: AdminSyncController
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     @State private var report: Dashboard.Report
     /// The `now`, time zone, and week definition the cached report was
     /// computed against. Foreground reloads compare the current week,
@@ -30,8 +31,9 @@ struct DashboardView: View {
     @State private var lastReloadCalendarIdentifier: Calendar.Identifier
     @Environment(\.scenePhase) private var scenePhase
 
-    init(controller: AdminSyncController) {
+    init(controller: AdminSyncController, theme: DesignSystem.Theme = DesignSystem.defaultTheme) {
         self.controller = controller
+        self.theme = theme
         let now = Date()
         let calendar = Calendar.current
         _report = State(initialValue: Dashboard.compute(
@@ -306,7 +308,7 @@ struct DashboardView: View {
                     GeometryReader { geometry in
                         let fraction = max(0.06, Double(point.score) / Double(maxScore))
                         RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.accentColor.opacity(0.7))
+                            .fill(theme.tokens.fill.color)
                             .frame(width: geometry.size.width * fraction)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -368,7 +370,7 @@ struct DashboardView: View {
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .background(theme.tokens.tutorBackground.color)
+        .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
     }
 }

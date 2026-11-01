@@ -54,7 +54,7 @@ final class ChatFixRound4Tests: XCTestCase {
             let fake = FakeEngine()
             let speech = ReadAloudService(band: GradeBand(grade: "4"), engine: fake)
             let msg = TutorMessage(id: "q1", text: "What is 7 times 8?", kind: .question)
-            let host = UIHostingController(rootView: SpeakerButton(message: msg, service: speech).background(ChatDesign.surface))
+            let host = UIHostingController(rootView: SpeakerButton(message: msg, service: speech).background(DesignSystem.defaultTheme.tokens.tutorBackground.color))
             let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 80, height: 60))
             win.overrideUserInterfaceStyle = style
             win.rootViewController = host; win.makeKeyAndVisible()
@@ -77,7 +77,7 @@ final class ChatFixRound4Tests: XCTestCase {
             .foregroundStyle(Color(red: 0x80 / 255, green: 0x99 / 255, blue: 0xEE / 255))
             .font(.body)
             .frame(minWidth: 44, minHeight: 44)
-            .background(ChatDesign.surface)
+            .background(DesignSystem.defaultTheme.tokens.tutorBackground.color)
         let host = UIHostingController(rootView: fixture)
         let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 80, height: 60))
         win.rootViewController = host; win.makeKeyAndVisible()
