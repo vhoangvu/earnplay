@@ -118,6 +118,10 @@ final class SimulatedShieldDemoState: ObservableObject {
 /// countdown stays live and expiry re-presents.
 struct SimulatedShieldCoverHost: View {
     @ObservedObject var flow: SimulatedShieldFlow
+    /// The app's current theme, forwarded to the presented shield so
+    /// a theme switch re-renders it (fix-4 item 7). Defaults to
+    /// Canonical for previews.
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -134,7 +138,7 @@ struct SimulatedShieldCoverHost: View {
         }
         .fullScreenCover(
             isPresented: Binding(get: { flow.isShieldPresented }, set: { _ in }),
-            content: { SimulatedShieldView(flow: flow) }
+            content: { SimulatedShieldView(flow: flow, theme: theme) }
         )
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             flow.tick()
@@ -150,6 +154,9 @@ struct SimulatedShieldCoverHost: View {
 struct SimulatedShieldDemoView: View {
     @StateObject private var demo = SimulatedShieldDemoState()
     @AppStorage(SimulatedShieldMode.forceUserDefaultsKey) private var forceSimulated = false
+    /// The app's current theme, forwarded through the cover host to
+    /// the shield (fix-4 item 7). Defaults to Canonical for previews.
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     private var simulatedOn: Bool { SimulatedShieldMode.isForced() }
 
@@ -173,7 +180,7 @@ struct SimulatedShieldDemoView: View {
                 }
                 if let id = demo.activeAppID,
                    let flow = demo.flow(for: id, isSimulatedMode: true) {
-                    SimulatedShieldCoverHost(flow: flow)
+                    SimulatedShieldCoverHost(flow: flow, theme: theme)
                 }
             }
         }

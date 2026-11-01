@@ -526,9 +526,15 @@ struct ChatConversationView: View {
             Text("Practice complete. Nice work.")
                 .font(.body.weight(.semibold))
                 .foregroundStyle(theme.tokens.tutorText.color)
+            // The label sits on the accent chrome: accent matches
+            // childBackground in every palette, so the fix-3 resolver
+            // supplies the readable label (4.63:1-6.75:1, pinned in
+            // ThemeContrastFix4Tests). The old white label fell to
+            // 2.80:1 in Warm Playful. The chrome/tint is unchanged.
             Button("Start again") { viewModel.restartSession() }
                 .buttonStyle(.borderedProminent)
                 .tint(theme.tokens.accent.color)
+                .foregroundStyle(theme.childTextOnChildBackground.color)
                 .frame(minHeight: 44)
                 .accessibilityIdentifier("chatRestartButton")
         }
@@ -559,7 +565,13 @@ struct ChatConversationView: View {
                 Button {
                     viewModel.requestHint()
                 } label: {
+                    // The label sits on the pale composer, so it takes
+                    // the paired tutorText token (9.94:1-16.88:1, pinned
+                    // in ThemeContrastFix4Tests) like the SpeakerButton
+                    // glyph; the accent tint stays on the button chrome.
+                    // The old accent label fell to 2.40:1 in Warm Playful.
                     Label("Hint", systemImage: "lightbulb")
+                        .foregroundStyle(theme.tokens.tutorText.color)
                         .frame(minHeight: 44)
                 }
                 .buttonStyle(.bordered)
@@ -572,9 +584,13 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chatComposerField")
                     .onSubmit { viewModel.submitDraft() }
 
+                // Same resolved label as Start again above: readable
+                // on the accent chrome in every palette; chrome/tint
+                // unchanged.
                 Button("Send") { viewModel.submitDraft() }
                     .buttonStyle(.borderedProminent)
                     .tint(theme.tokens.accent.color)
+                    .foregroundStyle(theme.childTextOnChildBackground.color)
                     .frame(minHeight: 44)
                     .accessibilityIdentifier("chatSendButton")
             }

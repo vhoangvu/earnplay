@@ -132,7 +132,7 @@ struct ContentView: View {
                 Divider()
                 ReadAloudPreviewView(theme: themes.theme)
                 Divider()
-                SimulatedShieldDemoView()
+                SimulatedShieldDemoView(theme: themes.theme)
                 Divider()
                 StallProbePreviewView(theme: themes.theme)
                 Divider()
