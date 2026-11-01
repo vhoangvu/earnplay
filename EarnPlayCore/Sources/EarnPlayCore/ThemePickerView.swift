@@ -102,7 +102,7 @@ struct ThemePreviewCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Preview")
                 .font(.caption.bold())
-                .foregroundStyle(theme.tokens.headerText.color)
+                .foregroundStyle(theme.headerTextOnHeaderBackground.color)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(6)
                 .background(theme.tokens.headerBackground.color)
@@ -117,7 +117,7 @@ struct ThemePreviewCard: View {
                 Spacer()
                 Text("Child bubble")
                     .font(.caption)
-                    .foregroundStyle(theme.tokens.childText.color)
+                    .foregroundStyle(theme.childTextOnChildBackground.color)
                     .padding(6)
                     .background(theme.tokens.childBackground.color)
                     .clipShape(RoundedRectangle(cornerRadius: theme.bubbleRadius))

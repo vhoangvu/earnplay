@@ -23,6 +23,12 @@ import EarnPlayCore
 /// harness cannot reach this screen (setup completion needs Screen
 /// Time authorization: WalkthroughChild04 SETUP-COMPLETION gap), so
 /// this in-process test proves the route on the real view instead.
+///
+/// T7.8 fix-3 item A: the star sampler is differential (each star
+/// state renders separately against a background-only reference;
+/// only painted pixels are classified) with missing-glyph and
+/// missing-boundary negative fixtures, closing the whole-bitmap
+/// false-pass where the background itself counted as starEmpty.
 @MainActor
 final class ThemeContrastFix2Tests: XCTestCase {
 
@@ -38,34 +44,103 @@ final class ThemeContrastFix2Tests: XCTestCase {
         func stopSpeaking() { isSpeaking = false }
     }
 
-    // MARK: - Finding 1: both star states, every palette
+    // MARK: - Finding 1: both star states, every palette (fix-3 item A)
 
+    /// Each star state renders SEPARATELY against its own background
+    /// reference (fix-3 item A): only pixels the star actually paints
+    /// (differing from the background-only render) are classified, so
+    /// background pixels can no longer count as a star state. The old
+    /// whole-bitmap sampler counted the Canonical background itself as
+    /// starEmpty (white is within tolerance of #d0d0e0) and pooled
+    /// both stars' boundaries, so it passed with a glyph removed.
+    /// Production rendering is unchanged; only the sampler changed.
     func testProgressStarsKeepColorsWithBoundaryInEveryPalette() throws {
         for palette in DesignSystem.Palette.allCases {
             let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
             for style: UIUserInterfaceStyle in [.light, .dark] {
-                let host = UIHostingController(rootView:
-                    HStack(spacing: 4) {
-                        ThemeProgressStar(filled: true, theme: theme)
-                        ThemeProgressStar(filled: false, theme: theme)
-                    }
-                    .padding(8)
-                    .background(theme.tokens.tutorBackground.color)
-                )
-                let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 120, height: 60))
-                win.overrideUserInterfaceStyle = style
-                win.rootViewController = host; win.makeKeyAndVisible()
-                host.view.setNeedsLayout(); host.view.layoutIfNeeded()
-                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
-                let sample = try XCTUnwrap(starSample(in: host.view, theme: theme),
-                    "\(palette) style \(style.rawValue): star bitmap did not render")
-                print("FIX2-STARS \(palette) style=\(style.rawValue) fill=\(sample.fill) empty=\(sample.empty) boundary=\(sample.boundary)")
-                XCTAssertGreaterThan(sample.fill, 5,
+                let bg = try XCTUnwrap(renderBackground(theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): background reference did not render")
+                let filledBmp = try XCTUnwrap(renderStar(filled: true, theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): filled star did not render")
+                let filled = starCounts(star: filledBmp, background: bg, theme: theme)
+                print("FIX3-STARS \(palette) style=\(style.rawValue) filled: fill=\(filled.fill) empty=\(filled.empty) boundary=\(filled.boundary)")
+                XCTAssertGreaterThan(filled.fill, 5,
                     "\(palette): filled star must keep its starFill token in style \(style.rawValue)")
-                XCTAssertGreaterThan(sample.empty, 5,
+                XCTAssertGreaterThan(filled.boundary, 5,
+                    "\(palette): filled star must render the tutorText boundary in style \(style.rawValue)")
+
+                let emptyBmp = try XCTUnwrap(renderStar(filled: false, theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): empty star did not render")
+                let empty = starCounts(star: emptyBmp, background: bg, theme: theme)
+                print("FIX3-STARS \(palette) style=\(style.rawValue) empty: fill=\(empty.fill) empty=\(empty.empty) boundary=\(empty.boundary)")
+                XCTAssertGreaterThan(empty.empty, 5,
                     "\(palette): empty star must keep its starEmpty token in style \(style.rawValue)")
-                XCTAssertGreaterThan(sample.boundary, 5,
-                    "\(palette): both star states must render the tutorText boundary in style \(style.rawValue)")
+                XCTAssertGreaterThan(empty.boundary, 5,
+                    "\(palette): empty star must render the tutorText boundary in style \(style.rawValue)")
+            }
+        }
+    }
+
+    // MARK: - Item A negative fixtures: the sampler must catch removal
+
+    /// Missing-glyph fixture: two INDEPENDENT background-only renders
+    /// compared as star-vs-background must yield ZERO of every state.
+    /// Sensitivity: the old sampler returned thousands of "empty"
+    /// pixels here (Canonical white is within tolerance of starEmpty
+    /// #d0d0e0: diffs 47,47,31), so a removed glyph still passed; the
+    /// differential sampler returns 0 because no pixel differs, so a
+    /// removed glyph now fails the positive test's >5 assertions.
+    /// Independent renders (not one bitmap vs itself) also prove
+    /// render noise stays below the differential threshold.
+    func testStarSamplerFindsNoGlyphOnBackgroundOnly() throws {
+        for palette in DesignSystem.Palette.allCases {
+            let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
+            for style: UIUserInterfaceStyle in [.light, .dark] {
+                let first = try XCTUnwrap(renderBackground(theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): background reference did not render")
+                let second = try XCTUnwrap(renderBackground(theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): second background reference did not render")
+                let counts = starCounts(star: second, background: first, theme: theme)
+                print("FIX3-NOGLYPH \(palette) style=\(style.rawValue) fill=\(counts.fill) empty=\(counts.empty) boundary=\(counts.boundary)")
+                XCTAssertEqual(counts.fill, 0,
+                    "\(palette): background must supply no fill pixels in style \(style.rawValue)")
+                XCTAssertEqual(counts.empty, 0,
+                    "\(palette): background must supply no empty pixels in style \(style.rawValue)")
+                XCTAssertEqual(counts.boundary, 0,
+                    "\(palette): background must supply no boundary pixels in style \(style.rawValue)")
+            }
+        }
+    }
+
+    /// Missing-boundary fixtures: a star WITHOUT the tutorText backing
+    /// (plain single glyph in the state color) must still show its
+    /// glyph color but ZERO boundary pixels — i.e. it would FAIL the
+    /// positive test's boundary > 5 assertion. The glyph-present half
+    /// (fill/empty > 5) proves the fixture actually rendered, so the
+    /// boundary == 0 half proves detection is sensitive to the backing.
+    func testStarSamplerFindsNoBoundaryWithoutBacking() throws {
+        for palette in DesignSystem.Palette.allCases {
+            let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
+            for style: UIUserInterfaceStyle in [.light, .dark] {
+                let bg = try XCTUnwrap(renderBackground(theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): background reference did not render")
+                let filledBmp = try XCTUnwrap(renderUnbackedStar(filled: true, theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): unbacked filled star did not render")
+                let filled = starCounts(star: filledBmp, background: bg, theme: theme)
+                print("FIX3-NOBOUNDARY \(palette) style=\(style.rawValue) filled: fill=\(filled.fill) boundary=\(filled.boundary)")
+                XCTAssertGreaterThan(filled.fill, 5,
+                    "\(palette): unbacked filled fixture must still render its glyph in style \(style.rawValue)")
+                XCTAssertEqual(filled.boundary, 0,
+                    "\(palette): unbacked filled star must show no boundary in style \(style.rawValue)")
+
+                let emptyBmp = try XCTUnwrap(renderUnbackedStar(filled: false, theme: theme, style: style),
+                    "\(palette) style \(style.rawValue): unbacked empty star did not render")
+                let empty = starCounts(star: emptyBmp, background: bg, theme: theme)
+                print("FIX3-NOBOUNDARY \(palette) style=\(style.rawValue) empty: empty=\(empty.empty) boundary=\(empty.boundary)")
+                XCTAssertGreaterThan(empty.empty, 5,
+                    "\(palette): unbacked empty fixture must still render its glyph in style \(style.rawValue)")
+                XCTAssertEqual(empty.boundary, 0,
+                    "\(palette): unbacked empty star must show no boundary in style \(style.rawValue)")
             }
         }
     }
@@ -206,15 +281,87 @@ final class ThemeContrastFix2Tests: XCTestCase {
         abs(px.0 - target.0) <= tolerance && abs(px.1 - target.1) <= tolerance && abs(px.2 - target.2) <= tolerance
     }
 
-    private func starSample(in view: UIView, theme: DesignSystem.Theme) -> (fill: Int, empty: Int, boundary: Int)? {
-        guard let bmp = normalizedBitmap(in: view) else { return nil }
+    private struct Bitmap {
+        var bytes: [UInt8]
+        var width: Int
+        var height: Int
+    }
+
+    /// Fixed geometry shared by every star/background render so the
+    /// differential comparison is pixel-aligned. The window is larger
+    /// than the content frame on purpose: tiny windows (~64x48)
+    /// rasterize blank via drawHierarchy (diagnosed: identical
+    /// content renders in a 120x60 window but not in a 64x48 one),
+    /// while the fixed content frame keeps star and background pixels
+    /// aligned across renders.
+    private let starFrame = CGSize(width: 64, height: 48)
+    private let renderWindow = CGSize(width: 120, height: 60)
+
+    private func render<Content: View>(_ content: Content, style: UIUserInterfaceStyle) -> Bitmap? {
+        let host = UIHostingController(rootView: content)
+        let win = UIWindow(frame: CGRect(origin: .zero, size: renderWindow))
+        win.overrideUserInterfaceStyle = style
+        win.rootViewController = host; win.makeKeyAndVisible()
+        host.view.setNeedsLayout(); host.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        guard let bmp = normalizedBitmap(in: host.view) else { return nil }
+        return Bitmap(bytes: bmp.bytes, width: bmp.width, height: bmp.height)
+    }
+
+    private func renderStar(filled: Bool, theme: DesignSystem.Theme, style: UIUserInterfaceStyle) -> Bitmap? {
+        render(
+            ThemeProgressStar(filled: filled, theme: theme)
+                .frame(width: starFrame.width, height: starFrame.height)
+                .background(theme.tokens.tutorBackground.color),
+            style: style)
+    }
+
+    private func renderBackground(theme: DesignSystem.Theme, style: UIUserInterfaceStyle) -> Bitmap? {
+        render(
+            Color.clear
+                .frame(width: starFrame.width, height: starFrame.height)
+                .background(theme.tokens.tutorBackground.color),
+            style: style)
+    }
+
+    /// A star glyph with NO tutorText backing: the removed-boundary
+    /// fixture. Same inner glyph (size 15, state color) as
+    /// ThemeProgressStar, without the size-20 backing.
+    private func renderUnbackedStar(filled: Bool, theme: DesignSystem.Theme, style: UIUserInterfaceStyle) -> Bitmap? {
+        render(
+            Image(systemName: filled ? "star.fill" : "star")
+                .font(.system(size: 15))
+                .foregroundStyle((filled ? theme.tokens.starFill : theme.tokens.starEmpty).color)
+                .frame(width: starFrame.width, height: starFrame.height)
+                .background(theme.tokens.tutorBackground.color),
+            style: style)
+    }
+
+    /// Differential sampler (fix-3 item A): a pixel is examined only
+    /// when the star render differs from the background-only render
+    /// there (max-channel abs diff > 12), and is then classified with
+    /// the R4 tolerance (50, boundary first). Threshold rationale: the
+    /// closest star-vs-background pair across palettes differs by 24
+    /// (System Native starEmpty #d1d1d6 vs tutorBackground #e9e9eb:
+    /// 24,24,21), while identical-layout render noise is ~0 (proven
+    /// by testStarSamplerFindsNoGlyphOnBackgroundOnly returning
+    /// exactly 0); 12 splits them with margin on both sides.
+    private func starCounts(star: Bitmap, background: Bitmap, theme: DesignSystem.Theme) -> (fill: Int, empty: Int, boundary: Int) {
+        guard star.width == background.width && star.height == background.height else {
+            XCTFail("star/background bitmap size mismatch: \(star.width)x\(star.height) vs \(background.width)x\(background.height)")
+            return (0, 0, 0)
+        }
         let fill = rgb255(theme.tokens.starFill)
         let empty = rgb255(theme.tokens.starEmpty)
         let boundary = rgb255(theme.tokens.tutorText)
         var f = 0, e = 0, b = 0
-        for i in 0..<(bmp.width * bmp.height) {
+        for i in 0..<(star.width * star.height) {
             let o = i * 4
-            let px = (Int(bmp.bytes[o]), Int(bmp.bytes[o + 1]), Int(bmp.bytes[o + 2]))
+            let dr = abs(Int(star.bytes[o]) - Int(background.bytes[o]))
+            let dg = abs(Int(star.bytes[o + 1]) - Int(background.bytes[o + 1]))
+            let db = abs(Int(star.bytes[o + 2]) - Int(background.bytes[o + 2]))
+            guard max(dr, max(dg, db)) > 12 else { continue }
+            let px = (Int(star.bytes[o]), Int(star.bytes[o + 1]), Int(star.bytes[o + 2]))
             if near(px, boundary) { b += 1 } else if near(px, fill) { f += 1 } else if near(px, empty) { e += 1 }
         }
         return (f, e, b)

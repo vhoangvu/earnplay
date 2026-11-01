@@ -501,7 +501,7 @@ struct ChatConversationView: View {
                 Spacer(minLength: 40)
                 Text(text)
                     .font(.body)
-                    .foregroundStyle(theme.tokens.childText.color)
+                    .foregroundStyle(theme.childTextOnChildBackground.color)
                     .padding(12)
                     .background(theme.tokens.childBackground.color)
                     .clipShape(RoundedRectangle(cornerRadius: theme.bubbleRadius))

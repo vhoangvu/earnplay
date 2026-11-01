@@ -306,6 +306,46 @@ public enum DesignSystem {
         /// Dark Mode, where the adaptive `.secondary` would wash out
         /// against the fixed light surface.
         public var secondaryOnTheme: Color { tokens.tutorText.color.opacity(0.75) }
+
+        /// Near-black text for vivid surfaces whose prescribed white
+        /// text falls below WCAG AA 4.5:1 (fix-3 item B). The System
+        /// Native text value (#111111), already in the token table:
+        /// 4.70-6.75 on the four failing child backgrounds and 6.75
+        /// on the Warm Playful header (see ThemeStoreTests). Neither
+        /// white nor this dark passes everywhere (dark falls to
+        /// 3.76-4.08 on the Calm/Sky/Canonical child bubbles), so the
+        /// resolved properties below select per palette explicitly.
+        public static let darkOverlayText = RGB(0x11, 0x11, 0x11)
+
+        /// Text rendered ON the child bubble (fix-3 item B): the
+        /// prescribed childText where it already meets 4.5:1 (Calm
+        /// Forest 5.00, Sky Blueprint 4.63, Canonical 5.02), else
+        /// darkOverlayText (Warm Playful 6.75, System Native 4.70,
+        /// Blush Pink 6.30, Hot Pink 5.00). Prescribed tokens stay
+        /// verbatim; this is an explicit per-palette selection, pinned
+        /// analytically in ThemeStoreTests.
+        public var childTextOnChildBackground: RGB {
+            switch palette {
+            case .warmPlayful, .systemNative, .blushPink, .hotPink:
+                return Self.darkOverlayText
+            case .calmForest, .skyBlueprint, .canonical:
+                return tokens.childText
+            }
+        }
+
+        /// Text rendered ON the header strip (fix-3 item B): the
+        /// prescribed headerText everywhere except Warm Playful
+        /// (2.80), which takes darkOverlayText (6.75). All 7 header
+        /// pairs computed; only Warm Playful falls below 4.5:1
+        /// (others 5.02-16.92). Pinned in ThemeStoreTests.
+        public var headerTextOnHeaderBackground: RGB {
+            switch palette {
+            case .warmPlayful:
+                return Self.darkOverlayText
+            case .calmForest, .skyBlueprint, .systemNative, .canonical, .blushPink, .hotPink:
+                return tokens.headerText
+            }
+        }
     }
 
     /// All 14 themes in picker order: the 7 palettes, rounded then

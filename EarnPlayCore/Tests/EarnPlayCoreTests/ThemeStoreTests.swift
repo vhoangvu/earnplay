@@ -204,6 +204,71 @@ final class ThemeStoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Resolved text floors (fix-3 item B)
+
+    /// The text actually rendered ON the child bubble meets WCAG AA
+    /// 4.5:1 in every palette: prescribed white where it passes
+    /// (Calm 5.00, Sky 4.63, Canonical 5.02), else darkOverlayText
+    /// (Warm 6.75, System Native 4.70, Blush 6.30, Hot Pink 5.00).
+    /// The prescribed childText token itself stays #ffffff verbatim
+    /// (pinned by testTokenTableMatchesMockupVerbatim); this pins the
+    /// resolved pair the chat and picker preview render.
+    func testResolvedChildTextMeets4_5To1OnChildBackgroundInEveryPalette() {
+        for palette in DesignSystem.Palette.allCases {
+            let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
+            let ratio = contrastRatio(theme.childTextOnChildBackground, theme.tokens.childBackground)
+            XCTAssertGreaterThan(ratio, 4.5, "\(palette) resolved child text/childBackground is \(ratio)")
+        }
+    }
+
+    /// The text actually rendered ON the header strip meets 4.5:1 in
+    /// every palette: prescribed headerText everywhere except Warm
+    /// Playful, which takes darkOverlayText (6.75). All 7 header
+    /// pairs computed; only Warm Playful falls below 4.5:1 with the
+    /// prescribed token (2.80; others 5.02-16.92).
+    func testResolvedHeaderTextMeets4_5To1OnHeaderBackgroundInEveryPalette() {
+        for palette in DesignSystem.Palette.allCases {
+            let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
+            let ratio = contrastRatio(theme.headerTextOnHeaderBackground, theme.tokens.headerBackground)
+            XCTAssertGreaterThan(ratio, 4.5, "\(palette) resolved header text/headerBackground is \(ratio)")
+        }
+    }
+
+    /// The resolved text keeps the prescribed tokens where they pass
+    /// and uses the shared dark overlay only where white fails, so a
+    /// future edit cannot silently flip a passing palette to dark or
+    /// leave a failing palette white.
+    func testResolvedTextKeepsPrescribedTokensWhereTheyPass() {
+        XCTAssertEqual(DesignSystem.Theme.darkOverlayText.hex, "#111111")
+        for palette in DesignSystem.Palette.allCases {
+            let theme = DesignSystem.Theme(palette: palette, shape: .rounded)
+            switch palette {
+            case .warmPlayful, .systemNative, .blushPink, .hotPink:
+                XCTAssertEqual(theme.childTextOnChildBackground,
+                               DesignSystem.Theme.darkOverlayText,
+                               "\(palette) child text must use the dark overlay")
+            case .calmForest, .skyBlueprint, .canonical:
+                XCTAssertEqual(theme.childTextOnChildBackground, theme.tokens.childText,
+                               "\(palette) child text must keep the prescribed token")
+            }
+            if palette == .warmPlayful {
+                XCTAssertEqual(theme.headerTextOnHeaderBackground,
+                               DesignSystem.Theme.darkOverlayText,
+                               "Warm Playful header text must use the dark overlay")
+            } else {
+                XCTAssertEqual(theme.headerTextOnHeaderBackground, theme.tokens.headerText,
+                               "\(palette) header text must keep the prescribed token")
+            }
+            for shape in DesignSystem.Shape.allCases {
+                let shaped = DesignSystem.Theme(palette: palette, shape: shape)
+                XCTAssertEqual(shaped.childTextOnChildBackground, theme.childTextOnChildBackground,
+                               "shape must not change resolved child text: \(palette) \(shape)")
+                XCTAssertEqual(shaped.headerTextOnHeaderBackground, theme.headerTextOnHeaderBackground,
+                               "shape must not change resolved header text: \(palette) \(shape)")
+            }
+        }
+    }
+
     private func luminance(_ rgb: DesignSystem.RGB) -> Double {
         func linear(_ v: Double) -> Double {
             v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
