@@ -205,7 +205,14 @@ final class ThemeContrastFix4Tests: XCTestCase {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 1.0))
         guard let cover = host.presentedViewController?.view else { return nil }
         cover.layoutIfNeeded()
-        let renderer = UIGraphicsImageRenderer(bounds: cover.bounds)
+        // Pin scale 3: the 100k/10k bounds are calibrated to a 3x
+        // render (observed 216k/220k); the default format inherits
+        // the screen scale, so a 2x simulator would count x4/9 and
+        // fail despite correct theme propagation. No behavior change
+        // on 3x runners.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 3
+        let renderer = UIGraphicsImageRenderer(bounds: cover.bounds, format: format)
         let image = renderer.image { _ in cover.drawHierarchy(in: cover.bounds, afterScreenUpdates: true) }
         guard let cg = image.cgImage else { return nil }
         let w = cg.width, h = cg.height
