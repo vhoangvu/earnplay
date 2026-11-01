@@ -6,8 +6,8 @@ import XCTest
 /// complete token set with no fallback.
 @MainActor
 final class ThemeStoreTests: XCTestCase {
-    private var suiteName: String!
-    private var defaults: UserDefaults!
+    private nonisolated(unsafe) var suiteName: String!
+    private nonisolated(unsafe) var defaults: UserDefaults!
 
     override func setUp() {
         super.setUp()
