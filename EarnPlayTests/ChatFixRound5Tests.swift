@@ -110,6 +110,11 @@ final class ChatFixRound5Tests: XCTestCase {
             let speech = ReadAloudService(band: GradeBand(grade: "4"), engine: FakeEngine())
             let vm = ChatConversationViewModel(engine: ZeroProgressEngine(), speech: speech)
             let host = UIHostingController(rootView: ChatConversationView(viewModel: vm))
+            // The hosting controller takes the appearance override BEFORE
+            // the window exists: a scene-less window-level override alone
+            // leaves SwiftUI rendering light in Dark Mode (checkmark-test
+            // precedent), so the .dark iteration would prove nothing.
+            host.overrideUserInterfaceStyle = style
             let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
             win.overrideUserInterfaceStyle = style
             win.rootViewController = host; win.makeKeyAndVisible()

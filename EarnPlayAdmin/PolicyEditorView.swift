@@ -59,8 +59,11 @@ struct PolicyEditorView: View {
                 movementSection
                 saveSection
             }
-            // Steppers, toggles, and row buttons take the theme accent
-            // instead of system blue, in both appearances.
+            // Steppers, toggles, and control chrome take the theme
+            // accent instead of system blue, in both appearances. The
+            // plain row actions ("Add chore", the app-list "Add") carry
+            // their own adaptive ink below: accent text is 1.81:1 on
+            // light cells.
             .tint(theme.tokens.accent.color)
             .navigationTitle("Policy Editor")
             .task { reload() }
@@ -202,6 +205,10 @@ struct PolicyEditorView: View {
                     verificationMode: .parentConfirm
                 ))
             }
+            // Adaptive ink, NOT the form's accent tint: the Light Pink
+            // accent is 1.81:1 on light cells (the picker-checkmark
+            // precedent), while .primary reads in both appearances.
+            .foregroundStyle(.primary)
             // Stable handle for the issue #71 walkthrough.
             // No behavior change.
             .accessibilityIdentifier("policyAddChoreButton")
@@ -327,6 +334,9 @@ private struct AppListSection: View {
                     apps.append(AppRef(id: id))
                     newAppID = ""
                 }
+                // Same adaptive ink as "Add chore": the form's accent
+                // tint is 1.81:1 as text on light cells.
+                .foregroundStyle(.primary)
                 .disabled(newAppID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         } header: { Text(title) } footer: {
