@@ -93,6 +93,30 @@ final class ChatComposerLayoutUITests: WalkthroughTestCase {
             abs(fieldFrame.maxX - rowMaxX), 24.0,
             "Composer: field right edge must align with the button row (\(geometry))"
         )
+
+        // Outer-width pin (Copilot review #1 on PR #78): the button-row
+        // comparison above is self-referential — verified empirically:
+        // with the inner stack narrowed to 200pt, every assertion above
+        // still passes. So pin the field edges to the OUTER app window
+        // instead. (The chat root's own `chatConversationView` element
+        // cannot serve as the reference: grouping makes that query
+        // report a descendant frame, not the container geometry.) The
+        // composer pads the window by 12pt on each side, and the field
+        // must span that full inner width within an explicit 24pt
+        // tolerance (padding + safe-area + rounding slack). The
+        // narrowed-stack counterexample now fails: a 200pt inner stack
+        // leaves its field edges ~90pt or more off the window edges
+        // (centered or leading alike — one edge always misses by far).
+        let windowFrame = app.windows.firstMatch.frame
+        let outerGeometry = "window=\(windowFrame) \(geometry)"
+        XCTAssertLessThan(
+            abs(fieldFrame.minX - (windowFrame.minX + 12.0)), 24.0,
+            "Composer: field left edge must pin to the outer window width (\(outerGeometry))"
+        )
+        XCTAssertLessThan(
+            abs(fieldFrame.maxX - (windowFrame.maxX - 12.0)), 24.0,
+            "Composer: field right edge must pin to the outer window width (\(outerGeometry))"
+        )
         // And the field is wider than either button (previously the
         // field was squeezed between the two buttons).
         XCTAssertGreaterThan(
