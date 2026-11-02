@@ -302,7 +302,7 @@ final class ChatConversationViewModel: ObservableObject {
         apply(update)
     }
 
-    /// Hint button: always visible beside the composer while the
+    /// Hint button: always visible below the answer field while the
     /// session is active, never disabled in the view. Once the
     /// session is complete the button is not rendered, and a stray
     /// call here is refused instead of silently doing nothing.
@@ -560,39 +560,47 @@ struct ChatConversationView: View {
             if viewModel.composer == .numberPad {
                 numberPad
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                // Hint is always visible beside the composer, never disabled.
-                Button {
-                    viewModel.requestHint()
-                } label: {
-                    // The label sits on the pale composer, so it takes
-                    // the paired tutorText token (9.94:1-16.88:1, pinned
-                    // in ThemeContrastFix4Tests) like the SpeakerButton
-                    // glyph; the accent tint stays on the button chrome.
-                    // The old accent label fell to 2.40:1 in Warm Playful.
-                    Label("Hint", systemImage: "lightbulb")
-                        .foregroundStyle(theme.tokens.tutorText.color)
-                        .frame(minHeight: 44)
-                }
-                .buttonStyle(.bordered)
-                .tint(theme.tokens.accent.color)
-                .accessibilityIdentifier("chatHintButton")
-
+            // Two-row composer (issue #77 mockup): the answer field
+            // spans the full width on row 1; Hint (left) and Send
+            // (right) share row 2 space-between.
+            VStack(spacing: 8) {
                 TextField("Type your answer", text: $viewModel.draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: .infinity)
                     .accessibilityIdentifier("chatComposerField")
                     .onSubmit { viewModel.submitDraft() }
 
-                // Same resolved label as Start again above: readable
-                // on the accent chrome in every palette; chrome/tint
-                // unchanged.
-                Button("Send") { viewModel.submitDraft() }
-                    .buttonStyle(.borderedProminent)
+                HStack(spacing: 8) {
+                    // Hint is always visible in the composer row, never disabled.
+                    Button {
+                        viewModel.requestHint()
+                    } label: {
+                        // The label sits on the pale composer, so it takes
+                        // the paired tutorText token (9.94:1-16.88:1, pinned
+                        // in ThemeContrastFix4Tests) like the SpeakerButton
+                        // glyph; the accent tint stays on the button chrome.
+                        // The old accent label fell to 2.40:1 in Warm Playful.
+                        Label("Hint", systemImage: "lightbulb")
+                            .foregroundStyle(theme.tokens.tutorText.color)
+                            .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.bordered)
                     .tint(theme.tokens.accent.color)
-                    .foregroundStyle(theme.childTextOnChildBackground.color)
-                    .frame(minHeight: 44)
-                    .accessibilityIdentifier("chatSendButton")
+                    .accessibilityIdentifier("chatHintButton")
+
+                    Spacer()
+
+                    // Same resolved label as Start again above: readable
+                    // on the accent chrome in every palette; chrome/tint
+                    // unchanged.
+                    Button("Send") { viewModel.submitDraft() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(theme.tokens.accent.color)
+                        .foregroundStyle(theme.childTextOnChildBackground.color)
+                        .frame(minHeight: 44)
+                        .accessibilityIdentifier("chatSendButton")
+                }
             }
         }
         // Bordered buttons (choices, Hint, Send, number-pad keys) take

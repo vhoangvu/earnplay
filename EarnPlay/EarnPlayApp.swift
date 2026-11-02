@@ -32,62 +32,77 @@ struct ContentView: View {
     @ObservedObject var syncController: ChildSyncController
     @Environment(\.scenePhase) private var scenePhase
 
+    /// UI-test-only chat preview (issue #77): launched with
+    /// `--earnplay-ui-chat`, the app renders the practice chat directly,
+    /// bypassing the model gate and setup wizard so XCUITest can pin the
+    /// composer layout (the chat is otherwise unreachable on the
+    /// simulator — see gap PRACTICE). Installed production builds are
+    /// never launched with this argument, so this changes nothing
+    /// outside UI tests (like the EARNPLAY_* environment overrides).
+    static var uiChatPreviewEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--earnplay-ui-chat")
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Fix round 1 (finding 1): the unpaired child's local code
-            // on a reachable production surface BEFORE any invitation —
-            // the admin reads it off this screen to start pairing.
-            // Hidden once paired; display alone pairs nothing.
-            if let code = syncController.preInvitePairingCode {
-                Text("Pairing code (show to admin): \(code)")
-                    .font(.body.monospacedDigit())
-                    .padding(8)
-            }
-            Group {
-                if downloadModel.isReady {
-                if setup.step == .complete, !setup.summaryDismissed {
-                    // The About sheet below is bound to the same
-                    // app-scope store as the chat theme (fix-2
-                    // finding 2), so onboarded installs keep a
-                    // settings route after the download gate lifts.
-                    SetupCompleteView(viewModel: setup, themes: themes)
-                } else if setup.step == .complete {
-                    // Main practice screen (T1.8): the chat conversation.
-                    // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
-                    // Practice recording (issue #63): the production
-                    // SessionLog producer — per-question detail + effort
-                    // snapshot, enqueued into the shared sync outbox
-                    // (same instance the service drains, never a second
-                    // writer over the same directory) and delivered via
-                    // notifySessionEnqueued after each durable enqueue.
-                    ChatConversationView(engine: DemoTutorEngine(
-                        recording: .productionDefault(
-                            queue: syncController.sessionQueue,
-                            // Round 2 item 4: read the persisted version
-                            // per log (one file read per session). Setup
-                            // commits through a separate store, so the
-                            // controller's cache stays stale until
-                            // restart; a fresh read carries the post-setup
-                            // version with no restart. Sync
-                            // version-comparison semantics unchanged.
-                            policyVersion: { PolicyStore().storedVersion },
-                            onSessionEnqueued: { [service = syncController.service] in
-                                service.notifySessionEnqueued()
-                            },
-                            // Round 2 item 2: a failed enqueue hands the
-                            // finalized log to the app-scoped controller,
-                            // which retains it across discarding this
-                            // view/engine and retries through the shared
-                            // queue on lifecycle triggers below.
-                            onEnqueueFailed: { [syncController] log in
-                                syncController.handleFailedEnqueue(log)
-                            })), theme: themes.theme)
-                } else {
-                    SetupFlowView(viewModel: setup)
-                }
+            if Self.uiChatPreviewEnabled {
+                ChatConversationView(engine: DemoTutorEngine(), theme: themes.theme)
             } else {
-                ModelDownloadView(viewModel: downloadModel, themes: themes)
-            }
+                // Fix round 1 (finding 1): the unpaired child's local code
+                // on a reachable production surface BEFORE any invitation —
+                // the admin reads it off this screen to start pairing.
+                // Hidden once paired; display alone pairs nothing.
+                if let code = syncController.preInvitePairingCode {
+                    Text("Pairing code (show to admin): \(code)")
+                        .font(.body.monospacedDigit())
+                        .padding(8)
+                }
+                Group {
+                    if downloadModel.isReady {
+                    if setup.step == .complete, !setup.summaryDismissed {
+                        // The About sheet below is bound to the same
+                        // app-scope store as the chat theme (fix-2
+                        // finding 2), so onboarded installs keep a
+                        // settings route after the download gate lifts.
+                        SetupCompleteView(viewModel: setup, themes: themes)
+                    } else if setup.step == .complete {
+                        // Main practice screen (T1.8): the chat conversation.
+                        // Band B (grade 4) demo engine over T1.2/T1.3 APIs.
+                        // Practice recording (issue #63): the production
+                        // SessionLog producer — per-question detail + effort
+                        // snapshot, enqueued into the shared sync outbox
+                        // (same instance the service drains, never a second
+                        // writer over the same directory) and delivered via
+                        // notifySessionEnqueued after each durable enqueue.
+                        ChatConversationView(engine: DemoTutorEngine(
+                            recording: .productionDefault(
+                                queue: syncController.sessionQueue,
+                                // Round 2 item 4: read the persisted version
+                                // per log (one file read per session). Setup
+                                // commits through a separate store, so the
+                                // controller's cache stays stale until
+                                // restart; a fresh read carries the post-setup
+                                // version with no restart. Sync
+                                // version-comparison semantics unchanged.
+                                policyVersion: { PolicyStore().storedVersion },
+                                onSessionEnqueued: { [service = syncController.service] in
+                                    service.notifySessionEnqueued()
+                                },
+                                // Round 2 item 2: a failed enqueue hands the
+                                // finalized log to the app-scoped controller,
+                                // which retains it across discarding this
+                                // view/engine and retries through the shared
+                                // queue on lifecycle triggers below.
+                                onEnqueueFailed: { [syncController] log in
+                                    syncController.handleFailedEnqueue(log)
+                                })), theme: themes.theme)
+                    } else {
+                        SetupFlowView(viewModel: setup)
+                    }
+                    } else {
+                        ModelDownloadView(viewModel: downloadModel, themes: themes)
+                    }
+                }
             }
         }
         .task {

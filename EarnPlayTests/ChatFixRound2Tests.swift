@@ -76,13 +76,14 @@ final class ChatFixRound2Tests: XCTestCase {
         let scrollViews = renderedScrollViews(in: host.view)
         let thread = try XCTUnwrap(scrollViews.max(by: { $0.bounds.height < $1.bounds.height }),
                                    "rendered thread scroll view missing")
-        // Real viewport is 479pt at the 4-line cap (header + bounded
-        // composer take the rest of 844): still >half the window and
+        // Two-row composer (issue #77): the mandated Hint/Send row
+        // below the field costs one button row (~70pt) versus the old
+        // 479pt viewport, so "most of the screen" no longer holds in
+        // the worst case (number pad + 4-line field + button row +
+        // header). Real viewport is 409pt at the 4-line cap: still
         // several message rows — the honest readable bound.
         XCTAssertGreaterThan(thread.bounds.height, 400,
                              "thread viewport must remain readable with a long draft, got \(thread.bounds.height)")
-        XCTAssertGreaterThan(thread.bounds.height, host.view.bounds.height / 2,
-                             "thread viewport must retain most of the screen")
     }
 
     // MARK: Item 2 — fallback reading passage exactly once
