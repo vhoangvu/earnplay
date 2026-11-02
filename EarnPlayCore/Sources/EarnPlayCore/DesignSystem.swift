@@ -2,9 +2,9 @@ import SwiftUI
 
 /// Single theme source (SSOT) for every app's colors and radii.
 ///
-/// Carries the Main Page Style Explorations: 7 palettes (Calm Forest,
+/// Carries the Main Page Style Explorations: 8 palettes (Calm Forest,
 /// Warm Playful, Sky Blueprint, System Native, Canonical, Blush Pink,
-/// Hot Pink) x rounded/sharp shapes = 14 themes. Each theme is defined
+/// Hot Pink, Light Pink) x rounded/sharp shapes = 16 themes. Each theme is defined
 /// by its 3 swatch colors (header / middle / background trio) and
 /// carries the full 12-token set verbatim from the mockup file's
 /// palette classes; rounded and sharp share the palette and differ
@@ -91,7 +91,7 @@ public enum DesignSystem {
 
     // MARK: - Palettes
 
-    /// The 7 exploration palettes, in picker order.
+    /// The 8 exploration palettes, in picker order.
     public enum Palette: String, CaseIterable, Sendable {
         case calmForest = "calm-forest"
         case warmPlayful = "warm-playful"
@@ -100,6 +100,7 @@ public enum DesignSystem {
         case canonical
         case blushPink = "blush-pink"
         case hotPink = "hot-pink"
+        case lightPink = "light-pink"
 
         /// Picker title. Canonical carries its design-docs marker.
         public var title: String {
@@ -111,6 +112,7 @@ public enum DesignSystem {
             case .canonical: return "Canonical (design docs)"
             case .blushPink: return "Blush Pink"
             case .hotPink: return "Hot Pink"
+            case .lightPink: return "Light Pink"
             }
         }
 
@@ -134,6 +136,8 @@ public enum DesignSystem {
                 return [RGB(0xC2, 0x25, 0x5C), RGB(0xF0, 0x65, 0x95), RGB(0xFF, 0xF7, 0xF9)]
             case .hotPink:
                 return [RGB(0xA6, 0x1E, 0x4D), RGB(0xF7, 0x25, 0x85), RGB(0xFF, 0xF0, 0xF5)]
+            case .lightPink:
+                return [RGB(0xF4, 0x72, 0xA0), RGB(0xF9, 0xA8, 0xD4), RGB(0xFF, 0xF5, 0xF8)]
             }
         }
 
@@ -238,6 +242,23 @@ public enum DesignSystem {
                     fill: RGB(0xF7, 0x25, 0x85),
                     starFill: RGB(0xFF, 0x8F, 0xAB),
                     starEmpty: RGB(0x8E, 0x2A, 0x5B))
+            case .lightPink:
+                // Accent deviation (deliberate, LLD): accent is #f9a8d4
+                // (the child background), following all 7 existing
+                // palettes, NOT the mockup class's --accent (#f472a0).
+                return Tokens(
+                    background: RGB(0xFF, 0xF5, 0xF8),
+                    headerBackground: RGB(0xF4, 0x72, 0xA0),
+                    headerText: RGB(0xFF, 0xFF, 0xFF),
+                    tutorBackground: RGB(0xFD, 0xE7, 0xEF),
+                    tutorText: RGB(0x7A, 0x21, 0x48),
+                    childBackground: RGB(0xF9, 0xA8, 0xD4),
+                    childText: RGB(0x7A, 0x21, 0x48),
+                    accent: RGB(0xF9, 0xA8, 0xD4),
+                    track: RGB(0xF9, 0xD6, 0xE2),
+                    fill: RGB(0xF9, 0xA8, 0xD4),
+                    starFill: RGB(0xF4, 0x72, 0xA0),
+                    starEmpty: RGB(0xF3, 0xC2, 0xD3))
             }
         }
     }
@@ -277,7 +298,7 @@ public enum DesignSystem {
 
     // MARK: - Theme
 
-    /// One of the 14 switchable themes: a palette plus a shape.
+    /// One of the 16 switchable themes: a palette plus a shape.
     public struct Theme: Identifiable, Equatable, Sendable {
         public var palette: Palette
         public var shape: Shape
@@ -319,28 +340,31 @@ public enum DesignSystem {
 
         /// Text rendered ON the child bubble (fix-3 item B): the
         /// prescribed childText where it already meets 4.5:1 (Calm
-        /// Forest 5.00, Sky Blueprint 4.63, Canonical 5.02), else
-        /// darkOverlayText (Warm Playful 6.75, System Native 4.70,
-        /// Blush Pink 6.30, Hot Pink 5.00). Prescribed tokens stay
-        /// verbatim; this is an explicit per-palette selection, pinned
-        /// analytically in ThemeStoreTests.
+        /// Forest 5.00, Sky Blueprint 4.63, Canonical 5.02, Light
+        /// Pink 5.41), else darkOverlayText (Warm Playful 6.75,
+        /// System Native 4.70, Blush Pink 6.30, Hot Pink 5.00).
+        /// Prescribed tokens stay verbatim; this is an explicit
+        /// per-palette selection, pinned analytically in
+        /// ThemeStoreTests.
         public var childTextOnChildBackground: RGB {
             switch palette {
             case .warmPlayful, .systemNative, .blushPink, .hotPink:
                 return Self.darkOverlayText
-            case .calmForest, .skyBlueprint, .canonical:
+            case .calmForest, .skyBlueprint, .canonical, .lightPink:
                 return tokens.childText
             }
         }
 
         /// Text rendered ON the header strip (fix-3 item B): the
         /// prescribed headerText everywhere except Warm Playful
-        /// (2.80), which takes darkOverlayText (6.75). All 7 header
-        /// pairs computed; only Warm Playful falls below 4.5:1
-        /// (others 5.02-16.92). Pinned in ThemeStoreTests.
+        /// (2.80) and Light Pink (2.71), which take darkOverlayText
+        /// (6.75 and 6.98). All 8 header pairs computed; only Warm
+        /// Playful and Light Pink fall below 4.5:1 with the
+        /// prescribed token (others 5.02-16.92). Pinned in
+        /// ThemeStoreTests.
         public var headerTextOnHeaderBackground: RGB {
             switch palette {
-            case .warmPlayful:
+            case .warmPlayful, .lightPink:
                 return Self.darkOverlayText
             case .calmForest, .skyBlueprint, .systemNative, .canonical, .blushPink, .hotPink:
                 return tokens.headerText
@@ -348,7 +372,7 @@ public enum DesignSystem {
         }
     }
 
-    /// All 14 themes in picker order: the 7 palettes, rounded then
+    /// All 16 themes in picker order: the 8 palettes, rounded then
     /// sharp within each palette.
     public static let allThemes: [Theme] = Palette.allCases.flatMap { palette in
         Shape.allCases.map { Theme(palette: palette, shape: $0) }
