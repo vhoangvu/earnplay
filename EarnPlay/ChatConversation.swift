@@ -133,7 +133,7 @@ enum ChildTextSanitizer {
 //
 // Colors and radii come from the switchable `DesignSystem` theme in
 // EarnPlayCore (SSOT); no hardcoded color literal may live in this
-// target. The view renders `theme` (default Canonical rounded): callers
+// target. The view renders `theme` (default Light Pink rounded): callers
 // pass the app ThemeStore's current theme for live switching.
 
 // MARK: - View model (no behaviour logic)

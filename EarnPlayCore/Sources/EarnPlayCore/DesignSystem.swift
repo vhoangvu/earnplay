@@ -378,9 +378,9 @@ public enum DesignSystem {
         Shape.allCases.map { Theme(palette: palette, shape: $0) }
     }
 
-    /// The default theme: Canonical rounded, the docs palette with the
-    /// historical card/button radii, so today's screenshots still match.
-    public static let defaultTheme = Theme(palette: .canonical, shape: .rounded)
+    /// The default theme: Light Pink rounded (issue #81), the owner-
+    /// picked palette with the historical rounded card/button radii.
+    public static let defaultTheme = Theme(palette: .lightPink, shape: .rounded)
 
     /// Resolves a persisted id, or nil for unknown ids (the store then
     /// falls back to `defaultTheme`; known ids never fall back).
@@ -393,7 +393,7 @@ public enum DesignSystem {
 ///
 /// Backed by the app's own `UserDefaults.standard`: the child and
 /// admin apps share no defaults, so each persists its own selection
-/// under the same key. Defaults to Canonical rounded.
+/// under the same key. Defaults to Light Pink rounded.
 @MainActor
 public final class ThemeStore: ObservableObject {
     public static let selectionDefaultsKey = "earnplay.theme.selection.v1"

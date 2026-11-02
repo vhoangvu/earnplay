@@ -120,7 +120,7 @@ struct SimulatedShieldCoverHost: View {
     @ObservedObject var flow: SimulatedShieldFlow
     /// The app's current theme, forwarded to the presented shield so
     /// a theme switch re-renders it (fix-4 item 7). Defaults to
-    /// Canonical for previews.
+    /// the default theme for previews.
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     var body: some View {
@@ -155,7 +155,7 @@ struct SimulatedShieldDemoView: View {
     @StateObject private var demo = SimulatedShieldDemoState()
     @AppStorage(SimulatedShieldMode.forceUserDefaultsKey) private var forceSimulated = false
     /// The app's current theme, forwarded through the cover host to
-    /// the shield (fix-4 item 7). Defaults to Canonical for previews.
+    /// the shield (fix-4 item 7). Defaults to the default theme for previews.
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
 
     private var simulatedOn: Bool { SimulatedShieldMode.isForced() }

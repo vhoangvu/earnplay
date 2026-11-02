@@ -1,9 +1,9 @@
 import XCTest
 @testable import EarnPlayCore
 
-/// T7.8 theme-system tests: the store defaults to Canonical, a
-/// selection persists across relaunch, and every theme provides a
-/// complete token set with no fallback.
+/// T7.8 theme-system tests: the store defaults to Light Pink
+/// rounded (issue #81), a selection persists across relaunch, and
+/// every theme provides a complete token set with no fallback.
 @MainActor
 final class ThemeStoreTests: XCTestCase {
     private nonisolated(unsafe) var suiteName: String!
@@ -23,12 +23,12 @@ final class ThemeStoreTests: XCTestCase {
 
     // MARK: - Default
 
-    func testDefaultIsCanonicalRounded() {
+    func testDefaultIsLightPinkRounded() {
         let store = ThemeStore(defaults: defaults)
-        XCTAssertEqual(store.theme.id, "canonical-rounded")
-        XCTAssertEqual(store.theme.displayName, "Canonical (design docs), rounded")
+        XCTAssertEqual(store.theme.id, "light-pink-rounded")
+        XCTAssertEqual(store.theme.displayName, "Light Pink, rounded")
         XCTAssertEqual(store.theme, DesignSystem.defaultTheme)
-        XCTAssertEqual(store.theme.palette, .canonical)
+        XCTAssertEqual(store.theme.palette, .lightPink)
         XCTAssertEqual(store.theme.shape, .rounded)
     }
 

@@ -4,7 +4,7 @@ import XCTest
 /// list all 16 theme names, switching re-renders, and relaunch keeps
 /// the selection.
 ///
-/// State: each test normalizes its app to Canonical rounded on entry
+/// State: each test normalizes its app to Light Pink rounded on entry
 /// (tapping the row when a previous run persisted another selection),
 /// so reruns on a dirty simulator still exercise switch + persist;
 /// the fresh-install default is asserted only when already selected.
@@ -76,10 +76,10 @@ final class ThemePickerUITests: WalkthroughTestCase {
         )
         assertAll16Rows(app, label: "ThemePicker-Child")
 
-        // Normalize to Canonical rounded (fresh sims already select it,
+        // Normalize to Light Pink rounded (fresh sims already select it,
         // which asserts the default; reruns tap it explicitly).
         normalizeSelection(app, label: "ThemePicker-Child")
-        assertSelected(app, id: "canonical-rounded", label: "ThemePicker-Child")
+        assertSelected(app, id: "light-pink-rounded", label: "ThemePicker-Child")
 
         // Switch: tapping Hot Pink sharp re-renders (preview label +
         // row values flip to the new selection).
@@ -131,7 +131,7 @@ final class ThemePickerUITests: WalkthroughTestCase {
         assertAll16Rows(app, label: "ThemePicker-Admin")
 
         normalizeSelection(app, label: "ThemePicker-Admin")
-        assertSelected(app, id: "canonical-rounded", label: "ThemePicker-Admin")
+        assertSelected(app, id: "light-pink-rounded", label: "ThemePicker-Admin")
 
         // Switch to a different theme than the child leg, proving the
         // apps persist their own selections independently.
@@ -176,23 +176,23 @@ final class ThemePickerUITests: WalkthroughTestCase {
         }
     }
 
-    /// Normalizes the selection to Canonical rounded. On a fresh
+    /// Normalizes the selection to Light Pink rounded. On a fresh
     /// install it is already selected (asserting the default); on a
     /// rerun the persisted row is tapped back explicitly.
     private func normalizeSelection(_ app: XCUIApplication, label: String) {
-        let canonical = app.descendants(matching: .any)["themeRow_canonical-rounded"].firstMatch
+        let defaultRow = app.descendants(matching: .any)["themeRow_light-pink-rounded"].firstMatch
         XCTAssertTrue(
-            canonical.waitForExistence(timeout: 10),
-            "\(label): canonical-rounded row is missing"
+            defaultRow.waitForExistence(timeout: 10),
+            "\(label): light-pink-rounded row is missing"
         )
-        if (canonical.value as? String) != "selected" {
-            NSLog("THEME-PICKER %@: normalizing a persisted selection back to Canonical rounded", label)
-            scrollIntoView(canonical, in: app)
-            canonical.tap()
+        if (defaultRow.value as? String) != "selected" {
+            NSLog("THEME-PICKER %@: normalizing a persisted selection back to Light Pink rounded", label)
+            scrollIntoView(defaultRow, in: app)
+            defaultRow.tap()
         }
         XCTAssertEqual(
-            canonical.value as? String, "selected",
-            "\(label): Canonical (design docs), rounded is not the selected theme"
+            defaultRow.value as? String, "selected",
+            "\(label): Light Pink, rounded is not the selected theme"
         )
     }
 
