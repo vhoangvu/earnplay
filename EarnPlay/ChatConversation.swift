@@ -583,10 +583,14 @@ struct ChatConversationView: View {
                         // The old accent label fell to 2.40:1 in Warm Playful.
                         Label("Hint", systemImage: "lightbulb")
                             .foregroundStyle(theme.tokens.tutorText.color)
-                            .frame(minHeight: 44)
                     }
                     .buttonStyle(.bordered)
                     .tint(theme.tokens.accent.color)
+                    // Issue #79: one shared button-level height rule with
+                    // Send below (44pt touch target); no minimum inside
+                    // the label, so the style padding cannot stack on it.
+                    // Rendered pill residual (~1.67pt) accepted per #79.
+                    .frame(minHeight: 44)
                     .accessibilityIdentifier("chatHintButton")
 
                     Spacer()
