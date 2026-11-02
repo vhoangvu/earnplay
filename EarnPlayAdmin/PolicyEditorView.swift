@@ -11,12 +11,27 @@ import EarnPlayCore
 /// persists the admin's copy, and queues the `PolicyUpdate` for T4.6
 /// sync; the version line shows the increment immediately.
 struct PolicyEditorView: View {
+    /// The admin app's current theme, passed from the app root (same
+    /// pattern as `DashboardView`) so this page follows the
+    /// Version-tab picker. Defaults to the default theme for previews.
+    /// Row text and cell backgrounds stay adaptive system: fixed theme
+    /// inks on system cells would wash out in Dark Mode (the dashboard
+    /// cards pair theme text with fixed light fills for the same
+    /// reason). The theme shows in the control tint, the Save chrome,
+    /// and the button radius below.
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     /// Finding 7: invoked after a successful save so the app-scope
     /// sync service flushes the queued policy immediately.
     var onPolicySaved: (() -> Void)? = nil
     @State private var store = PolicyStore()
     @State private var queue = PolicyUpdateQueue()
     @State private var state = PolicyEditorState()
+
+    init(theme: DesignSystem.Theme = DesignSystem.defaultTheme,
+         onPolicySaved: (() -> Void)? = nil) {
+        self.theme = theme
+        self.onPolicySaved = onPolicySaved
+    }
 
     var body: some View {
         NavigationStack {
@@ -44,6 +59,9 @@ struct PolicyEditorView: View {
                 movementSection
                 saveSection
             }
+            // Steppers, toggles, and row buttons take the theme accent
+            // instead of system blue, in both appearances.
+            .tint(theme.tokens.accent.color)
             .navigationTitle("Policy Editor")
             .task { reload() }
         }
@@ -234,7 +252,14 @@ struct PolicyEditorView: View {
 
     private var saveSection: some View {
         Section {
+            // Primary action on the accent chrome: the label takes the
+            // resolved readable ink (the chat Send pattern), and the
+            // chrome takes the theme's button radius.
             Button("Save (creates version \(state.baseVersion + 1))") { save() }
+                .buttonStyle(.borderedProminent)
+                .tint(theme.tokens.accent.color)
+                .foregroundStyle(theme.childTextOnChildBackground.color)
+                .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
                 .disabled(!state.isLoaded)
                 // Stable handle for the issue #71 walkthrough; the label
                 // carries the dynamic next version. No behavior change.
