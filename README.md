@@ -53,7 +53,10 @@ xcodebuild build -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPho
 
 For a device build, TestFlight, or App Store upload, give each app
 target its own ID from your own Developer account (the test targets'
-IDs do not matter for distribution). The reliable way is to set the
+IDs do not matter for distribution). Signing is a prerequisite for
+archiving: sign into Xcode with that Apple ID and let automatic
+signing create the certificate and provisioning profiles — without a
+signing identity, a device archive fails. The reliable way is to set the
 IDs in `project.yml` (one per target — it is the source of truth and
 the generated `.xcodeproj` is not committed) and regenerate.
 
