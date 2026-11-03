@@ -56,7 +56,16 @@ target its own ID from your own Developer account (the test targets'
 IDs do not matter for distribution). Signing is a prerequisite for
 archiving: sign into Xcode with that Apple ID and let automatic
 signing create the certificate and provisioning profiles — without a
-signing identity, a device archive fails. The reliable way is to set the
+signing identity, a device archive fails. Persist the team in
+`project.yml` so regenerating does not wipe it: add these two lines
+to each app target's `settings: base:` block (next to
+`PRODUCT_BUNDLE_IDENTIFIER`), with your Team ID from your Apple
+Developer account (Membership details, 10 characters):
+
+```yaml
+DEVELOPMENT_TEAM: ABCDE12345
+CODE_SIGN_STYLE: Automatic
+``` The reliable way is to set the
 IDs in `project.yml` (one per target — it is the source of truth and
 the generated `.xcodeproj` is not committed) and regenerate.
 
@@ -67,7 +76,7 @@ would stamp both with the same ID and archive both products. The
 admin app already has its own scheme, so archive it directly:
 
 ```sh
-xcodebuild archive -scheme EarnPlayAdmin \
+xcodebuild archive -scheme EarnPlayAdmin -allowProvisioningUpdates \
   PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay.admin
 ```
 
@@ -84,7 +93,7 @@ The child app has no child-only scheme yet, so add one to
 
 ```sh
 xcodegen generate
-xcodebuild archive -scheme EarnPlayDistribution \
+xcodebuild archive -scheme EarnPlayDistribution -allowProvisioningUpdates \
   PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
 ```
 
