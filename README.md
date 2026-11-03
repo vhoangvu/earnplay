@@ -51,21 +51,23 @@ xcodegen generate
 xcodebuild build -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 16'
 ```
 
-For a device build, TestFlight, or App Store upload, override the app
-targets' IDs on the archive command with IDs from your own Developer
-account (the test targets' IDs do not matter for distribution).
-Archive each app scheme separately, so one override per command is
-enough:
+For a device build, TestFlight, or App Store upload, give each app
+target its own ID from your own Developer account (the test targets'
+IDs do not matter for distribution). The reliable way is to set the
+IDs in `project.yml` (one per target — it is the source of truth and
+the generated `.xcodeproj` is not committed) and regenerate.
+
+If you prefer a command-line override, archive one target at a time.
+Do NOT pass a single `PRODUCT_BUNDLE_IDENTIFIER` override to
+`-scheme EarnPlay`: that scheme builds both apps, so one override
+would stamp both with the same ID and archive both products:
 
 ```sh
-xcodebuild archive -scheme EarnPlay \
+xcodebuild archive -target EarnPlay \
   PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
-xcodebuild archive -scheme EarnPlayAdmin \
+xcodebuild archive -target EarnPlayAdmin \
   PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay.admin
 ```
-
-You can also edit the IDs directly in `project.yml` (the source of
-truth — the generated `.xcodeproj` is not committed) and regenerate.
 
 Before uploading anything, verify the built app actually carries your
 ID — an upload under the wrong ID lands under the wrong app record:
@@ -76,10 +78,10 @@ ID — an upload under the wrong ID lands under the wrong app record:
 ```
 
 One more place to keep in sync: the UI tests launch the admin app by
-its literal bundle ID (`EarnPlayUITests/UXShotUITests.swift`,
-`EarnPlayUITests/WalkthroughSupport.swift`). If you change the admin
-ID, update those references to match, or the admin UI tests will fail
-to launch the app.
+its literal bundle ID (`EarnPlayUITests/WalkthroughSupport.swift:22`,
+where `adminBundleID` is defined, used at line 66). If you change the
+admin ID, update that constant to match, or the admin UI tests will
+fail to launch the app.
 
 ## CI (Route 1)
 
