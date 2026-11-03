@@ -37,10 +37,49 @@ These values must match Xcode's Bundle Identifier fields exactly
 | EarnPlayAdmin (admin app) | `com.vhoangvu.earnplay.admin` |
 | EarnPlayTests (unit tests) | `com.vhoangvu.earnplay.tests` |
 
-> **Placeholder — needs Vu's decision before any signing step:**
-> the `com.vhoangvu` prefix is a placeholder reverse-DNS prefix, not yet
-> confirmed against the Apple Developer account. Do not use these IDs for
-> signing, provisioning, or distribution until Vu confirms the real prefix.
+> These are the maintainer's local IDs. If you build from this source
+> with your own Apple Developer account, use your own bundle IDs
+> (see below) — do not sign or distribute with the IDs above.
+
+## Building with your own bundle ID
+
+Simulator builds need no signing and work with whatever ID is in
+`project.yml` — just generate and build:
+
+```sh
+xcodegen generate
+xcodebuild build -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+For a device build, TestFlight, or App Store upload, override the app
+targets' IDs on the archive command with IDs from your own Developer
+account (the test targets' IDs do not matter for distribution).
+Archive each app scheme separately, so one override per command is
+enough:
+
+```sh
+xcodebuild archive -scheme EarnPlay \
+  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
+xcodebuild archive -scheme EarnPlayAdmin \
+  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay.admin
+```
+
+You can also edit the IDs directly in `project.yml` (the source of
+truth — the generated `.xcodeproj` is not committed) and regenerate.
+
+Before uploading anything, verify the built app actually carries your
+ID — an upload under the wrong ID lands under the wrong app record:
+
+```sh
+/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" \
+  path/to.xcarchive/Products/Applications/EarnPlay.app/Info.plist
+```
+
+One more place to keep in sync: the UI tests launch the admin app by
+its literal bundle ID (`EarnPlayUITests/UXShotUITests.swift`,
+`EarnPlayUITests/WalkthroughSupport.swift`). If you change the admin
+ID, update those references to match, or the admin UI tests will fail
+to launch the app.
 
 ## CI (Route 1)
 
