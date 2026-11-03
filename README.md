@@ -57,16 +57,32 @@ IDs do not matter for distribution). The reliable way is to set the
 IDs in `project.yml` (one per target — it is the source of truth and
 the generated `.xcodeproj` is not committed) and regenerate.
 
-If you prefer a command-line override, archive one target at a time.
-Do NOT pass a single `PRODUCT_BUNDLE_IDENTIFIER` override to
-`-scheme EarnPlay`: that scheme builds both apps, so one override
-would stamp both with the same ID and archive both products:
+If you prefer a command-line override, archive one single-app scheme
+at a time. Do NOT pass a single `PRODUCT_BUNDLE_IDENTIFIER` override
+to `-scheme EarnPlay`: that scheme builds both apps, so one override
+would stamp both with the same ID and archive both products. The
+admin app already has its own scheme, so archive it directly:
 
 ```sh
-xcodebuild archive -target EarnPlay \
-  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
-xcodebuild archive -target EarnPlayAdmin \
+xcodebuild archive -scheme EarnPlayAdmin \
   PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay.admin
+```
+
+The child app has no child-only scheme yet, so add one to
+`project.yml` under `schemes:` (alongside `EarnPlay` and
+`EarnPlayAdmin`), regenerate, then archive it:
+
+```yaml
+  EarnPlayDistribution:
+    build:
+      targets:
+        EarnPlay: all
+```
+
+```sh
+xcodegen generate
+xcodebuild archive -scheme EarnPlayDistribution \
+  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
 ```
 
 Before uploading anything, verify the built app actually carries your
