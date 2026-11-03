@@ -65,7 +65,9 @@ Developer account (Membership details, 10 characters):
 ```yaml
 DEVELOPMENT_TEAM: ABCDE12345
 CODE_SIGN_STYLE: Automatic
-``` The reliable way is to set the
+```
+
+The reliable way is to set the
 IDs in `project.yml` (one per target — it is the source of truth and
 the generated `.xcodeproj` is not committed) and regenerate.
 
