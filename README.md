@@ -37,10 +37,81 @@ These values must match Xcode's Bundle Identifier fields exactly
 | EarnPlayAdmin (admin app) | `com.vhoangvu.earnplay.admin` |
 | EarnPlayTests (unit tests) | `com.vhoangvu.earnplay.tests` |
 
-> **Placeholder — needs Vu's decision before any signing step:**
-> the `com.vhoangvu` prefix is a placeholder reverse-DNS prefix, not yet
-> confirmed against the Apple Developer account. Do not use these IDs for
-> signing, provisioning, or distribution until Vu confirms the real prefix.
+> These are the maintainer's local IDs. If you build from this source
+> with your own Apple Developer account, use your own bundle IDs
+> (see below) — do not sign or distribute with the IDs above.
+
+## Building with your own bundle ID
+
+Simulator builds need no signing and work with whatever ID is in
+`project.yml` — just generate and build:
+
+```sh
+xcodegen generate
+xcodebuild build -scheme EarnPlay -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+For a device build, TestFlight, or App Store upload, give each app
+target its own ID from your own Developer account (the test targets'
+IDs do not matter for distribution). Signing is a prerequisite for
+archiving: sign into Xcode with that Apple ID and let automatic
+signing create the certificate and provisioning profiles — without a
+signing identity, a device archive fails. Persist the team in
+`project.yml` so regenerating does not wipe it: add these two lines
+to each app target's `settings: base:` block (next to
+`PRODUCT_BUNDLE_IDENTIFIER`), with your Team ID from your Apple
+Developer account (Membership details, 10 characters):
+
+```yaml
+DEVELOPMENT_TEAM: ABCDE12345
+CODE_SIGN_STYLE: Automatic
+```
+
+The reliable way is to set the
+IDs in `project.yml` (one per target — it is the source of truth and
+the generated `.xcodeproj` is not committed) and regenerate.
+
+If you prefer a command-line override, archive one single-app scheme
+at a time. Do NOT pass a single `PRODUCT_BUNDLE_IDENTIFIER` override
+to `-scheme EarnPlay`: that scheme builds both apps, so one override
+would stamp both with the same ID and archive both products. The
+admin app already has its own scheme, so archive it directly:
+
+```sh
+xcodebuild archive -scheme EarnPlayAdmin -allowProvisioningUpdates \
+  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay.admin
+```
+
+The child app has no child-only scheme yet, so add one to
+`project.yml` under `schemes:` (alongside `EarnPlay` and
+`EarnPlayAdmin`), regenerate, then archive it:
+
+```yaml
+  EarnPlayDistribution:
+    build:
+      targets:
+        EarnPlay: all
+```
+
+```sh
+xcodegen generate
+xcodebuild archive -scheme EarnPlayDistribution -allowProvisioningUpdates \
+  PRODUCT_BUNDLE_IDENTIFIER=com.example.earnplay
+```
+
+Before uploading anything, verify the built app actually carries your
+ID — an upload under the wrong ID lands under the wrong app record:
+
+```sh
+/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" \
+  path/to.xcarchive/Products/Applications/EarnPlay.app/Info.plist
+```
+
+One more place to keep in sync: the UI tests launch the admin app by
+its literal bundle ID (`EarnPlayUITests/WalkthroughSupport.swift:22`,
+where `adminBundleID` is defined, used at line 66). If you change the
+admin ID, update that constant to match, or the admin UI tests will
+fail to launch the app.
 
 ## CI (Route 1)
 
