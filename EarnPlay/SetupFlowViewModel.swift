@@ -405,6 +405,15 @@ public final class SetupFlowViewModel: ObservableObject {
     private func refresh() {
         step = flow.currentStep
         if step == .complete {
+            // Reauthorization restores completion with a newly staged
+            // enumeration (issue #87 fix round 2): sync the simulated
+            // picks before the summary rebuilds, so the completion
+            // screen and the installed shield panel list the same demo
+            // apps the parent picked instead of an empty set behind
+            // still-active shields. No-op when nothing is staged; on a
+            // normal commit the staged enumeration already matches the
+            // in-progress picks.
+            restoreSimulatedPicksFromStagedEnumeration()
             rebuildSummary()
         } else {
             summary = nil
@@ -543,23 +552,33 @@ public final class SetupFlowViewModel: ObservableObject {
         pickedCategories = categories
         selection.applicationTokens = Set(mapping.applicationTokens)
         selection.categoryTokens = Set(mapping.categoryTokens)
-        // Simulated picks restore from the staged enumeration, which a
-        // relaunch sets only for a committed setup (where the stable
-        // catalog ids round-trip through the persisted enumeration): the
-        // completion screen and the installed shield panel list the same
-        // demo apps the parent picked. A mid-flow relaunch stages no
-        // enumeration, so in-progress simulated picks are re-picked
-        // (their restrictive shields persist regardless).
-        if let staged = flow.pendingEnumeration {
-            let stagedAppIDs = Set(staged.apps.map(\.app.id))
-            simulatedAppIDs = Set(
-                SimulatedSetupCatalog.apps.map(\.id).filter(stagedAppIDs.contains)
-            )
-            let stagedCategoryIDs = Set(staged.categories.map(\.id))
-            simulatedCategoryIDs = Set(
-                SimulatedSetupCatalog.categories.map(\.id).filter(stagedCategoryIDs.contains)
-            )
-        }
+        restoreSimulatedPicksFromStagedEnumeration()
+    }
+
+    /// Restores the simulated picks from the staged enumeration, if any.
+    ///
+    /// A relaunch stages an enumeration only for a committed setup
+    /// (where the stable catalog ids round-trip through the persisted
+    /// enumeration): the completion screen and the installed shield
+    /// panel list the same demo apps the parent picked. A mid-flow
+    /// relaunch stages no enumeration, so in-progress simulated picks
+    /// are re-picked (their restrictive shields persist regardless).
+    /// Reauthorization is the same shape mid-lifecycle: the pending
+    /// committed enumeration becomes staged only on re-grant, so
+    /// `refresh()` re-runs this on every transition to `.complete`
+    /// (issue #87 fix round 2) — before the summary rebuild — and a
+    /// reauthorized demo matches the user's selections instead of an
+    /// empty pick set behind still-active shields.
+    private func restoreSimulatedPicksFromStagedEnumeration() {
+        guard let staged = flow.pendingEnumeration else { return }
+        let stagedAppIDs = Set(staged.apps.map(\.app.id))
+        simulatedAppIDs = Set(
+            SimulatedSetupCatalog.apps.map(\.id).filter(stagedAppIDs.contains)
+        )
+        let stagedCategoryIDs = Set(staged.categories.map(\.id))
+        simulatedCategoryIDs = Set(
+            SimulatedSetupCatalog.categories.map(\.id).filter(stagedCategoryIDs.contains)
+        )
     }
 
     // MARK: - Installed simulated shields (main flow)
@@ -593,8 +612,9 @@ public final class SetupFlowViewModel: ObservableObject {
     /// simulated backend is installed (see
     /// `supportsInstalledSimulatedShields`). The decision logger,
     /// unlock duration, and scorer default to production values (the
-    /// policy's practice minutes, a fresh per-session scorer);
-    /// callers — tests — may inject their own.
+    /// policy's practice minutes, a fresh per-session scorer over the
+    /// installed policy's effort floor); callers — tests — may inject
+    /// their own, and an explicitly passed scorer still wins.
     public func makeInstalledSimulatedShieldFlow(
         for app: AppRef,
         category: AppCategoryRef? = nil,
@@ -603,13 +623,14 @@ public final class SetupFlowViewModel: ObservableObject {
         scorer: EffortScorer? = nil
     ) -> SimulatedShieldFlow? {
         guard let backend = backend as? SimulatedShieldBackend else { return nil }
-        let minutes = policyStore.currentPolicy.unlockDurations.practiceMinutes
+        let policy = policyStore.currentPolicy
+        let minutes = policy.unlockDurations.practiceMinutes
         return SimulatedShieldFlow(
             manager: flow.installedShieldManager,
             backend: backend,
             app: app,
             category: category,
-            scorer: scorer ?? EffortScorer(),
+            scorer: scorer ?? EffortScorer(floorSettings: policy.effortFloorSettings),
             recorder: EffortSessionRecorder(startedAt: Date()),
             unlockDuration: unlockDuration ?? TimeInterval(minutes) * 60,
             isSimulatedMode: true,
@@ -620,14 +641,33 @@ public final class SetupFlowViewModel: ObservableObject {
         )
     }
 
+    /// True when the installed policy blocks `app` with no challenge
+    /// offered (issue #87 fix round 2): the default Blocked choice and
+    /// never-unlockable overrides alike. `isNeverUnlockable` already
+    /// excludes always-allowed apps, so an allowed app never reports
+    /// blocked here — it keeps the host path (which renders unlocked,
+    /// never a trap). The installed shield panel branches off this so
+    /// a blocked target shows an informational status instead of a
+    /// challenge the manager would refuse regardless of effort.
+    public func isInstalledShieldBlocked(_ app: AppRef) -> Bool {
+        policyStore.currentPolicy.isNeverUnlockable(app)
+    }
+
     /// The cached installed-composition flow for one app, created on
-    /// first use. A cache hit returns the flow untouched; presentation
-    /// refresh happens in `selectInstalledShieldApp(_:)`, never during
-    /// a view-body read.
+    /// first use. Returns nil for blocked targets (see
+    /// `isInstalledShieldBlocked(_:)`), so the panel never presents a
+    /// non-dismissible challenge the manager would refuse; the
+    /// challenge path for unlockable targets is unchanged. A cache
+    /// hit returns the flow untouched; presentation refresh happens
+    /// in `selectInstalledShieldApp(_:)`, never during a view-body
+    /// read. The blocked gate runs before the cache lookup so a
+    /// policy change that blocks a previously unlockable app stops
+    /// presenting its cached challenge.
     public func installedShieldFlow(
         for app: AppRef,
         category: AppCategoryRef? = nil
     ) -> SimulatedShieldFlow? {
+        if isInstalledShieldBlocked(app) { return nil }
         if let existing = installedShieldFlows[app.id] { return existing }
         guard let flow = makeInstalledSimulatedShieldFlow(for: app, category: category) else {
             return nil

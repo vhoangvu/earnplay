@@ -568,6 +568,12 @@ public struct SetupCompleteView: View {
 /// the completion screen — never the dead preview harness. Shown only
 /// when a simulated backend is installed (forced mode); the honesty
 /// badge above it is retained.
+///
+/// Fix round 2: blocked targets (the default Blocked choice, including
+/// never-unlockable overrides) show an informational status instead of
+/// the challenge host — the manager refuses their unlocks regardless
+/// of effort, so presenting the full-screen challenge would trap the
+/// tester. The challenge path for unlockable targets is unchanged.
 private struct InstalledShieldPanel: View {
     @ObservedObject var viewModel: SetupFlowViewModel
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
@@ -584,9 +590,8 @@ private struct InstalledShieldPanel: View {
                 .foregroundStyle(.secondary)
             ForEach(viewModel.pickedApps) { app in
                 Button {
-                    if viewModel.selectInstalledShieldApp(app.id) != nil {
-                        activeShieldAppID = app.id
-                    }
+                    activeShieldAppID = app.id
+                    _ = viewModel.selectInstalledShieldApp(app.id)
                 } label: {
                     HStack {
                         Text("Simulated shield:")
@@ -594,22 +599,52 @@ private struct InstalledShieldPanel: View {
                     }
                 }
                 .accessibilityIdentifier("installedShieldEntry-\(app.id)")
+                if viewModel.isInstalledShieldBlocked(app.ref) {
+                    InstalledBlockedStatusLabel(appID: app.id)
+                }
             }
             ForEach(viewModel.pickedSimulatedApps) { app in
                 Button("Simulated shield: \(app.name)") {
-                    if viewModel.selectInstalledShieldApp(app.id) != nil {
-                        activeShieldAppID = app.id
-                    }
+                    activeShieldAppID = app.id
+                    _ = viewModel.selectInstalledShieldApp(app.id)
                 }
                 .accessibilityIdentifier("installedShieldEntry-\(app.id)")
+                if viewModel.isInstalledShieldBlocked(app.ref) {
+                    InstalledBlockedStatusLabel(appID: app.id)
+                }
             }
             if let id = activeShieldAppID,
-                let target = viewModel.installedShieldTarget(for: id),
-                let flow = viewModel.installedShieldFlow(for: target.ref, category: target.category)
+                let target = viewModel.installedShieldTarget(for: id)
             {
-                SimulatedShieldCoverHost(flow: flow, theme: theme)
+                if viewModel.isInstalledShieldBlocked(target.ref) {
+                    InstalledBlockedStatusLabel(appID: id, selected: true)
+                } else if let flow = viewModel.installedShieldFlow(
+                    for: target.ref, category: target.category
+                ) {
+                    SimulatedShieldCoverHost(flow: flow, theme: theme)
+                }
             }
         }
+    }
+}
+
+/// Informational blocked status for an installed shield target with no
+/// challenge offered (issue #87 fix round 2): the default Blocked
+/// choice and never-unlockable overrides alike. Rendered inline
+/// per-row and in the selected detail in place of the challenge host,
+/// so a blocked target never opens a non-dismissible challenge.
+/// Internal so app tests pin the copy without driving panel taps.
+struct InstalledBlockedStatusLabel: View {
+    let appID: String
+    var selected: Bool = false
+
+    var body: some View {
+        Text("Blocked (simulated) — no challenge offered. It stays shielded.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier(
+                selected ? "installedBlockedStatusSelected-\(appID)" : "installedBlockedStatus-\(appID)"
+            )
     }
 }
 
