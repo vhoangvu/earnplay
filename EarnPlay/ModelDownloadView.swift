@@ -13,49 +13,94 @@ struct ModelDownloadView: View {
     @ObservedObject var viewModel: ModelDownloadViewModel
     @ObservedObject var themes: ThemeStore = ThemeStore()
 
+    /// The shared app theme, via the store this view already receives
+    /// (the same object as the About picker's, so a switch re-renders
+    /// this page too). No color literal lives here: the download-phase
+    /// surfaces below read theme tokens, like the chat page, while the
+    /// embedded About/picker subtree stays on the adaptive system
+    /// background its inks assume (see body).
+    private var theme: DesignSystem.Theme { themes.theme }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Download tutor model")
-                    .font(.largeTitle.bold())
-                Text("One-time download of the on-device tutor (~800 MB). " +
-                     "Wi-Fi only — this never uses cellular data. " +
-                     "Afterward the app works fully offline.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Divider()
-                switch viewModel.phase {
-                case .checking:
-                    ProgressView("Checking for model…")
-                case .needsDownload:
-                    Button("Download over Wi-Fi") {
-                        viewModel.startDownload()
+            VStack(alignment: .leading, spacing: 0) {
+                // Download-phase content on the fixed light theme
+                // surface: every ink here is theme-paired (tutorText,
+                // secondaryOnTheme, the resolved Send-pattern label),
+                // so it reads in both appearances.
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Download tutor model")
+                        .font(.largeTitle.bold())
+                        .foregroundStyle(theme.tokens.tutorText.color)
+                    Text("One-time download of the on-device tutor (~800 MB). " +
+                         "Wi-Fi only — this never uses cellular data. " +
+                         "Afterward the app works fully offline.")
+                        .font(.subheadline)
+                        .foregroundStyle(theme.secondaryOnTheme)
+                    Divider()
+                    switch viewModel.phase {
+                    case .checking:
+                        ProgressView("Checking for model…")
+                            .tint(theme.tokens.fill.color)
+                            .foregroundStyle(theme.tokens.tutorText.color)
+                    case .needsDownload:
+                        Button("Download over Wi-Fi") {
+                            viewModel.startDownload()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(theme.tokens.accent.color)
+                        .foregroundStyle(theme.childTextOnChildBackground.color)
+                    case .downloading(let progress):
+                        ProgressView(value: progress) {
+                            Text("Downloading… \(Int(progress * 100))%")
+                        }
+                        .tint(theme.tokens.fill.color)
+                        .foregroundStyle(theme.tokens.tutorText.color)
+                        Text("Keep the app open until the download finishes.")
+                            .font(.caption)
+                            .foregroundStyle(theme.secondaryOnTheme)
+                    case .failed(let message):
+                        // Semantic red, NOT a theme token: DesignSystem
+                        // carries no error ink, and the failure must read as
+                        // an error in every theme (same as the chore-trade
+                        // grant failure on its themed card).
+                        Text(message)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                        Button("Retry download") {
+                            viewModel.startDownload()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(theme.tokens.accent.color)
+                        .foregroundStyle(theme.childTextOnChildBackground.color)
+                    case .ready:
+                        EmptyView()
                     }
-                    .buttonStyle(.borderedProminent)
-                case .downloading(let progress):
-                    ProgressView(value: progress) {
-                        Text("Downloading… \(Int(progress * 100))%")
-                    }
-                    Text("Keep the app open until the download finishes.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .failed(let message):
-                    Text(message)
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                    Button("Retry download") {
-                        viewModel.startDownload()
-                    }
-                    .buttonStyle(.borderedProminent)
-                case .ready:
-                    EmptyView()
+                    Divider()
                 }
-                Divider()
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.tokens.background.color)
+                // The embedded About/theme-picker subtree sits on the
+                // adaptive system background, NOT the fixed light theme
+                // surface: its inks are adaptive (.primary/.secondary),
+                // which would wash out as light text on near-white in
+                // Dark Mode. This also keeps the picker's documented
+                // "rows sit on system background" assumption (and its
+                // checkmark-contrast fixture) true in every host.
                 AboutView(themes: themes)
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.systemBackground))
             }
-            .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .background(Color(.systemBackground))
+        // Bordered buttons (Download, Retry) take the theme's button
+        // radius (10 rounded / 8 sharp), as in the chat composer. The
+        // About picker's plain rows below are unaffected (default
+        // style reads no border shape).
+        .buttonBorderShape(.roundedRectangle(radius: theme.buttonRadius))
         // Stable handle for the issue #69 UI smoke tests. No behavior change.
         .accessibilityIdentifier("modelDownloadView")
     }

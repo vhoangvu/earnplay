@@ -54,7 +54,7 @@ struct EarnPlayAdminApp: App {
                 DashboardView(controller: syncController, theme: themes.theme)
                     .tabItem { Label("Progress", systemImage: "chart.bar") }
                     .tag(4)
-                PolicyEditorView(onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
+                PolicyEditorView(theme: themes.theme, onPolicySaved: { syncController.service.notifyPolicyEnqueued() })
                     .tabItem { Label("Policy", systemImage: "lock.shield") }
                     .tag(0)
                 SessionsView(controller: syncController)

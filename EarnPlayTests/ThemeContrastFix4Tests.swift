@@ -22,15 +22,19 @@ import EarnPlayCore
 /// System Native, Blush Pink, and Hot Pink. Measured 4.63-6.75.
 ///
 /// Item 7: the demo chain (demo view -> cover host -> shield) carries
-/// the app's theme instead of always rendering Canonical. The UI leg
-/// is unreachable (SimulatedShieldDemoView lives only in
+/// the app's theme instead of always rendering the default. The UI
+/// leg is unreachable (SimulatedShieldDemoView lives only in
 /// ContentView.previewHarnesses, which is dead code per the
 /// WalkthroughChildTests SETUP-COMPLETION note), so this pins
-/// propagation in-process: a host given Hot Pink sharp presents the
-/// shield badge in the Hot Pink track, while the default host keeps
-/// the Canonical track (the control leg, proving the sampler
-/// distinguishes the two themes). Defaults stay defaultTheme for
-/// previews. No token values changed anywhere in fix-4.
+/// propagation in-process: a host given Canonical sharp presents the
+/// shield badge in the Canonical track, while the default host keeps
+/// the Light Pink track (the control leg, proving the sampler
+/// distinguishes the two themes). Issue #81 moved the default from
+/// Canonical to Light Pink, so the picked contrast theme moved from
+/// Hot Pink (whose track is within tolerance of the Light Pink
+/// track) to Canonical (23 apart on red — see the sampler note).
+/// Defaults stay defaultTheme for previews. No token values changed
+/// anywhere in fix-4.
 @MainActor
 final class ThemeContrastFix4Tests: XCTestCase {
     private var directory: URL!
@@ -85,7 +89,7 @@ final class ThemeContrastFix4Tests: XCTestCase {
 
     // MARK: - Item 7: shield theme propagation
 
-    func testShieldThemeDefaultsToCanonicalForPreviews() {
+    func testShieldPreviewsUseDefaultTheme() {
         XCTAssertEqual(SimulatedShieldDemoView().theme, DesignSystem.defaultTheme,
             "demo view must keep the default theme for previews")
         XCTAssertEqual(SimulatedShieldCoverHost(flow: makePresentedFlow()).theme,
@@ -95,7 +99,7 @@ final class ThemeContrastFix4Tests: XCTestCase {
     }
 
     func testShieldChainStoresThePassedTheme() {
-        let picked = DesignSystem.Theme(palette: .hotPink, shape: .sharp)
+        let picked = DesignSystem.Theme(palette: .canonical, shape: .sharp)
         XCTAssertEqual(SimulatedShieldDemoView(theme: picked).theme, picked,
             "demo view must store the passed theme")
         XCTAssertEqual(SimulatedShieldCoverHost(flow: makePresentedFlow(), theme: picked).theme, picked,
@@ -103,36 +107,37 @@ final class ThemeContrastFix4Tests: XCTestCase {
     }
 
     /// The presented shield renders the HOST's theme, not the default:
-    /// Hot Pink sharp through the host paints the badge in the Hot
-    /// Pink track (tens of thousands of badge-fill pixels), and the
-    /// default host still paints Canonical (the control leg, proving
-    /// the sampler distinguishes the two themes). Pre-fix this fails:
-    /// the host constructed the shield without a theme, so both
-    /// renders painted Canonical. The badge UIView itself carries no
-    /// materialized accessibility identifier (covers don't bridge Text
-    /// identifiers to UIViews), so the cover bitmap is classified by
-    /// track color instead. Bounds rationale: badge fill is O(200k)
-    /// pixels (observed 216k/220k) while cross-theme bleed is
-    /// antialiased text edges only (observed 2452/0), so the right
-    /// theme must exceed 100k and the wrong theme must stay under
-    /// 10k — a 10x separation with 2x/4x margins on the observations.
+    /// Canonical sharp through the host paints the badge in the
+    /// Canonical track (tens of thousands of badge-fill pixels), and
+    /// the default host still paints the default (Light Pink) track
+    /// (the control leg, proving the sampler distinguishes the two
+    /// themes). Pre-fix this fails: the host constructed the shield
+    /// without a theme, so both renders painted the default. The
+    /// badge UIView itself carries no materialized accessibility
+    /// identifier (covers don't bridge Text identifiers to UIViews),
+    /// so the cover bitmap is classified by track color instead.
+    /// Bounds rationale: badge fill is O(200k) pixels (observed
+    /// 221k/216k) while cross-theme bleed is antialiased text edges
+    /// only (observed 0/2.7k), so the right theme must exceed 100k
+    /// and the wrong theme must stay under 10k — a 10x separation
+    /// with 2x/3x margins on the observations.
     func testShieldHostPassesThemeToPresentedShield() throws {
-        let picked = DesignSystem.Theme(palette: .hotPink, shape: .sharp)
+        let picked = DesignSystem.Theme(palette: .canonical, shape: .sharp)
         let themed = try XCTUnwrap(renderCoverTrackCounts(theme: picked),
             "themed host: shield cover did not render")
-        print("FIX4-SHIELD themed hotPink=\(themed.hotPink) canonical=\(themed.canonical)")
-        XCTAssertGreaterThan(themed.hotPink, 100_000,
-            "themed host must paint the badge in the Hot Pink track")
-        XCTAssertLessThan(themed.canonical, 10_000,
-            "themed host must NOT paint the Canonical track (canonical=\(themed.canonical))")
+        print("FIX4-SHIELD themed picked=\(themed.picked) defaultTrack=\(themed.defaultTrack)")
+        XCTAssertGreaterThan(themed.picked, 100_000,
+            "themed host must paint the badge in the Canonical track")
+        XCTAssertLessThan(themed.defaultTrack, 10_000,
+            "themed host must NOT paint the default track (defaultTrack=\(themed.defaultTrack))")
 
         let plain = try XCTUnwrap(renderCoverTrackCounts(theme: nil),
             "default host: shield cover did not render")
-        print("FIX4-SHIELD default hotPink=\(plain.hotPink) canonical=\(plain.canonical)")
-        XCTAssertGreaterThan(plain.canonical, 100_000,
-            "default host must paint the badge in the Canonical track")
-        XCTAssertLessThan(plain.hotPink, 10_000,
-            "default host must NOT paint the Hot Pink track (hotPink=\(plain.hotPink))")
+        print("FIX4-SHIELD default picked=\(plain.picked) defaultTrack=\(plain.defaultTrack)")
+        XCTAssertGreaterThan(plain.defaultTrack, 100_000,
+            "default host must paint the badge in the default (Light Pink) track")
+        XCTAssertLessThan(plain.picked, 10_000,
+            "default host must NOT paint the Canonical track (picked=\(plain.picked))")
     }
 
     // MARK: - Helpers
@@ -184,12 +189,19 @@ final class ThemeContrastFix4Tests: XCTestCase {
 
     /// Presents the cover host (nil theme = default init) and counts
     /// badge-track pixels in the presented cover bitmap, split by
-    /// theme: Hot Pink sharp vs Canonical default. Tolerance 16
-    /// clears every flat fill (each track is >16 from the shield
-    /// background and text inks on at least one channel); only
-    /// antialiased text edges bleed across (observed 2452/0), which
-    /// the test's 100k/10k bounds absorb with margin.
-    private func renderCoverTrackCounts(theme: DesignSystem.Theme?) -> (hotPink: Int, canonical: Int)? {
+    /// theme: the Canonical-sharp picked theme vs the Light Pink
+    /// default. Tolerance 16 clears every flat fill: the two tracks
+    /// differ by 23 on red (Canonical #e2e4f0 vs Light Pink #f9d6e2),
+    /// and each track is >16 from the other theme's shield
+    /// background and text inks on at least one channel (no stars
+    /// render in the cover, so star tokens never enter the bitmap).
+    /// Only antialiased text-edge bands bleed across (observed
+    /// 0/2.7k), which the test's 100k/10k bounds absorb with margin.
+    /// Hot Pink sharp can
+    /// no longer serve as the picked theme: its track (245,198,218)
+    /// is within 16 on every channel of the Light Pink track
+    /// (249,214,226), so the sampler could not tell them apart.
+    private func renderCoverTrackCounts(theme: DesignSystem.Theme?) -> (picked: Int, defaultTrack: Int)? {
         let flow = makePresentedFlow()
         let host: UIHostingController<SimulatedShieldCoverHost>
         if let theme {
@@ -222,19 +234,19 @@ final class ThemeContrastFix4Tests: XCTestCase {
                                   bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: info) else { return nil }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-        let hotTrack = rgb255(DesignSystem.Theme(palette: .hotPink, shape: .sharp).tokens.track)
-        let canonicalTrack = rgb255(DesignSystem.defaultTheme.tokens.track)
-        var hot = 0, canonical = 0
+        let pickedTrack = rgb255(DesignSystem.Theme(palette: .canonical, shape: .sharp).tokens.track)
+        let defaultTrack = rgb255(DesignSystem.defaultTheme.tokens.track)
+        var picked = 0, plain = 0
         for i in 0..<(w * h) {
             let o = i * 4
             let px = (Int(bytes[o]), Int(bytes[o + 1]), Int(bytes[o + 2]))
-            if near(px, hotTrack, tolerance: 16) {
-                hot += 1
-            } else if near(px, canonicalTrack, tolerance: 16) {
-                canonical += 1
+            if near(px, pickedTrack, tolerance: 16) {
+                picked += 1
+            } else if near(px, defaultTrack, tolerance: 16) {
+                plain += 1
             }
         }
-        return (hot, canonical)
+        return (picked, plain)
     }
 
     private func rgb255(_ rgb: DesignSystem.RGB) -> (Int, Int, Int) {
