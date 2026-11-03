@@ -630,6 +630,13 @@ public final class SetupFlowViewModel: ObservableObject {
     /// policy's practice minutes, a fresh per-session scorer over the
     /// installed policy's effort floor); callers — tests — may inject
     /// their own, and an explicitly passed scorer still wins.
+    ///
+    /// Finish-time revalidation (issue #87 fix round 4): default
+    /// settings follow the LIVE installed policy — a retained flow
+    /// finishing after a policy change scores against the current
+    /// floor and grants with the current duration instead of the
+    /// construction-time settings. Each explicitly injected setting
+    /// keeps its retained value (fix round 2 contract).
     public func makeInstalledSimulatedShieldFlow(
         for app: AppRef,
         category: AppCategoryRef? = nil,
@@ -652,7 +659,10 @@ public final class SetupFlowViewModel: ObservableObject {
             decisionLogger: decisionLogger ?? DecisionLogger(
                 directory: Self.installedShieldLogDirectory()
             ),
-            decisionDurationMinutes: minutes
+            decisionDurationMinutes: minutes,
+            policyStore: policyStore,
+            followsLiveFloor: scorer == nil,
+            followsLiveDuration: unlockDuration == nil
         )
     }
 

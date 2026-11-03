@@ -80,6 +80,23 @@ public final class SimulatedShieldFlow: ObservableObject {
     /// Set only when no Decision was persisted (and no unlock applied);
     /// cleared by the next logged finish or a fresh challenge session.
     @Published public private(set) var lastLogError: DecisionLogError?
+    /// Live policy source for finish-time revalidation (issue #87 fix
+    /// round 4): when set with `followsLiveFloor` / `followsLiveDuration`,
+    /// `finishChallenge` scores against the CURRENT effort floor and
+    /// grants with the CURRENT practice duration instead of the
+    /// retained construction-time settings — so a stricter policy
+    /// arriving before a retained challenge finishes cannot grant under
+    /// superseded settings. Nil keeps the legacy retained behavior
+    /// (demo flows, unit-test fixtures with injected short windows).
+    private let policyStore: PolicyStore?
+    /// True when scoring follows the live policy floor (the installed
+    /// default scorer); an explicitly injected scorer keeps its own
+    /// floor (fix round 2 contract).
+    private let followsLiveFloor: Bool
+    /// True when the grant follows the live policy duration (the
+    /// installed default window); an explicitly injected duration is
+    /// kept as-is.
+    private let followsLiveDuration: Bool
     /// Demo session context for the decision log: rotated on every fresh
     /// challenge session, kept across denied/refused/failed retries.
     public private(set) var decisionSessionId: String
@@ -126,7 +143,10 @@ public final class SimulatedShieldFlow: ObservableObject {
         isSimulatedMode: Bool,
         decisionLogger: DecisionLogger,
         decisionSessionId: String = UUID().uuidString,
-        decisionDurationMinutes: Int? = nil
+        decisionDurationMinutes: Int? = nil,
+        policyStore: PolicyStore? = nil,
+        followsLiveFloor: Bool = false,
+        followsLiveDuration: Bool = false
     ) {
         self.manager = manager
         self.backend = backend
@@ -137,6 +157,9 @@ public final class SimulatedShieldFlow: ObservableObject {
         self.unlockDuration = unlockDuration
         self.isSimulatedMode = isSimulatedMode
         self.decisionLogger = decisionLogger
+        self.policyStore = policyStore
+        self.followsLiveFloor = followsLiveFloor
+        self.followsLiveDuration = followsLiveDuration
         self.decisionSessionId = decisionSessionId
         self.decisionDurationMinutes = decisionDurationMinutes
             ?? max(1, Int(ceil(unlockDuration / 60)))
@@ -184,13 +207,20 @@ public final class SimulatedShieldFlow: ObservableObject {
     /// score or a grant the manager refuses. When a previous unlock has
     /// ended since the last tick, the shield re-presents and a fresh
     /// session starts BEFORE scoring, so stale passing effort can never
-    /// grant a free window. Returns the score for the result narration,
+    /// grant a free window. Flows following the live policy (the
+    /// installed default) revalidate the CURRENT floor and duration at
+    /// this boundary, so a retained challenge finishing after a policy
+    /// change is scored and granted under current settings, never
+    /// superseded ones. Returns the score for the result narration,
     /// or nil when the log write failed.
     @discardableResult
     public func finishChallenge() -> EffortScore? {
         manager.refresh()
         remainingUnlockTime = manager.remainingUnlockTime
         updatePresentation()
+        revalidateScorerFloor()
+        let grantDuration = currentUnlockDuration
+        let logMinutes = currentDurationMinutes
         let logged: (score: EffortScore, decision: Decision)
         do {
             logged = try recorder.evaluateAndLog(
@@ -198,7 +228,7 @@ public final class SimulatedShieldFlow: ObservableObject {
                 logger: decisionLogger,
                 sessionId: decisionSessionId,
                 appId: app.id,
-                durationMinutes: decisionDurationMinutes
+                durationMinutes: logMinutes
             )
         } catch let error as DecisionLogError {
             lastScore = nil
@@ -219,7 +249,7 @@ public final class SimulatedShieldFlow: ObservableObject {
         lastDecision = logged.decision
         lastLogError = nil
         if logged.score.decision == .granted {
-            manager.grantUnlock(for: app, category: category, duration: unlockDuration)
+            manager.grantUnlock(for: app, category: category, duration: grantDuration)
         }
         remainingUnlockTime = manager.remainingUnlockTime
         updatePresentation()
@@ -248,14 +278,49 @@ public final class SimulatedShieldFlow: ObservableObject {
     /// previous result cleared. Runs only when the shield re-presents
     /// after an unlock ends (expiry or a replaced window), so a denied
     /// challenge, a refused grant, or a failed log write keeps its
-    /// recorded effort for a retry.
+    /// recorded effort for a retry. The new draw uses the current
+    /// policy floor when this flow follows the live policy.
     private func resetChallengeSession() {
         recorder = EffortSessionRecorder(startedAt: Date())
-        scorer = EffortScorer(floorSettings: scorer.floorSettings, weights: scorer.weights)
+        scorer = EffortScorer(floorSettings: currentFloorSettings, weights: scorer.weights)
         decisionSessionId = UUID().uuidString
         lastScore = nil
         lastDecision = nil
         lastLogError = nil
+    }
+
+    /// The effort floor to score against: the live policy's floor when
+    /// this flow follows it, else the scorer's retained floor.
+    private var currentFloorSettings: EffortFloorSettings {
+        guard followsLiveFloor, let policyStore else { return scorer.floorSettings }
+        return policyStore.currentPolicy.effortFloorSettings
+    }
+
+    /// The unlock seconds a grant opens: the live policy's practice
+    /// window when this flow follows it, else the retained duration.
+    private var currentUnlockDuration: TimeInterval {
+        guard followsLiveDuration, let policyStore else { return unlockDuration }
+        return TimeInterval(policyStore.currentPolicy.unlockDurations.practiceMinutes) * 60
+    }
+
+    /// The unlock minutes recorded in the Decision: the live policy's
+    /// practice minutes when this flow follows it, else the retained
+    /// construction-time value.
+    private var currentDurationMinutes: Int {
+        guard followsLiveDuration, let policyStore else { return decisionDurationMinutes }
+        return policyStore.currentPolicy.unlockDurations.practiceMinutes
+    }
+
+    /// Rebuilds the scorer under the current floor when this flow
+    /// follows the live policy, preserving the per-session threshold
+    /// draw and weights. A no-op when the floor is unchanged or the
+    /// flow keeps retained settings.
+    private func revalidateScorerFloor() {
+        let current = currentFloorSettings
+        guard current != scorer.floorSettings else { return }
+        scorer = EffortScorer(
+            threshold: scorer.threshold, floorSettings: current, weights: scorer.weights
+        )
     }
 
     private static let fallbackPrompt =
