@@ -55,6 +55,13 @@ private struct AuthorizationStepView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Allow Screen Time access")
                     .font(.title2.bold())
+                if viewModel.isSimulatedMode {
+                    SimulatedModeBadge()
+                    Text("Simulated mode is on: requesting below grants " +
+                        "simulated approval for the demo — not real Screen " +
+                        "Time access.")
+                        .font(.footnote)
+                }
                 Text("EarnPlay uses Screen Time to list this device's apps " +
                     "and to shield them outside earned unlocks. This step " +
                     "must be done on the child's device.")
@@ -319,6 +326,9 @@ public struct SetupCompleteView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Setup complete")
                     .font(.title2.bold())
+                if viewModel.isSimulatedMode {
+                    SimulatedModeBadge()
+                }
                 Button("About & app theme") {
                     showingAbout = true
                 }
@@ -390,6 +400,26 @@ public struct SetupCompleteView: View {
                 .foregroundStyle(.secondary)
             Text(value)
         }
+    }
+}
+
+// MARK: - Simulated-mode honesty badge
+
+/// Honesty badge for simulated mode in the MAIN setup flow (issue
+/// #87): the same labeling `SimulatedShieldView` renders, so simulated
+/// authorization and simulated shields here never look like real
+/// Screen Time enforcement. Shown only when the view model runs a
+/// simulated half (`isSimulatedMode`); the unforced flow is unchanged.
+private struct SimulatedModeBadge: View {
+    var body: some View {
+        Text(SimulatedShieldFlow.simulatedBadgeText)
+            .font(.headline)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(Color(.systemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .accessibilityIdentifier("simulatedShieldBadge")
     }
 }
 

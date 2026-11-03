@@ -106,8 +106,15 @@ public final class SetupFlowViewModel: ObservableObject {
     /// view-model methods. No behavior change.
     let flow: SetupFlow
     private let policyStore: PolicyStore
-    private let backend: NonEnforcingShieldBackend
-    private let authService: any SetupAuthorizationService
+    /// Installed shield backend. Internal (not private) so app tests can
+    /// pin the issue-#87 composition (simulated vs non-enforcing).
+    /// `any ShieldBackend` so the forced-simulated composition can install
+    /// `SimulatedShieldBackend` behind the same interface; the unforced
+    /// composition still installs `NonEnforcingShieldBackend`.
+    let backend: any ShieldBackend
+    /// Installed authorization service. Internal (not private) so app
+    /// tests can pin the issue-#87 composition (simulated vs real).
+    let authService: any SetupAuthorizationService
     private let tokenStore: SetupTokenStore
 
     /// Durable token-to-ref registries: every token ever picked in this
@@ -122,7 +129,7 @@ public final class SetupFlowViewModel: ObservableObject {
     public init(
         flow: SetupFlow,
         policyStore: PolicyStore,
-        backend: NonEnforcingShieldBackend,
+        backend: any ShieldBackend,
         authService: any SetupAuthorizationService,
         tokenStore: SetupTokenStore
     ) {
@@ -135,14 +142,47 @@ public final class SetupFlowViewModel: ObservableObject {
         refresh()
     }
 
-    /// Default wiring over the on-device stores with real authorization.
-    /// Pass a simulated `authService` for the Demo verification path.
+    /// True when either installed half is simulated: the shield backend
+    /// is the simulated backend, or authorization is the simulated
+    /// service. The setup UI renders the simulated honesty badge off
+    /// this, so a simulated authorization or simulated shields in the
+    /// main flow never look like real Screen Time enforcement. Derived
+    /// from the installed instances (the single source of truth), so it
+    /// stays correct however the view model was constructed.
+    public var isSimulatedMode: Bool {
+        backend is SimulatedShieldBackend || authService is SimulatedSetupAuthorizationService
+    }
+
+    /// Default wiring over the on-device stores (issue #87).
+    ///
+    /// When `simulatedMode` resolves true, the flow uses the simulated
+    /// pair (`SimulatedSetupAuthorizationService` +
+    /// `SimulatedShieldBackend`) so gate scenarios can run where the
+    /// FamilyControls entitlement is unavailable (TestFlight, simulator).
+    /// When false, behavior is exactly the pre-#87 default (real
+    /// FamilyControls authorization + `NonEnforcingShieldBackend`).
+    ///
+    /// The default resolves live through `SimulatedShieldMode.isForced()`,
+    /// so the launch argument, the environment variable, and the
+    /// UserDefaults toggle (the only input a TestFlight binary receives)
+    /// all keep working through the same resolver with no new flag
+    /// names. The mode resolves once here at composition (app launch):
+    /// flipping the toggle requires a restart to take effect.
+    ///
+    /// An explicitly injected `authService` still wins for the auth half
+    /// (the Demo verification seam); the backend half always follows
+    /// `simulatedMode`.
     public static func makeDefault(
-        authService: (any SetupAuthorizationService)? = nil
+        authService: (any SetupAuthorizationService)? = nil,
+        simulatedMode: Bool = SimulatedShieldMode.isForced()
     ) -> SetupFlowViewModel {
         let store = PolicyStore()
-        let backend = NonEnforcingShieldBackend()
-        let auth = authService ?? FamilyControlsSetupAuthorizationService()
+        let backend: any ShieldBackend =
+            simulatedMode ? SimulatedShieldBackend() : NonEnforcingShieldBackend()
+        let defaultAuth: any SetupAuthorizationService = simulatedMode
+            ? SimulatedSetupAuthorizationService()
+            : FamilyControlsSetupAuthorizationService()
+        let auth = authService ?? defaultAuth
         let manager = ShieldManager(
             policyStore: store,
             enumeration: .empty,
