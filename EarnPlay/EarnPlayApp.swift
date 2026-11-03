@@ -97,7 +97,7 @@ struct ContentView: View {
                                     syncController.handleFailedEnqueue(log)
                                 })), theme: themes.theme)
                     } else {
-                        SetupFlowView(viewModel: setup)
+                        SetupFlowView(viewModel: setup, themes: themes)
                     }
                     } else {
                         ModelDownloadView(viewModel: downloadModel, themes: themes)
