@@ -207,8 +207,10 @@ struct PolicyEditorView: View {
             }
             // Adaptive ink, NOT the form's accent tint: the Light Pink
             // accent is 1.81:1 on light cells (the picker-checkmark
-            // precedent), while .primary reads in both appearances.
-            .foregroundStyle(.primary)
+            // precedent). Default-style Button tint overrides
+            // .foregroundStyle(.primary); .foregroundColor(.primary)
+            // survives and reads in both appearances.
+            .foregroundColor(.primary)
             // Stable handle for the issue #71 walkthrough.
             // No behavior change.
             .accessibilityIdentifier("policyAddChoreButton")
@@ -335,8 +337,10 @@ private struct AppListSection: View {
                     newAppID = ""
                 }
                 // Same adaptive ink as "Add chore": the form's accent
-                // tint is 1.81:1 as text on light cells.
-                .foregroundStyle(.primary)
+                // tint is 1.81:1 as text on light cells. Default-style
+                // Button tint overrides .foregroundStyle(.primary);
+                // .foregroundColor(.primary) survives.
+                .foregroundColor(.primary)
                 .disabled(newAppID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         } header: { Text(title) } footer: {
