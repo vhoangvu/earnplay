@@ -215,11 +215,20 @@ public final class SetupFlowViewModel: ObservableObject {
     /// An explicitly injected `authService` still wins for the auth half
     /// (the Demo verification seam); the backend half always follows
     /// `simulatedMode`.
+    ///
+    /// An explicitly injected `policyStore` is shared as the live store
+    /// (issue #87 fix round 3): production passes the sync controller's
+    /// store, so an accepted sync update lands in the same instance the
+    /// setup flow, the installed manager, and this view model read —
+    /// instead of a sibling instance whose disk write the setup store's
+    /// in-memory cache would never see until relaunch. Nil keeps the
+    /// standalone default (a fresh store over the default directory).
     public static func makeDefault(
         authService: (any SetupAuthorizationService)? = nil,
-        simulatedMode: Bool = SimulatedShieldMode.isForced()
+        simulatedMode: Bool = SimulatedShieldMode.isForced(),
+        policyStore: PolicyStore? = nil
     ) -> SetupFlowViewModel {
-        let store = PolicyStore()
+        let store = policyStore ?? PolicyStore()
         let backend: any ShieldBackend =
             simulatedMode ? SimulatedShieldBackend() : NonEnforcingShieldBackend()
         let defaultAuth: any SetupAuthorizationService = simulatedMode
@@ -595,6 +604,12 @@ public final class SetupFlowViewModel: ObservableObject {
 
     /// Cached shield flows over the installed composition, by app id.
     private var installedShieldFlows: [String: SimulatedShieldFlow] = [:]
+    /// Policy version the cached installed flows were built under (issue
+    /// #87 fix round 3): a lookup that observes a newer version drops
+    /// the cache first, so effort-floor and unlock-duration changes
+    /// reach already-cached flows instead of lingering behind a cache
+    /// hit. Nil until the first lookup.
+    private var installedShieldPolicyVersion: Int?
 
     /// Demo-scoped decision-log directory for installed shield flows:
     /// installed unlock decisions log here, never into production
@@ -653,6 +668,40 @@ public final class SetupFlowViewModel: ObservableObject {
         policyStore.currentPolicy.isNeverUnlockable(app)
     }
 
+    /// Drops cached installed flows whose policy settings are stale
+    /// (issue #87 fix round 3): when the installed policy version moved
+    /// since the cache was built, every entry is discarded so the next
+    /// lookup rebuilds under the current floor and unlock duration. A
+    /// no-op when the version is unchanged, so an untouched policy
+    /// keeps its cache hits (and any in-progress challenge effort).
+    private func reconcileInstalledShieldFlows() {
+        let version = policyStore.storedVersion
+        guard installedShieldPolicyVersion != version else { return }
+        installedShieldFlows.removeAll()
+        installedShieldPolicyVersion = version
+    }
+
+    /// Reloads the installed policy from disk and refreshes everything
+    /// derived from it (issue #87 fix round 3): the installed manager
+    /// re-applies shields under the reloaded policy, cached shield
+    /// flows whose settings went stale are dropped, the completion
+    /// summary rebuilds, and the UI republishes. This is the
+    /// cross-instance propagation path — a sync update accepted through
+    /// a sibling store over the same directory becomes visible to the
+    /// blocked gate and the installed flows without a relaunch. (In
+    /// production the store is shared with the sync controller, so the
+    /// reload is a no-op and this is purely the manager/UI refresh;
+    /// the app calls it from the controller's policy-update hook.)
+    public func refreshInstalledPolicyFromDisk() {
+        policyStore.reloadFromDisk()
+        flow.installedShieldManager.refresh()
+        reconcileInstalledShieldFlows()
+        if step == .complete {
+            rebuildSummary()
+        }
+        objectWillChange.send()
+    }
+
     /// The cached installed-composition flow for one app, created on
     /// first use. Returns nil for blocked targets (see
     /// `isInstalledShieldBlocked(_:)`), so the panel never presents a
@@ -662,12 +711,15 @@ public final class SetupFlowViewModel: ObservableObject {
     /// in `selectInstalledShieldApp(_:)`, never during a view-body
     /// read. The blocked gate runs before the cache lookup so a
     /// policy change that blocks a previously unlockable app stops
-    /// presenting its cached challenge.
+    /// presenting its cached challenge; the lookup then reconciles
+    /// the cache against the policy version so floor and unlock
+    /// duration changes rebuild already-cached flows.
     public func installedShieldFlow(
         for app: AppRef,
         category: AppCategoryRef? = nil
     ) -> SimulatedShieldFlow? {
         if isInstalledShieldBlocked(app) { return nil }
+        reconcileInstalledShieldFlows()
         if let existing = installedShieldFlows[app.id] { return existing }
         guard let flow = makeInstalledSimulatedShieldFlow(for: app, category: category) else {
             return nil

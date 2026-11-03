@@ -177,6 +177,13 @@ public final class ChildSyncService: @unchecked Sendable {
     private let snapLock = NSLock()
     private var _snapshot: ChildSyncSnapshot
     public var onSnapshotChange: ((ChildSyncSnapshot) -> Void)?
+    /// Fired after a received policy is accepted (`.applied` only — a
+    /// stale version changes nothing and fires nothing), so the host
+    /// can refresh policy-derived state without a relaunch (issue #87
+    /// fix round 3). Called on the transport's receive thread; the
+    /// child app's controller re-publishes on the main thread (see
+    /// `ChildSyncController.onPolicyUpdate`). Nil unless the host sets it.
+    public var onPolicyApplied: ((Policy) -> Void)?
     public init(policyStore: PolicyStore, sessionQueue: SessionLogQueue,
                 transport: any SyncTransport, pairing: SyncPairingGate? = nil,
                 retry: SyncRetryConfiguration = SyncRetryConfiguration()) {
@@ -238,7 +245,13 @@ public final class ChildSyncService: @unchecked Sendable {
         case .policyUpdate(let policy):
             guard isPaired else { return }
             switch policyStore.apply(policy) {
-            case .applied, .rejectedStaleVersion:
+            case .applied:
+                publishSnapshot()
+                onPolicyApplied?(policy)
+                if let ack = try? SyncMessageCodec.encode(.ackPolicy(version: policy.version)) {
+                    try? transport.send(ack)
+                }
+            case .rejectedStaleVersion:
                 publishSnapshot()
                 if let ack = try? SyncMessageCodec.encode(.ackPolicy(version: policy.version)) {
                     try? transport.send(ack)
