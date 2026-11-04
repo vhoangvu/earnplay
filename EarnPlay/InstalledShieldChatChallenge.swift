@@ -345,21 +345,34 @@ struct InstalledShieldChatChallengeView: View {
             // with no scrolling at phone landscape heights. The column
             // scrolls only at even shorter heights.
             if compact {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        challengeHeader
-                            .background(ChallengeLayoutProbe {
-                                ChallengeLayoutReport(
-                                    shieldHeaderHeight: $0.size.height)
-                            })
+                // Round 6: ONLY the simulated badge is pinned above the
+                // sidebar scroll — the header texts and Finish footer stay
+                // scrollable, preserving the round-5 guarantee that Finish
+                // is never stranded at keyboard-reduced heights (a fully
+                // pinned header would strand it when the viewport falls
+                // below header-plus-footer). Scrolling to a denial result
+                // can no longer push the enforcement indicator off-screen.
+                VStack(spacing: 0) {
+                    simulatedBadge
+                        .padding(.horizontal, 12)
+                        .padding(.top, 12)
+                        .background(ChallengeLayoutProbe {
+                            ChallengeLayoutReport(
+                                shieldHeaderHeight: $0.size.height)
+                        })
 
-                        finishFooter
-                            .background(ChallengeLayoutProbe {
-                                ChallengeLayoutReport(
-                                    finishFooterHeight: $0.size.height)
-                            })
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            challengeHeaderTexts
+
+                            finishFooter
+                                .background(ChallengeLayoutProbe {
+                                    ChallengeLayoutReport(
+                                        finishFooterHeight: $0.size.height)
+                                })
+                        }
+                        .padding(12)
                     }
-                    .padding(12)
                 }
                 .frame(width: Self.compactSidebarWidth)
             }
@@ -372,14 +385,15 @@ struct InstalledShieldChatChallengeView: View {
             // available height minus the pinned header, and the chat
             // keeps available-minus-chrome, so closed content still fits
             // exactly and keyboard-reduced heights still scroll the
-            // column (not the chat). The compact sidebar keeps its
-            // scrolling header deliberately: at landscape
-            // keyboard-reduced heights the sidebar viewport can fall
-            // below header-plus-footer, where a pinned sidebar header
-            // would strand Finish — the scrolling sidebar keeps it
-            // reachable. Keyboard open/close still changes no branch in
-            // either layout, so the focused composer subtree still
-            // always survives (the resolved round-4 finding).
+            // column (not the chat). Round 6: the compact sidebar pins
+            // ONLY the simulated badge above its scroll; the header texts
+            // and Finish footer stay scrollable deliberately — at
+            // landscape keyboard-reduced heights the sidebar viewport can
+            // fall below header-plus-footer, where a fully pinned sidebar
+            // header would strand Finish. Keyboard open/close still
+            // changes no branch in either layout, so the focused composer
+            // subtree still always survives (the resolved round-4
+            // finding).
             if compact {
                 ScrollView(.vertical) {
                     VStack(spacing: 0) {
@@ -448,19 +462,37 @@ struct InstalledShieldChatChallengeView: View {
 
     private var challengeHeader: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(SimulatedShieldFlow.simulatedBadgeText)
-                .font(.headline)
-                .foregroundStyle(theme.tokens.tutorText.color)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(theme.tokens.track.color)
-                .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
-                .accessibilityIdentifier("simulatedShieldBadge")
-                .background(ChallengeLayoutProbe {
-                    ChallengeLayoutReport(badgeFrame: $0.frame(in: .global))
-                })
+            simulatedBadge
 
+            challengeHeaderTexts
+        }
+    }
+
+    /// The simulated-enforcement badge alone (round 6): pinned in BOTH
+    /// layouts — above the portrait column (round 5) and above the
+    /// compact sidebar scroll — so reaching the controls or a denial
+    /// result can never hide it. Carries the badge frame probe.
+    private var simulatedBadge: some View {
+        Text(SimulatedShieldFlow.simulatedBadgeText)
+            .font(.headline)
+            .foregroundStyle(theme.tokens.tutorText.color)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(theme.tokens.track.color)
+            .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
+            .accessibilityIdentifier("simulatedShieldBadge")
+            .background(ChallengeLayoutProbe {
+                ChallengeLayoutReport(badgeFrame: $0.frame(in: .global))
+            })
+    }
+
+    /// The non-badge header lines: the locked-app label and the effort
+    /// explainer. Pinned with the badge in portrait (part of
+    /// `challengeHeader`); scrollable in the compact sidebar (round 6),
+    /// so Finish stays reachable at keyboard-reduced heights.
+    private var challengeHeaderTexts: some View {
+        VStack(alignment: .leading, spacing: 12) {
             Text("Locked app (simulated): \(flow.app.id)")
                 .font(.subheadline)
                 .foregroundStyle(theme.secondaryOnTheme)

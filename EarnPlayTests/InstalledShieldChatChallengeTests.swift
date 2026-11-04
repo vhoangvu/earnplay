@@ -1882,6 +1882,22 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                 visible.insetBy(dx: 0, dy: 4).contains(landed),
                 "the Finish control must be visible after its reveal scroll",
                 file: file, line: line)
+            // Round 6: the pinned sidebar badge stays visible after the
+            // Finish reveal scroll — reaching Finish must never hide the
+            // simulated-enforcement indication. The badge sits OUTSIDE the
+            // sidebar scroll, so its raw reported frame needs no scroll
+            // translation (calibrated above to read in host coordinates),
+            // and the 8pt bound holds tens of points of margin.
+            guard let badgeFrame = latestReport?.badgeFrame else {
+                XCTFail("the badge lost its frame after revealing Finish",
+                        file: file, line: line)
+                return false
+            }
+            XCTAssertTrue(
+                visible.insetBy(dx: 0, dy: 8).contains(
+                    CGPoint(x: badgeFrame.midX, y: badgeFrame.midY)),
+                "the simulated badge must stay visible after revealing Finish",
+                file: file, line: line)
             XCTAssertTrue(
                 mountedComposerField(in: host.view) === composer,
                 "the composer subtree must survive revealing Finish",
@@ -1934,6 +1950,38 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertTrue(
             mountedComposerField(in: host.view) === composer,
             "the composer subtree must survive the Finish tap")
+
+        // Round 6, the finding's exact scenario: the denial narration
+        // grows the sidebar footer, and scrolling the sidebar to the
+        // denial result at the keyboard-reduced height must keep the
+        // pinned badge visible. The bottom offset must exceed the rest
+        // offset, proving the sidebar actually scrolled (a vacuous
+        // no-scroll pass would prove nothing about pinning).
+        pumpCover(host.view)
+        let sidebarMin = -sidebar.adjustedContentInset.top
+        let denialBottom = sidebar.contentSize.height - sidebar.bounds.height
+            + sidebar.adjustedContentInset.bottom
+        XCTAssertGreaterThan(
+            denialBottom, sidebarMin,
+            "reading the denial result must require sidebar scrolling")
+        sidebar.setContentOffset(CGPoint(x: 0, y: denialBottom), animated: false)
+        pumpCover(host.view)
+        XCTAssertEqual(
+            sidebar.contentOffset.y, denialBottom, accuracy: 0.5,
+            "the sidebar must apply the denial-result scroll")
+        guard spinUntil(timeout: 5, {
+            pumpCover(host.view)
+            return latestReport?.badgeFrame != nil
+        }), let denialBadgeFrame = latestReport?.badgeFrame else {
+            return XCTFail("the badge lost its frame after scrolling to the denial result")
+        }
+        XCTAssertTrue(
+            visible.insetBy(dx: 0, dy: 8).contains(
+                CGPoint(x: denialBadgeFrame.midX, y: denialBadgeFrame.midY)),
+            "the simulated badge must stay visible after scrolling to the denial result")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive scrolling to the denial result")
 
         // Keyboard closed: the composer subtree survives and the chat
         // keeps its floor with no scrolling tricks — the decision
