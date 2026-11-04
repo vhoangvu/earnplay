@@ -471,6 +471,128 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             flow.currentEffortSignals(at: base.addingTimeInterval(60)).activeMinutes, 1)
     }
 
+    // MARK: - Flow replacement mid-challenge (PR #92 fix round 1)
+
+    @MainActor
+    private func makeSetupViewModel(backend: SimulatedShieldBackend) -> SetupFlowViewModel {
+        let store = PolicyStore(directory: directory)
+        let manager = ShieldManager(
+            policyStore: store,
+            enumeration: .empty,
+            backend: backend,
+            unlockStore: FileUnlockWindowStore(directory: directory)
+        )
+        let flow = SetupFlow(
+            policyStore: store,
+            shieldManager: manager,
+            enumerationStore: FileSetupEnumerationStore(directory: directory),
+            authorized: false
+        )
+        return SetupFlowViewModel(
+            flow: flow,
+            policyStore: store,
+            backend: backend,
+            authService: SimulatedSetupAuthorizationService(),
+            tokenStore: SetupTokenStore(directory: directory)
+        )
+    }
+
+    @MainActor
+    private func completeForcedSetup(
+        appIDs: Set<String>,
+        choice: SetupFlowViewModel.AppChoice = .unblockable
+    ) async -> SetupFlowViewModel {
+        let viewModel = makeSetupViewModel(backend: SimulatedShieldBackend())
+        await viewModel.requestAuthorization()
+        viewModel.simulatedAppIDs = appIDs
+        viewModel.simulatedCategoryIDs = []
+        viewModel.continueFromEnumeration()
+        viewModel.setAllChoices(choice)
+        viewModel.continueFromSelection()
+        viewModel.finishSetup()
+        XCTAssertEqual(viewModel.step, .complete)
+        return viewModel
+    }
+
+    /// A policy refresh replaces the cached installed flow while the
+    /// challenge is open; the recreated challenge (keyed by flow identity)
+    /// records post-replacement chat effort into, and finishes, the
+    /// REPLACEMENT session — a grant stays achievable, and the discarded
+    /// session's effort never leaks into the new decision.
+    @MainActor
+    func testFlowReplacedMidChallengeScoresReplacementSession() async {
+        let game = SimulatedSetupCatalog.apps[0]
+        let viewModel = await completeForcedSetup(appIDs: [game.id])
+        guard let oldFlow = viewModel.installedShieldFlow(
+            for: game.ref, category: game.category.ref
+        ) else {
+            return XCTFail("expected a cached installed flow for the picked app")
+        }
+        XCTAssertTrue(oldFlow.isShieldPresented)
+
+        // Pre-replacement effort through the full chat path: one answer
+        // recorded into the OLD session.
+        let (_, _, oldChat) = makeChallenge(flow: oldFlow)
+        oldChat.startIfNeeded()
+        oldChat.draft = "54"
+        oldChat.submitDraft()
+        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
+
+        // Policy refresh mid-challenge: version moves, the cache is
+        // reconciled, and the next lookup builds a replacement flow.
+        let syncStore = PolicyStore(directory: directory)
+        var updated = syncStore.currentPolicy
+        updated.version += 1
+        XCTAssertEqual(syncStore.apply(updated), .applied)
+        viewModel.refreshInstalledPolicyFromDisk()
+        guard let newFlow = viewModel.installedShieldFlow(
+            for: game.ref, category: game.category.ref
+        ) else {
+            return XCTFail("expected a replacement installed flow after the refresh")
+        }
+        XCTAssertFalse(
+            newFlow === oldFlow,
+            "a policy version move must replace the cached installed flow")
+        XCTAssertTrue(
+            newFlow.isShieldPresented,
+            "the cover stays up over the replacement flow")
+        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 0)
+        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 0)
+
+        // Post-replacement effort through a fresh chat path bound to the
+        // replacement (the recreated challenge view): 5 answers + 3 hints.
+        let (_, _, newChat) = makeChallenge(flow: newFlow)
+        newChat.startIfNeeded()
+        for answer in ["7", "14", "21", "28", "35"] {
+            newChat.draft = answer
+            newChat.submitDraft()
+        }
+        newChat.requestHint()
+        newChat.requestHint()
+        newChat.requestHint()
+
+        // 5 attempts (10 pts) + 3 hints (6 pts) = 16, clearing any 8...14
+        // threshold draw — and counting ONLY post-replacement effort.
+        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 5)
+        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 3)
+
+        // The discarded session keeps only its own effort: finishing it
+        // denies (one attempt, no hint leg).
+        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
+        XCTAssertEqual(oldFlow.currentEffortSignals().hintInteractions, 0)
+        XCTAssertEqual(oldFlow.finishChallenge()?.decision, .denied)
+
+        // The replacement session scores its own effort: grant achievable.
+        let score = newFlow.finishChallenge()
+        XCTAssertEqual(score?.score, 16)
+        XCTAssertEqual(score?.decision, .granted)
+        XCTAssertTrue(score?.floorMet ?? false)
+        XCTAssertFalse(newFlow.isShieldPresented)
+        XCTAssertEqual(
+            newFlow.challengeDecisionText,
+            SimulatedShieldFlow.unlockGrantedText)
+    }
+
     // MARK: - Challenge surface
 
     @MainActor

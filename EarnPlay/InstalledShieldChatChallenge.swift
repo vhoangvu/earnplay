@@ -247,7 +247,13 @@ struct InstalledShieldChatCoverHost: View {
         }
         .fullScreenCover(
             isPresented: Binding(get: { flow.isShieldPresented }, set: { _ in }),
-            content: { InstalledShieldChatChallengeView(flow: flow, theme: theme) }
+            // Keyed by flow identity (PR #92 fix round 1): a policy refresh
+            // replaces the cached installed flow mid-challenge, and without
+            // this SwiftUI reuses the challenge's @StateObject — chat effort
+            // would keep recording into the discarded session while Finish
+            // scores the replacement's empty one. The new identity recreates
+            // the chat model with, and bound to, the replacement flow.
+            content: { InstalledShieldChatChallengeView(flow: flow, theme: theme).id(ObjectIdentifier(flow)) }
         )
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             flow.tick()
