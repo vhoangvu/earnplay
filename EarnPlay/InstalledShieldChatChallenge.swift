@@ -152,17 +152,34 @@ struct InstalledShieldChatChallengeView: View {
     @ObservedObject var flow: SimulatedShieldFlow
     @StateObject private var chatViewModel: ChatConversationViewModel
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
+    private let onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)?
 
-    /// - Parameter engine: challenge engine override for tests; production
-    ///   wraps a non-recording `DemoTutorEngine` over `flow`.
+    /// Height below which the challenge uses its compact two-column
+    /// layout (PR #92 fix round 2): landscape phones report 375–440pt
+    /// while portrait phones report 667pt and up, so 500 separates
+    /// them with margin. iPad heights stay on the regular layout.
+    private static let compactHeightThreshold: CGFloat = 500
+
+    /// - Parameter makeEngine: challenge engine factory for tests; each
+    ///   (re)mount builds its engine over its own flow. Production (nil)
+    ///   wraps a non-recording `DemoTutorEngine` over `flow`. A factory
+    ///   (not one shared instance) so a flow replacement rebinds effort
+    ///   to the replacement session.
+    /// - Parameter onChatModelMount: test hook reporting the mounted
+    ///   challenge's live chat model and flow on appearance; nil in
+    ///   production. Mount-time only, so it always names the identity
+    ///   the surface actually uses (view `init` also runs for
+    ///   identities whose `@StateObject` is then discarded).
     init(
         flow: SimulatedShieldFlow,
         theme: DesignSystem.Theme = DesignSystem.defaultTheme,
-        engine: (any ChatTutorEngine)? = nil
+        makeEngine: ((SimulatedShieldFlow) -> any ChatTutorEngine)? = nil,
+        onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)? = nil
     ) {
         self.flow = flow
         self.theme = theme
-        let challengeEngine = engine ?? InstalledShieldChatEngine(
+        self.onChatModelMount = onChatModelMount
+        let challengeEngine = makeEngine?(flow) ?? InstalledShieldChatEngine(
             inner: DemoTutorEngine(), flow: flow
         )
         _chatViewModel = StateObject(wrappedValue: ChatConversationViewModel(
@@ -171,54 +188,106 @@ struct InstalledShieldChatChallengeView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(SimulatedShieldFlow.simulatedBadgeText)
-                    .font(.headline)
-                    .foregroundStyle(theme.tokens.tutorText.color)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(theme.tokens.track.color)
-                    .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
-                    .accessibilityIdentifier("simulatedShieldBadge")
-
-                Text("Locked app (simulated): \(flow.app.id)")
-                    .font(.subheadline)
-                    .foregroundStyle(theme.secondaryOnTheme)
-                    .accessibilityIdentifier("lockedAppLabel")
-
-                Text("Chat with the tutor to build effort, then finish to check it. Effort counts — correctness does not.")
-                    .font(.caption)
-                    .foregroundStyle(theme.secondaryOnTheme)
-            }
-            .padding()
-
-            ChatConversationView(viewModel: chatViewModel, theme: theme)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Button("Finish & check effort") {
-                    flow.finishChallenge()
-                }
-                .accessibilityIdentifier("finishChallengeButton")
-
-                if let score = flow.lastScore {
-                    Text(score.narration)
-                        .font(.callout)
-                        .foregroundStyle(theme.tokens.tutorText.color)
-                        .accessibilityIdentifier("challengeResultLabel")
-                }
-                if let decisionText = flow.challengeDecisionText {
-                    Text(decisionText)
-                        .font(.callout.bold())
-                        .foregroundStyle(theme.tokens.tutorText.color)
-                        .accessibilityIdentifier("challengeDecisionLabel")
+        GeometryReader { proxy in
+            Group {
+                if proxy.size.height < Self.compactHeightThreshold {
+                    compactBody
+                } else {
+                    regularBody
                 }
             }
-            .padding()
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .background(theme.tokens.background.color)
         .interactiveDismissDisabled(true)
+        .onAppear {
+            onChatModelMount?(chatViewModel, flow)
+        }
+    }
+
+    /// Portrait / tall layout: unchanged from issue #91 — the fixed
+    /// challenge header, the chat, and the finish footer stacked
+    /// vertically, with only the message thread scrolling.
+    private var regularBody: some View {
+        VStack(spacing: 0) {
+            challengeHeader
+                .padding()
+
+            ChatConversationView(viewModel: chatViewModel, theme: theme)
+
+            finishFooter
+                .padding()
+        }
+    }
+
+    /// Short-height layout (landscape phones): the fixed header and
+    /// finish footer plus the chat's number pad, answer field, and
+    /// Hint/Send row exceed short viewports, and only the message
+    /// thread scrolls — so the Finish action could be pushed off-screen
+    /// in this non-dismissible challenge. Here the chat keeps the full
+    /// height on the right while the badge and Finish action sit in a
+    /// narrow left column, keeping both visible and tappable with no
+    /// scrolling at phone landscape heights. The column scrolls only
+    /// at even shorter heights.
+    private var compactBody: some View {
+        HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    challengeHeader
+
+                    finishFooter
+                }
+                .padding(12)
+            }
+            .frame(width: 280)
+
+            ChatConversationView(viewModel: chatViewModel, theme: theme)
+        }
+    }
+
+    private var challengeHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(SimulatedShieldFlow.simulatedBadgeText)
+                .font(.headline)
+                .foregroundStyle(theme.tokens.tutorText.color)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(theme.tokens.track.color)
+                .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
+                .accessibilityIdentifier("simulatedShieldBadge")
+
+            Text("Locked app (simulated): \(flow.app.id)")
+                .font(.subheadline)
+                .foregroundStyle(theme.secondaryOnTheme)
+                .accessibilityIdentifier("lockedAppLabel")
+
+            Text("Chat with the tutor to build effort, then finish to check it. Effort counts — correctness does not.")
+                .font(.caption)
+                .foregroundStyle(theme.secondaryOnTheme)
+        }
+    }
+
+    private var finishFooter: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button("Finish & check effort") {
+                flow.finishChallenge()
+            }
+            .accessibilityIdentifier("finishChallengeButton")
+
+            if let score = flow.lastScore {
+                Text(score.narration)
+                    .font(.callout)
+                    .foregroundStyle(theme.tokens.tutorText.color)
+                    .accessibilityIdentifier("challengeResultLabel")
+            }
+            if let decisionText = flow.challengeDecisionText {
+                Text(decisionText)
+                    .font(.callout.bold())
+                    .foregroundStyle(theme.tokens.tutorText.color)
+                    .accessibilityIdentifier("challengeDecisionLabel")
+            }
+        }
     }
 }
 
@@ -231,6 +300,24 @@ struct InstalledShieldChatChallengeView: View {
 struct InstalledShieldChatCoverHost: View {
     @ObservedObject var flow: SimulatedShieldFlow
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
+    private let makeEngine: ((SimulatedShieldFlow) -> any ChatTutorEngine)?
+    private let onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)?
+
+    /// - Parameters:
+    ///   - makeEngine: forwarded to the challenge view (see its docs).
+    ///   - onChatModelMount: forwarded to the challenge view (see its
+    ///     docs). Both are nil in production.
+    init(
+        flow: SimulatedShieldFlow,
+        theme: DesignSystem.Theme = DesignSystem.defaultTheme,
+        makeEngine: ((SimulatedShieldFlow) -> any ChatTutorEngine)? = nil,
+        onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)? = nil
+    ) {
+        self.flow = flow
+        self.theme = theme
+        self.makeEngine = makeEngine
+        self.onChatModelMount = onChatModelMount
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -253,7 +340,15 @@ struct InstalledShieldChatCoverHost: View {
             // would keep recording into the discarded session while Finish
             // scores the replacement's empty one. The new identity recreates
             // the chat model with, and bound to, the replacement flow.
-            content: { InstalledShieldChatChallengeView(flow: flow, theme: theme).id(ObjectIdentifier(flow)) }
+            content: {
+                InstalledShieldChatChallengeView(
+                    flow: flow,
+                    theme: theme,
+                    makeEngine: makeEngine,
+                    onChatModelMount: onChatModelMount
+                )
+                .id(ObjectIdentifier(flow))
+            }
         )
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             flow.tick()

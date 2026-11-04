@@ -140,12 +140,17 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         return (fake, engine, viewModel)
     }
 
-    /// Hosts a view in a tall window and returns its OCR'd visible text
-    /// (the `ThemeContrastFix2Tests` pattern).
+    /// Hosts a view in a window and returns its OCR'd visible text
+    /// (the `ThemeContrastFix2Tests` pattern). Defaults to the tall
+    /// window; short-height tests pass phone landscape dimensions.
     @MainActor
-    private func renderedText<Content: View>(for view: Content) -> String {
+    private func renderedText<Content: View>(
+        for view: Content,
+        width: CGFloat = 390,
+        height: CGFloat = 1500
+    ) -> String {
         let host = UIHostingController(rootView: view)
-        let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 1500))
+        let win = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: height))
         win.rootViewController = host
         win.makeKeyAndVisible()
         host.view.setNeedsLayout()
@@ -593,6 +598,260 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             SimulatedShieldFlow.unlockGrantedText)
     }
 
+    // MARK: - Mounted flow replacement (PR #92 fix round 2, finding 2)
+
+    /// Holder so the test can swap the mounted cover host's flow
+    /// mid-challenge, mirroring the production panel re-reading
+    /// `installedShieldFlow` after a policy refresh.
+    private final class MountedFlowHolder: ObservableObject {
+        @Published var flow: SimulatedShieldFlow
+        init(_ flow: SimulatedShieldFlow) { self.flow = flow }
+    }
+
+    private struct MountedSwapRoot: View {
+        @ObservedObject var holder: MountedFlowHolder
+        var makeEngine: (SimulatedShieldFlow) -> any ChatTutorEngine
+        var onMount: (ChatConversationViewModel, SimulatedShieldFlow) -> Void
+
+        var body: some View {
+            InstalledShieldChatCoverHost(
+                flow: holder.flow,
+                makeEngine: makeEngine,
+                onChatModelMount: onMount
+            )
+        }
+    }
+
+    /// Spins the runloop until `condition` holds or `timeout` lapses.
+    @MainActor
+    private func spinUntil(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        return condition()
+    }
+
+    @MainActor
+    private func pumpCover(_ view: UIView) {
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        view.layoutIfNeeded()
+    }
+
+    /// The mounted challenge's composer field (the round-2 probe proved
+    /// `insertText` on this rendered field drives the live model's draft
+    /// binding). Rendered SwiftUI buttons materialize no tappable views
+    /// in this host (probed census: no `UIControl`, no accessibility
+    /// elements), so submits, hints, and Finish go through the mounted
+    /// surface's own live model and flow — the exact methods its Send,
+    /// Hint, and Finish buttons call, on the exact instances they own.
+    @MainActor
+    private func mountedComposerField(in root: UIView) -> UITextView? {
+        var found: [UITextView] = []
+        func walk(_ v: UIView) {
+            if let field = v as? UITextView { found.append(field) }
+            v.subviews.forEach(walk)
+        }
+        walk(root)
+        guard found.count == 1 else { return nil }
+        return found.first
+    }
+
+    /// Types one answer through the RENDERED composer field of the
+    /// mounted surface and submits it through the surface's live model
+    /// (`submitDraft`, Send's own action). Returns false when the cover
+    /// or field is missing, or the draft binding never lands.
+    @MainActor
+    private func submitAnswerThroughSurface(
+        _ text: String,
+        host: UIHostingController<MountedSwapRoot>,
+        model: ChatConversationViewModel
+    ) -> Bool {
+        guard let cover = host.presentedViewController?.view else { return false }
+        pumpCover(cover)
+        guard let field = mountedComposerField(in: cover) else { return false }
+        field.selectAll(nil)
+        field.insertText(text)
+        guard spinUntil(timeout: 3, { model.draft == text }) else { return false }
+        model.submitDraft()
+        pumpCover(cover)
+        return true
+    }
+
+    /// The cover stays presented while its flow is replaced; post-
+    /// replacement chat effort submitted through the mounted surface
+    /// records ONLY into the replacement session, and finishing
+    /// through the surface grants and opens the unlock window on the
+    /// replacement. Fails when the `.id(ObjectIdentifier(flow))`
+    /// keying is removed: the stale model keeps recording into the
+    /// discarded session, so the replacement stays empty and denies.
+    @MainActor
+    func testMountedFlowReplacementRoutesEffortToReplacement() async {
+        let game = SimulatedSetupCatalog.apps[0]
+        let viewModel = await completeForcedSetup(appIDs: [game.id])
+        guard let oldFlow = viewModel.installedShieldFlow(
+            for: game.ref, category: game.category.ref
+        ) else {
+            return XCTFail("expected a cached installed flow for the picked app")
+        }
+        XCTAssertTrue(oldFlow.isShieldPresented)
+
+        // One fake-backed engine per flow, first wins: the challenge
+        // view `init` (and so the factory) also runs for identities
+        // whose `@StateObject` is then discarded, but the mounted
+        // identity always keeps the first-built engine.
+        var fakesByFlow: [ObjectIdentifier: FakeChatEngine] = [:]
+        let factory: (SimulatedShieldFlow) -> any ChatTutorEngine = { flow in
+            let id = ObjectIdentifier(flow)
+            if let existing = fakesByFlow[id] {
+                return InstalledShieldChatEngine(inner: existing, flow: flow)
+            }
+            let fake = FakeChatEngine()
+            fakesByFlow[id] = fake
+            return InstalledShieldChatEngine(inner: fake, flow: flow)
+        }
+        // Mount-time reports only: these always name the identity the
+        // surface actually uses — never a discarded speculative init.
+        var mounts: [(model: ChatConversationViewModel, flow: SimulatedShieldFlow)] = []
+        let holder = MountedFlowHolder(oldFlow)
+        let root = MountedSwapRoot(holder: holder, makeEngine: factory) { model, flow in
+            if mounts.last?.model !== model {
+                mounts.append((model, flow))
+            }
+        }
+        let host = UIHostingController(rootView: root)
+        let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        win.rootViewController = host
+        win.makeKeyAndVisible()
+        UIView.setAnimationsEnabled(false)
+        defer { UIView.setAnimationsEnabled(true) }
+
+        guard spinUntil(timeout: 5, { mounts.count >= 1 }) else {
+            return XCTFail("the mounted challenge never reported its live model")
+        }
+        guard let firstMount = mounts.first, firstMount.flow === oldFlow else {
+            return XCTFail("the mounted challenge must start bound to the presented flow")
+        }
+        guard spinUntil(timeout: 5, { firstMount.model.messages.count >= 1 }) else {
+            return XCTFail("the mounted chat never started its session")
+        }
+
+        // Pre-replacement effort through the mounted surface: one
+        // answer recorded into the OLD session.
+        XCTAssertTrue(
+            submitAnswerThroughSurface("54", host: host, model: firstMount.model),
+            "typing + submitting through the mounted surface must work")
+        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
+        XCTAssertEqual(fakesByFlow[ObjectIdentifier(oldFlow)]?.submitted, ["54"])
+
+        // Policy refresh mid-challenge: version moves, the cache is
+        // reconciled, and the next lookup builds a replacement flow —
+        // which the mounted surface adopts with its cover still up.
+        let syncStore = PolicyStore(directory: directory)
+        var updated = syncStore.currentPolicy
+        updated.version += 1
+        XCTAssertEqual(syncStore.apply(updated), .applied)
+        viewModel.refreshInstalledPolicyFromDisk()
+        guard let newFlow = viewModel.installedShieldFlow(
+            for: game.ref, category: game.category.ref
+        ) else {
+            return XCTFail("expected a replacement installed flow after the refresh")
+        }
+        XCTAssertFalse(
+            newFlow === oldFlow,
+            "a policy version move must replace the cached installed flow")
+        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 0)
+        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 0)
+        holder.flow = newFlow
+        XCTAssertNotNil(
+            host.presentedViewController,
+            "the cover must stay presented across the flow replacement")
+
+        // The `.id` keying remounts the challenge onto the replacement.
+        // Without it this is the stale pre-replacement model — and the
+        // effort assertions below fail (the mutation check) — so the
+        // test proceeds with the surface's CURRENT model either way.
+        // Each spin iteration also lays out the host and cover, as a
+        // real screen does every frame: in this headless window the
+        // presentation update only commits on a layout pass.
+        let remounted = spinUntil(timeout: 5) {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            host.presentedViewController?.view.setNeedsLayout()
+            host.presentedViewController?.view.layoutIfNeeded()
+            return mounts.contains { $0.flow === newFlow }
+        }
+        XCTAssertTrue(
+            remounted,
+            "replacing the flow must remount the mounted challenge (the `.id` keying)")
+        guard let live = mounts.last else {
+            return XCTFail("the mounted challenge lost its live model")
+        }
+        guard spinUntil(timeout: 5, { live.model.messages.count >= 1 }) else {
+            return XCTFail("the remounted chat never started its session")
+        }
+
+        // Post-replacement effort through the mounted surface: 5
+        // answers + 3 hints = 16, clearing any 8...14 threshold draw.
+        for answer in ["7", "14", "21", "28", "35"] {
+            XCTAssertTrue(
+                submitAnswerThroughSurface(answer, host: host, model: live.model),
+                "typing + submitting through the remounted surface must work")
+        }
+        live.model.requestHint()
+        live.model.requestHint()
+        live.model.requestHint()
+
+        // ONLY the replacement session receives the new effort.
+        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 5)
+        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 3)
+        XCTAssertEqual(
+            fakesByFlow[ObjectIdentifier(newFlow)]?.submitted,
+            ["7", "14", "21", "28", "35"])
+        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
+        XCTAssertEqual(oldFlow.currentEffortSignals().hintInteractions, 0)
+        XCTAssertEqual(fakesByFlow[ObjectIdentifier(oldFlow)]?.submitted, ["54"])
+
+        // Finishing through the mounted surface (its live flow, the
+        // Finish button's own target) grants ONLY the replacement
+        // session and opens its unlock window.
+        let score = live.flow.finishChallenge()
+        XCTAssertEqual(score?.decision, .granted)
+        XCTAssertEqual(score?.score, 16)
+        XCTAssertTrue(score?.floorMet ?? false)
+        XCTAssertFalse(newFlow.isShieldPresented)
+        XCTAssertGreaterThan(newFlow.remainingUnlockTime, 0)
+        XCTAssertEqual(
+            newFlow.challengeDecisionText,
+            SimulatedShieldFlow.unlockGrantedText)
+        XCTAssertTrue(
+            oldFlow.isShieldPresented,
+            "the discarded session must not open an unlock window")
+        XCTAssertEqual(oldFlow.remainingUnlockTime, 0)
+
+        // The discarded session keeps only its own effort: finishing it
+        // denies (one attempt, no hint leg).
+        XCTAssertEqual(oldFlow.finishChallenge()?.decision, .denied)
+
+        // The grant dismisses the mounted cover. Yield via Task.sleep
+        // (letting the main actor process the dismissal) rather than
+        // spinning the runloop, which starves it in this headless host.
+        var dismissed = false
+        for _ in 0..<50 where !dismissed {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            if host.presentedViewController == nil {
+                dismissed = true
+            } else {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        XCTAssertTrue(dismissed, "the grant must dismiss the mounted challenge cover")
+    }
+
     // MARK: - Challenge surface
 
     @MainActor
@@ -601,9 +860,53 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         let view = InstalledShieldChatChallengeView(
             flow: flow,
             theme: DesignSystem.defaultTheme,
-            engine: InstalledShieldChatEngine(inner: FakeChatEngine(), flow: flow))
+            makeEngine: { flow in InstalledShieldChatEngine(inner: FakeChatEngine(), flow: flow) })
 
         let rendered = renderedText(for: view)
+        XCTAssertTrue(
+            rendered.contains("SIMULATED SHIELD"),
+            "challenge must carry the simulated badge; rendered:\n\(rendered)")
+        XCTAssertTrue(
+            rendered.contains("Hint") && rendered.contains("Send"),
+            "challenge must present the chat composer; rendered:\n\(rendered)")
+        XCTAssertTrue(
+            rendered.contains("Finish"),
+            "challenge must offer the finish boundary; rendered:\n\(rendered)")
+    }
+
+    // MARK: - Short-height layout (PR #92 fix round 2, finding 1)
+
+    /// Short landscape phones: at 844×390 with the PRODUCTION engine
+    /// (whose first question renders the three-row number pad), the
+    /// simulated badge and the Finish action stay visible — reachable
+    /// with no scrolling in the non-dismissible challenge.
+    @MainActor
+    func testShortLandscapeKeepsBadgeAndFinishVisible() {
+        let (flow, _) = makeFlow()
+        let view = InstalledShieldChatChallengeView(
+            flow: flow, theme: DesignSystem.defaultTheme)
+
+        let rendered = renderedText(for: view, width: 844, height: 390)
+        XCTAssertTrue(
+            rendered.contains("SIMULATED SHIELD"),
+            "badge must stay visible at short heights; rendered:\n\(rendered)")
+        XCTAssertTrue(
+            rendered.contains("Finish"),
+            "Finish must stay reachable at short heights; rendered:\n\(rendered)")
+        XCTAssertTrue(
+            rendered.contains("Hint") && rendered.contains("Send"),
+            "chat composer must stay usable at short heights; rendered:\n\(rendered)")
+    }
+
+    /// Portrait behavior is unchanged: at the exact 390×844 phone
+    /// portrait size the badge, chat, and Finish action all render.
+    @MainActor
+    func testPortraitKeepsBadgeChatAndFinish() {
+        let (flow, _) = makeFlow()
+        let view = InstalledShieldChatChallengeView(
+            flow: flow, theme: DesignSystem.defaultTheme)
+
+        let rendered = renderedText(for: view, width: 390, height: 844)
         XCTAssertTrue(
             rendered.contains("SIMULATED SHIELD"),
             "challenge must carry the simulated badge; rendered:\n\(rendered)")
