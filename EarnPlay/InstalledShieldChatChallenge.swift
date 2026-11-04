@@ -151,14 +151,38 @@ final class InstalledShieldChatEngine: ChatTutorEngine, HintListenEventSink {
 struct InstalledShieldChatChallengeView: View {
     @ObservedObject var flow: SimulatedShieldFlow
     @StateObject private var chatViewModel: ChatConversationViewModel
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     private let onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)?
 
-    /// Height below which the challenge uses its compact two-column
-    /// layout (PR #92 fix round 2): landscape phones report 375–440pt
-    /// while portrait phones report 667pt and up, so 500 separates
-    /// them with margin. iPad heights stay on the regular layout.
-    private static let compactHeightThreshold: CGFloat = 500
+    /// Minimum container width for the compact two-column layout (PR
+    /// #92 fix round 3, finding 1): the sidebar reserves 280pt, and
+    /// the chat keeps at least ~320pt for the number pad and the
+    /// Hint/Send row. A 390pt-wide portrait phone never qualifies, so
+    /// a keyboard-reduced height can never strand it in a 280pt-sidebar
+    /// + 110pt-chat split. Every supported landscape phone (667pt wide
+    /// and up) still qualifies.
+    private static let compactMinWidth: CGFloat = 600
+
+    /// Sidebar width in the compact layout (round 2, unchanged).
+    private static let compactSidebarWidth: CGFloat = 280
+
+    /// Layout decision table (round 3, finding 1): the compact sidebar
+    /// layout applies only when the vertical size class is compact
+    /// (short landscape phones — every iPhone in landscape reports a
+    /// compact vertical class, portrait phones and all iPads report
+    /// regular) AND the container is wide enough for the sidebar. The
+    /// decision reads NO height, so opening the software keyboard —
+    /// which changes neither the size class nor the container width —
+    /// can never flip the layout. Pure, so the table is unit-tested
+    /// directly; the view feeds it the environment size class and the
+    /// root reader's width.
+    static func useCompactLayout(
+        verticalSizeClass: UserInterfaceSizeClass?,
+        width: CGFloat
+    ) -> Bool {
+        verticalSizeClass == .compact && width >= compactMinWidth
+    }
 
     /// - Parameter makeEngine: challenge engine factory for tests; each
     ///   (re)mount builds its engine over its own flow. Production (nil)
@@ -189,14 +213,7 @@ struct InstalledShieldChatChallengeView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            Group {
-                if proxy.size.height < Self.compactHeightThreshold {
-                    compactBody
-                } else {
-                    regularBody
-                }
-            }
-            .frame(width: proxy.size.width, height: proxy.size.height)
+            adaptiveBody(width: proxy.size.width)
         }
         .background(theme.tokens.background.color)
         .interactiveDismissDisabled(true)
@@ -205,44 +222,62 @@ struct InstalledShieldChatChallengeView: View {
         }
     }
 
-    /// Portrait / tall layout: unchanged from issue #91 — the fixed
-    /// challenge header, the chat, and the finish footer stacked
-    /// vertically, with only the message thread scrolling.
-    private var regularBody: some View {
-        VStack(spacing: 0) {
-            challengeHeader
-                .padding()
+    /// Both layouts share one structure (round 3, finding 1): the
+    /// reader feeds ONLY the width — the keyboard never changes the
+    /// container width, and the height input is gone (the size class
+    /// carries the short/regular distinction) — so opening the
+    /// software keyboard can never flip the layout.
+    private func adaptiveBody(width: CGFloat) -> some View {
+        let compact = Self.useCompactLayout(
+            verticalSizeClass: verticalSizeClass, width: width)
+        return HStack(spacing: 0) {
+            // Compact sidebar (round 2): at short landscape heights the
+            // fixed header and finish footer plus the chat's number
+            // pad, answer field, and Hint/Send row exceed the viewport,
+            // and only the message thread scrolls — so the Finish
+            // action could be pushed off-screen in this
+            // non-dismissible challenge. Here the chat keeps the full
+            // height on the right while the badge and Finish action sit
+            // in a narrow left column, keeping both visible and tappable
+            // with no scrolling at phone landscape heights. The column
+            // scrolls only at even shorter heights.
+            if compact {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        challengeHeader
 
-            ChatConversationView(viewModel: chatViewModel, theme: theme)
-
-            finishFooter
-                .padding()
-        }
-    }
-
-    /// Short-height layout (landscape phones): the fixed header and
-    /// finish footer plus the chat's number pad, answer field, and
-    /// Hint/Send row exceed short viewports, and only the message
-    /// thread scrolls — so the Finish action could be pushed off-screen
-    /// in this non-dismissible challenge. Here the chat keeps the full
-    /// height on the right while the badge and Finish action sit in a
-    /// narrow left column, keeping both visible and tappable with no
-    /// scrolling at phone landscape heights. The column scrolls only
-    /// at even shorter heights.
-    private var compactBody: some View {
-        HStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    challengeHeader
-
-                    finishFooter
+                        finishFooter
+                    }
+                    .padding(12)
                 }
-                .padding(12)
+                .frame(width: Self.compactSidebarWidth)
             }
-            .frame(width: 280)
 
-            ChatConversationView(viewModel: chatViewModel, theme: theme)
+            // The chat keeps ONE structural position in both layouts —
+            // the inner column's middle slot — so a layout flip
+            // (rotation, multitasking resize) never replaces the
+            // focused composer subtree and never dismisses the
+            // keyboard. Only the header and footer move, and they hold
+            // no focus. The regular (portrait / tall) layout is
+            // otherwise unchanged from issue #91: the fixed challenge
+            // header, the chat, and the finish footer stacked
+            // vertically, with only the message thread scrolling.
+            VStack(spacing: 0) {
+                if !compact {
+                    challengeHeader
+                        .padding()
+                }
+
+                ChatConversationView(viewModel: chatViewModel, theme: theme)
+
+                if !compact {
+                    finishFooter
+                        .padding()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var challengeHeader: some View {

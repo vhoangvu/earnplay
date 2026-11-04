@@ -142,24 +142,37 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
 
     /// Hosts a view in a window and returns its OCR'd visible text
     /// (the `ThemeContrastFix2Tests` pattern). Defaults to the tall
-    /// window; short-height tests pass phone landscape dimensions.
+    /// portrait window; the short-height test passes phone landscape
+    /// dimensions with a compact vertical class (the challenge reads
+    /// the size class, not the height, so the class is set explicitly
+    /// rather than inherited from the portrait simulator).
     @MainActor
     private func renderedText<Content: View>(
         for view: Content,
         width: CGFloat = 390,
-        height: CGFloat = 1500
+        height: CGFloat = 1500,
+        verticalSizeClass: UserInterfaceSizeClass = .regular
     ) -> String {
-        let host = UIHostingController(rootView: view)
+        let host = UIHostingController(
+            rootView: view.environment(\.verticalSizeClass, verticalSizeClass))
         let win = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: height))
         win.rootViewController = host
         win.makeKeyAndVisible()
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
+        return ocrText(of: host.view)
+    }
+
+    /// OCR'd visible text of an already-mounted view (round 3): the
+    /// portrait-keyboard test snapshots its live window — with the
+    /// composer focused and across resizes — rather than a fresh one.
+    @MainActor
+    private func ocrText(of view: UIView) -> String {
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
-        host.view.layoutIfNeeded()
-        let renderer = UIGraphicsImageRenderer(bounds: host.view.bounds)
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
         let image = renderer.image { _ in
-            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
         }
         guard let cg = image.cgImage else { return "" }
         let req = VNRecognizeTextRequest()
@@ -519,86 +532,16 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         return viewModel
     }
 
-    /// A policy refresh replaces the cached installed flow while the
-    /// challenge is open; the recreated challenge (keyed by flow identity)
-    /// records post-replacement chat effort into, and finishes, the
-    /// REPLACEMENT session — a grant stays achievable, and the discarded
-    /// session's effort never leaks into the new decision.
-    @MainActor
-    func testFlowReplacedMidChallengeScoresReplacementSession() async {
-        let game = SimulatedSetupCatalog.apps[0]
-        let viewModel = await completeForcedSetup(appIDs: [game.id])
-        guard let oldFlow = viewModel.installedShieldFlow(
-            for: game.ref, category: game.category.ref
-        ) else {
-            return XCTFail("expected a cached installed flow for the picked app")
-        }
-        XCTAssertTrue(oldFlow.isShieldPresented)
-
-        // Pre-replacement effort through the full chat path: one answer
-        // recorded into the OLD session.
-        let (_, _, oldChat) = makeChallenge(flow: oldFlow)
-        oldChat.startIfNeeded()
-        oldChat.draft = "54"
-        oldChat.submitDraft()
-        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
-
-        // Policy refresh mid-challenge: version moves, the cache is
-        // reconciled, and the next lookup builds a replacement flow.
-        let syncStore = PolicyStore(directory: directory)
-        var updated = syncStore.currentPolicy
-        updated.version += 1
-        XCTAssertEqual(syncStore.apply(updated), .applied)
-        viewModel.refreshInstalledPolicyFromDisk()
-        guard let newFlow = viewModel.installedShieldFlow(
-            for: game.ref, category: game.category.ref
-        ) else {
-            return XCTFail("expected a replacement installed flow after the refresh")
-        }
-        XCTAssertFalse(
-            newFlow === oldFlow,
-            "a policy version move must replace the cached installed flow")
-        XCTAssertTrue(
-            newFlow.isShieldPresented,
-            "the cover stays up over the replacement flow")
-        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 0)
-        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 0)
-
-        // Post-replacement effort through a fresh chat path bound to the
-        // replacement (the recreated challenge view): 5 answers + 3 hints.
-        let (_, _, newChat) = makeChallenge(flow: newFlow)
-        newChat.startIfNeeded()
-        for answer in ["7", "14", "21", "28", "35"] {
-            newChat.draft = answer
-            newChat.submitDraft()
-        }
-        newChat.requestHint()
-        newChat.requestHint()
-        newChat.requestHint()
-
-        // 5 attempts (10 pts) + 3 hints (6 pts) = 16, clearing any 8...14
-        // threshold draw — and counting ONLY post-replacement effort.
-        XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 5)
-        XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 3)
-
-        // The discarded session keeps only its own effort: finishing it
-        // denies (one attempt, no hint leg).
-        XCTAssertEqual(oldFlow.currentEffortSignals().genuineAttempts, 1)
-        XCTAssertEqual(oldFlow.currentEffortSignals().hintInteractions, 0)
-        XCTAssertEqual(oldFlow.finishChallenge()?.decision, .denied)
-
-        // The replacement session scores its own effort: grant achievable.
-        let score = newFlow.finishChallenge()
-        XCTAssertEqual(score?.score, 16)
-        XCTAssertEqual(score?.decision, .granted)
-        XCTAssertTrue(score?.floorMet ?? false)
-        XCTAssertFalse(newFlow.isShieldPresented)
-        XCTAssertEqual(
-            newFlow.challengeDecisionText,
-            SimulatedShieldFlow.unlockGrantedText)
-    }
-
     // MARK: - Mounted flow replacement (PR #92 fix round 2, finding 2)
+    //
+    // Round 3, finding 2: the earlier `testFlowReplacedMidChallengeScoresReplacementSession`
+    // built fresh chat models via `makeChallenge(flow:)` for both flows and never mounted the
+    // cover, so it could not catch the stale-@StateObject regression. It was removed because
+    // `testMountedFlowReplacementRoutesEffortToReplacement` covers every assertion it made —
+    // pre-swap 1 attempt in the old session; post-swap 5 attempts + 3 hints = 16 in the
+    // replacement; old denies on finish; replacement grants, opens the window (`isShieldPresented`
+    // asserted explicitly post-swap), and shows the granted decision text — all submitted and
+    // finished through the same mounted cover surface.
 
     /// Holder so the test can swap the mounted cover host's flow
     /// mid-challenge, mirroring the production panel re-reading
@@ -763,6 +706,9 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertFalse(
             newFlow === oldFlow,
             "a policy version move must replace the cached installed flow")
+        XCTAssertTrue(
+            newFlow.isShieldPresented,
+            "the cover stays up over the replacement flow")
         XCTAssertEqual(newFlow.currentEffortSignals().genuineAttempts, 0)
         XCTAssertEqual(newFlow.currentEffortSignals().hintInteractions, 0)
         holder.flow = newFlow
@@ -886,7 +832,8 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         let view = InstalledShieldChatChallengeView(
             flow: flow, theme: DesignSystem.defaultTheme)
 
-        let rendered = renderedText(for: view, width: 844, height: 390)
+        let rendered = renderedText(
+            for: view, width: 844, height: 390, verticalSizeClass: .compact)
         XCTAssertTrue(
             rendered.contains("SIMULATED SHIELD"),
             "badge must stay visible at short heights; rendered:\n\(rendered)")
@@ -916,5 +863,185 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertTrue(
             rendered.contains("Finish"),
             "challenge must offer the finish boundary; rendered:\n\(rendered)")
+    }
+
+    // MARK: - Portrait keyboard (PR #92 fix round 3, finding 1)
+
+    /// Portrait phone with the software keyboard open: at 390x844 with
+    /// the PRODUCTION engine, focusing the composer keeps the regular
+    /// stacked layout — badge, chat, and Finish stay reachable — and
+    /// the composer keeps focus and identity. Shrinking the hosted
+    /// view to a keyboard-reduced height below 500pt (the finding's
+    /// premise: the keyboard steals the space; the window stays
+    /// full-size, as with a real keyboard window) must STILL stay
+    /// regular — no 280pt sidebar on a 390pt phone — with the focused
+    /// composer subtree surviving; restoring the height (keyboard
+    /// closed) keeps the same composer. Fails on the round-2 layout,
+    /// which flips to compact below 500pt and replaces the composer
+    /// (focus lost, the field instance replaced).
+    @MainActor
+    func testPortraitKeyboardKeepsLayoutAndComposerFocus() {
+        let (flow, _) = makeFlow()
+        var liveModel: ChatConversationViewModel?
+        let view = InstalledShieldChatChallengeView(
+            flow: flow,
+            theme: DesignSystem.defaultTheme,
+            onChatModelMount: { model, _ in liveModel = model })
+            .environment(\.verticalSizeClass, .regular)
+        let host = UIHostingController(rootView: view)
+        let win = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        win.rootViewController = host
+        win.makeKeyAndVisible()
+        UIView.setAnimationsEnabled(false)
+        defer { UIView.setAnimationsEnabled(true) }
+
+        let composerAppeared = spinUntil(timeout: 5) {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            return mountedComposerField(in: host.view) != nil
+        }
+        guard composerAppeared else {
+            return XCTFail("the mounted portrait challenge never rendered its composer")
+        }
+        guard let field = mountedComposerField(in: host.view) else {
+            return XCTFail("the mounted portrait challenge lost its composer")
+        }
+        guard let model = liveModel else {
+            return XCTFail("the mounted challenge never reported its live model")
+        }
+        guard spinUntil(timeout: 5, { model.messages.count >= 1 }) else {
+            return XCTFail("the mounted chat never started its session")
+        }
+
+        // Open the portrait keyboard: focus the rendered composer.
+        XCTAssertTrue(field.becomeFirstResponder(), "focusing the composer must work")
+        XCTAssertTrue(
+            spinUntil(timeout: 5, { field.isFirstResponder }),
+            "the composer must hold focus with the portrait keyboard open")
+
+        // Typing through the focused field drives the live model's draft.
+        field.selectAll(nil)
+        field.insertText("56")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { model.draft == "56" }),
+            "the focused composer must stay bound to the live model")
+
+        // Badge, chat, and Finish stay reachable with the keyboard open.
+        let open = ocrText(of: host.view)
+        XCTAssertTrue(
+            open.contains("SIMULATED SHIELD"),
+            "badge must stay visible with the keyboard open; rendered:\n\(open)")
+        XCTAssertTrue(
+            open.contains("Hint") && open.contains("Send"),
+            "chat composer must stay usable with the keyboard open; rendered:\n\(open)")
+        XCTAssertTrue(
+            open.contains("Finish"),
+            "Finish must stay reachable with the keyboard open; rendered:\n\(open)")
+
+        // Keyboard-reduced container height (below 500pt on the 390pt
+        // phone): the layout must stay regular and the focused
+        // composer must survive with its draft binding intact.
+        host.view.autoresizingMask = []
+        host.view.frame = CGRect(x: 0, y: 0, width: 390, height: 499)
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        host.view.layoutIfNeeded()
+
+        guard let sameField = mountedComposerField(in: host.view) else {
+            return XCTFail("the keyboard-reduced height removed the composer")
+        }
+        XCTAssertTrue(
+            sameField === field,
+            "the composer subtree must survive a keyboard-driven height change (no subtree replacement)")
+        // Shrinking the hosted view transiently resigns first responder
+        // (UIKit re-seats the field on geometry changes even though the
+        // instance survives — the identity assertion above proves no
+        // subtree replacement happened). A real keyboard never resizes
+        // the hosted view, so production keeps focus; here the same
+        // field simply refocuses.
+        XCTAssertTrue(
+            field.becomeFirstResponder(),
+            "the surviving composer must refocus after the height change")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { field.isFirstResponder }),
+            "the surviving composer must hold focus after refocusing")
+        field.selectAll(nil)
+        field.insertText("42")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { model.draft == "42" }),
+            "the composer draft binding must survive a keyboard-driven height change")
+
+        // The badge stays rendered at the reduced height. (The Hint/Send
+        // row cannot fit a 499pt window in ANY stacked layout — the
+        // fixed chrome exceeds it — so it is not asserted here;
+        // production keeps the full 844pt window with the keyboard
+        // avoiding over it, and the open phase above proves badge, chat,
+        // and Finish all reachable with the keyboard open at full size.)
+        let reduced = ocrText(of: host.view)
+        XCTAssertTrue(
+            reduced.contains("SIMULATED SHIELD"),
+            "badge must stay visible at the keyboard-reduced height; rendered:\n\(reduced)")
+
+        // Keyboard closed (full height restored): the regular layout
+        // and the same composer survive the round trip.
+        host.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        host.view.layoutIfNeeded()
+
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === field,
+            "the composer subtree must survive the keyboard open/close round trip")
+        field.selectAll(nil)
+        field.insertText("7")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { model.draft == "7" }),
+            "the composer draft binding must survive the keyboard open/close round trip")
+
+        let closed = ocrText(of: host.view)
+        XCTAssertTrue(
+            closed.contains("SIMULATED SHIELD"),
+            "badge must stay visible after the keyboard closes; rendered:\n\(closed)")
+        XCTAssertTrue(
+            closed.contains("Hint") && closed.contains("Send"),
+            "chat composer must stay usable after the keyboard closes; rendered:\n\(closed)")
+        XCTAssertTrue(
+            closed.contains("Finish"),
+            "Finish must stay reachable after the keyboard closes; rendered:\n\(closed)")
+    }
+
+    /// Decision table: compact only with a compact vertical class AND
+    /// enough width. The table takes NO height — a 390pt-wide portrait
+    /// phone never takes the 280pt sidebar, however short a
+    /// keyboard-reduced height gets; short landscape keeps the round-2
+    /// sidebar; regular-class layouts (portrait, iPad) stay stacked.
+    @MainActor
+    func testCompactLayoutDecisionTable() {
+        // Regular vertical class (portrait phones, all iPads): regular
+        // at every width — height never enters the decision.
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .regular, width: 390))
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .regular, width: 844))
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .regular, width: 1024))
+        // Unset class: regular (fail closed, never the sidebar).
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: nil, width: 844))
+        // Short landscape phones: compact (round-2 behavior kept).
+        XCTAssertTrue(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .compact, width: 844))
+        XCTAssertTrue(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .compact, width: 667))
+        // Width gate: narrow containers never take the sidebar, even
+        // with a compact vertical class.
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .compact, width: 390))
+        XCTAssertFalse(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .compact, width: 599))
+        XCTAssertTrue(InstalledShieldChatChallengeView.useCompactLayout(
+            verticalSizeClass: .compact, width: 600))
     }
 }
