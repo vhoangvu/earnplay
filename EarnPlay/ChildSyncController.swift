@@ -49,6 +49,13 @@ final class ChildSyncController: ObservableObject {
     /// Fired after a retained failed log drains (round 2 item 2 test
     /// hook; production delivery is `service.notifySessionEnqueued()`).
     var onSessionEnqueued: (() -> Void)?
+    /// Fired on the main thread after the sync service accepts a policy
+    /// update (issue #87 fix round 3). The app wires this to the setup
+    /// model's `refreshInstalledPolicyFromDisk()`, so the installed
+    /// manager, cached shield flows, and completion UI refresh without
+    /// a relaunch. Nil unless the host sets it; stale versions and
+    /// persistence failures fire nothing.
+    var onPolicyUpdate: (() -> Void)?
     /// Directory holding the retained-log file (round 3 item 3). Defaults
     /// to the shared app directory (the default queue's directory in
     /// production); tests inject an isolated directory.
@@ -104,6 +111,13 @@ final class ChildSyncController: ObservableObject {
         }
         self.transport.onPairingFailure = { [weak self] _ in
             self?.publishOnMain { self?.handlePairingFailure() }
+        }
+        // Issue #87 fix round 3: accepted sync updates refresh the
+        // setup model's installed state. The service fires on the
+        // transport's receive thread; re-publish on main like the
+        // pairing handlers above.
+        self.service.onPolicyApplied = { [weak self] _ in
+            self?.publishOnMain { self?.onPolicyUpdate?() }
         }
         // Fix round 1 (finding 1): publish the pre-invite code while
         // unpaired, cleared on pairing. Chained AFTER the store's

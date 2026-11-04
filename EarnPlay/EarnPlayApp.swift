@@ -23,7 +23,7 @@ struct EarnPlayApp: App {
 
 struct ContentView: View {
     @StateObject private var downloadModel = ModelDownloadViewModel()
-    @StateObject private var setup = SetupFlowViewModel.makeDefault()
+    @StateObject private var setup: SetupFlowViewModel
     @ObservedObject var themes: ThemeStore
     /// Shared sync; the practice engine enqueues into its outbox
     /// instance and notifies its service after each durable enqueue.
@@ -31,6 +31,19 @@ struct ContentView: View {
     /// whenever the controller holds a pending request.
     @ObservedObject var syncController: ChildSyncController
     @Environment(\.scenePhase) private var scenePhase
+
+    /// The setup model shares the sync controller's policy store (issue
+    /// #87 fix round 3): one live store for sync updates, the setup
+    /// flow, the installed manager, and the completion UI, so an
+    /// accepted update never sits in a sibling instance invisible to
+    /// the installed shields until relaunch.
+    init(themes: ThemeStore, syncController: ChildSyncController) {
+        self.themes = themes
+        self.syncController = syncController
+        _setup = StateObject(wrappedValue: SetupFlowViewModel.makeDefault(
+            policyStore: syncController.policyStore
+        ))
+    }
 
     /// UI-test-only chat preview (issue #77): launched with
     /// `--earnplay-ui-chat`, the app renders the practice chat directly,
@@ -97,7 +110,7 @@ struct ContentView: View {
                                     syncController.handleFailedEnqueue(log)
                                 })), theme: themes.theme)
                     } else {
-                        SetupFlowView(viewModel: setup)
+                        SetupFlowView(viewModel: setup, themes: themes)
                     }
                     } else {
                         ModelDownloadView(viewModel: downloadModel, themes: themes)
@@ -107,6 +120,16 @@ struct ContentView: View {
         }
         .task {
             downloadModel.refreshIfNeeded()
+        }
+        // Issue #87 fix round 3: an accepted sync update refreshes the
+        // installed manager, cached shield flows, and completion UI
+        // without a relaunch. Wired here (not in `init`, which SwiftUI
+        // may re-run with a discarded model) so the hook always reaches
+        // the live `@StateObject` setup model.
+        .onAppear {
+            syncController.onPolicyUpdate = { [weak setupVM = setup] in
+                Task { @MainActor in setupVM?.refreshInstalledPolicyFromDisk() }
+            }
         }
         // Production pairing confirmation (issue #65): presented
         // whenever a pending request exists, from ANY app state —

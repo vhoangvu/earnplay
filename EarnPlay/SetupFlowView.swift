@@ -10,9 +10,15 @@ import EarnPlayCore
 /// skipped, and an incomplete flow claims no protection.
 public struct SetupFlowView: View {
     @ObservedObject var viewModel: SetupFlowViewModel
+    /// The child app's theme store, passed from the app root so the
+    /// setup-wide About sheet's picker drives the live app theme (the
+    /// same app-scope binding `SetupCompleteView` uses).
+    @ObservedObject var themes: ThemeStore
+    @State private var showingAbout = false
 
-    public init(viewModel: SetupFlowViewModel) {
+    public init(viewModel: SetupFlowViewModel, themes: ThemeStore) {
         self.viewModel = viewModel
+        self.themes = themes
     }
 
     public var body: some View {
@@ -37,6 +43,36 @@ public struct SetupFlowView: View {
             }
             .navigationTitle("Set up EarnPlay")
             .navigationBarTitleDisplayMode(.inline)
+            // Setup-wide About/Demo entry (issue #87 fix round 1): the
+            // download screen's About entry exists only while the model
+            // is NOT ready and the completion screen's only at
+            // `.complete`, so without this a model-ready install stuck in
+            // setup — exactly a blocked TestFlight tester — can never
+            // reach the simulate toggle. One toolbar item covers every
+            // setup step; the toggle keeps its restart requirement.
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("About & demo") {
+                        showingAbout = true
+                    }
+                    .accessibilityIdentifier("setupAboutButton")
+                }
+            }
+            .sheet(isPresented: $showingAbout) {
+                NavigationStack {
+                    ScrollView {
+                        AboutView(themes: themes)
+                            .padding()
+                    }
+                    .navigationTitle("About")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingAbout = false }
+                        }
+                    }
+                }
+            }
         }
         .onAppear {
             viewModel.refreshAuthorizationStatus()
@@ -55,6 +91,13 @@ private struct AuthorizationStepView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Allow Screen Time access")
                     .font(.title2.bold())
+                if viewModel.isSimulatedMode {
+                    SimulatedModeBadge()
+                    Text("Simulated mode is on: requesting below grants " +
+                        "simulated approval for the demo — not real Screen " +
+                        "Time access.")
+                        .font(.footnote)
+                }
                 Text("EarnPlay uses Screen Time to list this device's apps " +
                     "and to shield them outside earned unlocks. This step " +
                     "must be done on the child's device.")
@@ -109,10 +152,14 @@ private struct EnumerationStepView: View {
                     "next screen you choose which picked apps stay allowed " +
                     "and which can be earned back.")
                     .foregroundStyle(.secondary)
-                Button("Select apps and categories") {
-                    viewModel.isPickerPresented = true
+                if viewModel.usesSimulatedEnumeration {
+                    SimulatedEnumerationPicker(viewModel: viewModel)
+                } else {
+                    Button("Select apps and categories") {
+                        viewModel.isPickerPresented = true
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
                 Text(pickedSummary)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -125,7 +172,7 @@ private struct EnumerationStepView: View {
                     viewModel.continueFromEnumeration()
                 }
                 .buttonStyle(.bordered)
-                .disabled(selectionIsEmpty)
+                .disabled(!viewModel.hasEnumerationInput)
                 Button("Start over", role: .destructive) {
                     viewModel.abandonSetup()
                 }
@@ -142,19 +189,84 @@ private struct EnumerationStepView: View {
         )
     }
 
-    private var selectionIsEmpty: Bool {
-        viewModel.selection.applicationTokens.isEmpty
-            && viewModel.selection.categoryTokens.isEmpty
-    }
-
     private var pickedSummary: String {
-        let apps = viewModel.selection.applicationTokens.count
-        let categories = viewModel.selection.categoryTokens.count
+        let apps: Int
+        let categories: Int
+        if viewModel.usesSimulatedEnumeration {
+            apps = viewModel.pickedSimulatedApps.count
+            categories = viewModel.pickedSimulatedCategories.count
+        } else {
+            apps = viewModel.selection.applicationTokens.count
+            categories = viewModel.selection.categoryTokens.count
+        }
         if apps == 0 && categories == 0 {
             return "Nothing picked yet."
         }
         return "\(apps) app\(apps == 1 ? "" : "s"), " +
             "\(categories) categor\(categories == 1 ? "y" : "ies") picked."
+    }
+}
+
+// MARK: - Simulated enumeration picker (forced mode)
+
+/// Demo app/category multi-select for forced-mode setup (issue #87 fix
+/// round 1): simulated approval never grants real FamilyControls
+/// authorization, so the system picker cannot produce tokens on this
+/// path. Picks feed the setup enumeration through the same
+/// `continueFromEnumeration()` submission as tokens; the unforced flow
+/// keeps the real picker exactly as-is.
+private struct SimulatedEnumerationPicker: View {
+    @ObservedObject var viewModel: SetupFlowViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Simulated mode is on: the system picker cannot list " +
+                "apps without real Screen Time authorization, so pick " +
+                "demo apps and categories below. Selections are " +
+                "simulated — not real device apps.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Demo apps")
+                .font(.headline)
+            ForEach(SimulatedSetupCatalog.apps) { app in
+                Toggle(
+                    isOn: binding(for: app.id, in: \.simulatedAppIDs)
+                ) {
+                    VStack(alignment: .leading) {
+                        Text(app.name)
+                        Text(app.category.name)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityIdentifier("simulatedAppPick-\(app.id)")
+            }
+            Text("Demo categories")
+                .font(.headline)
+            ForEach(SimulatedSetupCatalog.categories) { category in
+                Toggle(
+                    category.name,
+                    isOn: binding(for: category.id, in: \.simulatedCategoryIDs)
+                )
+                .accessibilityIdentifier("simulatedCategoryPick-\(category.id)")
+            }
+        }
+    }
+
+    private func binding(
+        for id: String,
+        in keyPath: ReferenceWritableKeyPath<SetupFlowViewModel, Set<String>>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { viewModel[keyPath: keyPath].contains(id) },
+            set: { selected in
+                if selected {
+                    viewModel[keyPath: keyPath].insert(id)
+                } else {
+                    viewModel[keyPath: keyPath].remove(id)
+                }
+            }
+        )
     }
 }
 
@@ -183,30 +295,29 @@ private struct SelectionStepView: View {
             .padding(.horizontal)
             List {
                 ForEach(viewModel.pickedApps) { app in
-                    VStack(alignment: .leading, spacing: 8) {
+                    AppChoiceRow(viewModel: viewModel, appID: app.id) {
                         Label(app.token)
-                        Picker(
-                            "Choice",
-                            selection: Binding(
-                                get: { viewModel.choices[app.id] ?? .blocked },
-                                set: { viewModel.choices[app.id] = $0 }
-                            )
-                        ) {
-                            ForEach(SetupFlowViewModel.AppChoice.allCases) { choice in
-                                Text(choice.shortLabel).tag(choice)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        Text((viewModel.choices[app.id] ?? .blocked).explanation)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 4)
                 }
-                if !viewModel.pickedCategories.isEmpty {
+                ForEach(viewModel.pickedSimulatedApps) { app in
+                    AppChoiceRow(viewModel: viewModel, appID: app.id) {
+                        VStack(alignment: .leading) {
+                            Text(app.name)
+                            Text(app.category.name)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if !viewModel.pickedCategories.isEmpty
+                    || !viewModel.pickedSimulatedCategories.isEmpty
+                {
                     Section("Category backstop") {
                         ForEach(viewModel.pickedCategories) { category in
                             Label(category.token)
+                        }
+                        ForEach(viewModel.pickedSimulatedCategories) { category in
+                            Text(category.name)
                         }
                         Text("Newly installed apps in these categories stay " +
                             "shielded until they are picked.")
@@ -238,6 +349,39 @@ private struct SelectionStepView: View {
                 .padding(.horizontal)
         }
         .padding(.vertical)
+    }
+}
+
+/// One app's Blocked/Earn/Allowed choice row (selection step),
+/// shared by token-backed picks (whose title is the system token label)
+/// and simulated picks (whose title is the catalog name). Extracted so
+/// both paths render the identical control; no behavior change for the
+/// token path.
+private struct AppChoiceRow<Title: View>: View {
+    @ObservedObject var viewModel: SetupFlowViewModel
+    let appID: String
+    @ViewBuilder let title: () -> Title
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            title()
+            Picker(
+                "Choice",
+                selection: Binding(
+                    get: { viewModel.choices[appID] ?? .blocked },
+                    set: { viewModel.choices[appID] = $0 }
+                )
+            ) {
+                ForEach(SetupFlowViewModel.AppChoice.allCases) { choice in
+                    Text(choice.shortLabel).tag(choice)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text((viewModel.choices[appID] ?? .blocked).explanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -319,6 +463,9 @@ public struct SetupCompleteView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Setup complete")
                     .font(.title2.bold())
+                if viewModel.isSimulatedMode {
+                    SimulatedModeBadge()
+                }
                 Button("About & app theme") {
                     showingAbout = true
                 }
@@ -340,7 +487,7 @@ public struct SetupCompleteView: View {
                     }
                     .font(.subheadline)
                 }
-                if !viewModel.pickedApps.isEmpty {
+                if !viewModel.pickedApps.isEmpty || !viewModel.pickedSimulatedApps.isEmpty {
                     Text("Managed apps")
                         .font(.headline)
                     ForEach(viewModel.pickedApps) { app in
@@ -352,6 +499,25 @@ public struct SetupCompleteView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    ForEach(viewModel.pickedSimulatedApps) { app in
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(app.name)
+                                Text(app.category.name)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(viewModel.choices[app.id]?.shortLabel ?? "Blocked")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if viewModel.supportsInstalledSimulatedShields,
+                    !viewModel.pickedApps.isEmpty || !viewModel.pickedSimulatedApps.isEmpty
+                {
+                    InstalledShieldPanel(viewModel: viewModel, theme: themes.theme)
                 }
                 Text("Demo status: the policy is saved and shields are " +
                     "staged through the T2.2 shield interface. Real " +
@@ -390,6 +556,115 @@ public struct SetupCompleteView: View {
                 .foregroundStyle(.secondary)
             Text(value)
         }
+    }
+}
+
+// MARK: - Installed simulated shield panel
+
+/// Reachable simulated lock/unlock over the MAIN flow's installed shield
+/// composition (issue #87 fix round 1): each picked app's flow runs on
+/// the same manager, policy, enumeration, and simulated backend the
+/// setup committed, so testers exercise real grant/expiry behavior from
+/// the completion screen — never the dead preview harness. Shown only
+/// when a simulated backend is installed (forced mode); the honesty
+/// badge above it is retained.
+///
+/// Fix round 2: blocked targets (the default Blocked choice, including
+/// never-unlockable overrides) show an informational status instead of
+/// the challenge host — the manager refuses their unlocks regardless
+/// of effort, so presenting the full-screen challenge would trap the
+/// tester. The challenge path for unlockable targets is unchanged.
+private struct InstalledShieldPanel: View {
+    @ObservedObject var viewModel: SetupFlowViewModel
+    var theme: DesignSystem.Theme = DesignSystem.defaultTheme
+    @State private var activeShieldAppID: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Simulated shields")
+                .font(.headline)
+            Text("Try this setup's shields: each entry opens a simulated " +
+                "lock screen over the installed configuration. Simulated " +
+                "only — not real enforcement.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(viewModel.pickedApps) { app in
+                Button {
+                    activeShieldAppID = app.id
+                    _ = viewModel.selectInstalledShieldApp(app.id)
+                } label: {
+                    HStack {
+                        Text("Simulated shield:")
+                        Label(app.token)
+                    }
+                }
+                .accessibilityIdentifier("installedShieldEntry-\(app.id)")
+                if viewModel.isInstalledShieldBlocked(app.ref) {
+                    InstalledBlockedStatusLabel(appID: app.id)
+                }
+            }
+            ForEach(viewModel.pickedSimulatedApps) { app in
+                Button("Simulated shield: \(app.name)") {
+                    activeShieldAppID = app.id
+                    _ = viewModel.selectInstalledShieldApp(app.id)
+                }
+                .accessibilityIdentifier("installedShieldEntry-\(app.id)")
+                if viewModel.isInstalledShieldBlocked(app.ref) {
+                    InstalledBlockedStatusLabel(appID: app.id)
+                }
+            }
+            if let id = activeShieldAppID,
+                let target = viewModel.installedShieldTarget(for: id)
+            {
+                if viewModel.isInstalledShieldBlocked(target.ref) {
+                    InstalledBlockedStatusLabel(appID: id, selected: true)
+                } else if let flow = viewModel.installedShieldFlow(
+                    for: target.ref, category: target.category
+                ) {
+                    SimulatedShieldCoverHost(flow: flow, theme: theme)
+                }
+            }
+        }
+    }
+}
+
+/// Informational blocked status for an installed shield target with no
+/// challenge offered (issue #87 fix round 2): the default Blocked
+/// choice and never-unlockable overrides alike. Rendered inline
+/// per-row and in the selected detail in place of the challenge host,
+/// so a blocked target never opens a non-dismissible challenge.
+/// Internal so app tests pin the copy without driving panel taps.
+struct InstalledBlockedStatusLabel: View {
+    let appID: String
+    var selected: Bool = false
+
+    var body: some View {
+        Text("Blocked (simulated) — no challenge offered. It stays shielded.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier(
+                selected ? "installedBlockedStatusSelected-\(appID)" : "installedBlockedStatus-\(appID)"
+            )
+    }
+}
+
+// MARK: - Simulated-mode honesty badge
+
+/// Honesty badge for simulated mode in the MAIN setup flow (issue
+/// #87): the same labeling `SimulatedShieldView` renders, so simulated
+/// authorization and simulated shields here never look like real
+/// Screen Time enforcement. Shown only when the view model runs a
+/// simulated half (`isSimulatedMode`); the unforced flow is unchanged.
+private struct SimulatedModeBadge: View {
+    var body: some View {
+        Text(SimulatedShieldFlow.simulatedBadgeText)
+            .font(.headline)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(Color(.systemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .accessibilityIdentifier("simulatedShieldBadge")
     }
 }
 

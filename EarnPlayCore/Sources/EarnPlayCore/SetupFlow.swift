@@ -426,6 +426,12 @@ public final class SetupFlow: @unchecked Sendable {
         return stagedEnumeration
     }
 
+    /// The shield manager this flow applies through. Exposed so the app
+    /// can drive simulated shield flows over the installed composition
+    /// (issue #87): the same manager, policy, enumeration, and backend
+    /// the setup committed — never a parallel demo sandbox.
+    public var installedShieldManager: ShieldManager { shieldManager }
+
     /// Records a FamilyControls authorization result.
     ///
     /// A grant advances `authorization` to `enumeration` — except when a
