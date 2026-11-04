@@ -100,6 +100,14 @@ protocol ChatTutorEngine: AnyObject {
     /// view model renders the session-complete state (which refuses all
     /// submissions) until the block lifts. Default is false.
     var isInputBlocked: Bool { get }
+    /// Async follow-up sink (issue #93): an engine whose reply needs
+    /// background work (on-device model inference) withholds part of
+    /// its sync update and delivers the remainder here later. The view
+    /// model installs this in `init` and applies each update verbatim
+    /// on the main actor, exactly like a sync update. Invoked from a
+    /// background queue; implementations must hop to the main actor.
+    /// Default is nil (the engine answers fully synchronously).
+    var onAsyncUpdate: ((ChatEngineUpdate) -> Void)? { get set }
 }
 
 extension ChatTutorEngine {
@@ -108,6 +116,13 @@ extension ChatTutorEngine {
     func recordComposerActivity() {}
     var currentHintListenSink: (any HintListenEventSink)? { nil }
     var isInputBlocked: Bool { false }
+    var onAsyncUpdate: ((ChatEngineUpdate) -> Void)? {
+        get { nil }
+        // Engines without async work drop the subscription: the view
+        // model assigns unconditionally, and fully-sync engines keep
+        // working with no stored callback.
+        set { _ = newValue }
+    }
 }
 
 // MARK: - Untrusted child input
@@ -199,6 +214,13 @@ final class ChatConversationViewModel: ObservableObject {
         self.hintListenForwarder = forwarder
         speech.hintListenSink = forwarder
         cancellable = speech.$isVoiceUnavailable.sink { [weak self] in self?.isVoiceUnavailable = $0 }
+        // Issue #93: engines with background work (model inference)
+        // deliver withheld reply turns here; each is applied verbatim
+        // on the main actor, exactly like a sync update. Fully-sync
+        // engines drop this assignment via the protocol default.
+        engine.onAsyncUpdate = { [weak self] update in
+            Task { @MainActor [weak self] in self?.apply(update) }
+        }
     }
 
     // MARK: Rendering state for tests and the view
