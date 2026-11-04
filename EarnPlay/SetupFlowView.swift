@@ -573,7 +573,9 @@ public struct SetupCompleteView: View {
 /// never-unlockable overrides) show an informational status instead of
 /// the challenge host — the manager refuses their unlocks regardless
 /// of effort, so presenting the full-screen challenge would trap the
-/// tester. The challenge path for unlockable targets is unchanged.
+/// tester. Issue #91: the challenge for unlockable targets is the chat
+/// tutor (`InstalledShieldChatCoverHost`), finishing through the same
+/// `finishChallenge` boundary; blocked targets keep the status below.
 private struct InstalledShieldPanel: View {
     @ObservedObject var viewModel: SetupFlowViewModel
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
@@ -621,7 +623,7 @@ private struct InstalledShieldPanel: View {
                 } else if let flow = viewModel.installedShieldFlow(
                     for: target.ref, category: target.category
                 ) {
-                    SimulatedShieldCoverHost(flow: flow, theme: theme)
+                    InstalledShieldChatCoverHost(flow: flow, theme: theme)
                 }
             }
         }

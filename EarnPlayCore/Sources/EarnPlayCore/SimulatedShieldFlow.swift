@@ -196,6 +196,49 @@ public final class SimulatedShieldFlow: ObservableObject {
         recorder.recordInteraction()
     }
 
+    /// Records one follow-up interaction from the chat challenge (the
+    /// child's reply to a tutor probe). One explicit recorder call per
+    /// chat interaction type (issue #91): the challenge wrapper calls
+    /// this, never the recorder directly.
+    public func recordFollowUpInteraction(at date: Date? = nil) {
+        recorder.recordFollowUpInteraction(at: date)
+    }
+
+    /// Records one answer revision from the chat challenge (a submission
+    /// the engine labels a revision of an earlier answer).
+    public func recordAnswerRevision(at date: Date? = nil) {
+        recorder.recordAnswerRevision(at: date)
+    }
+
+    /// Records one verbal explanation from the chat challenge (a
+    /// substantive probe reply explains the child's thinking).
+    public func recordExplanation(at date: Date? = nil) {
+        recorder.recordExplanation(at: date)
+    }
+
+    /// Records a timing-only interaction from the chat challenge
+    /// (composer activity, a non-substantive probe reply): an active-time
+    /// anchor that never scores as an attempt, hint, or any other count.
+    public func recordInteraction(at date: Date? = nil) {
+        recorder.recordInteraction(at: date)
+    }
+
+    /// Hint-listen entry for the chat challenge: a hint read aloud is a
+    /// hint interaction on the scored session — the same
+    /// recorded-hint-interaction interface the main practice chat records
+    /// through. A plain method (not a `HintListenEventSink` conformance,
+    /// which is nonisolated): the challenge engine's sink forwards here.
+    public func recordHintListen(_ event: HintListenEvent) {
+        recorder.recordHintListen(event)
+    }
+
+    /// The effort signals recorded so far in the current challenge
+    /// session: a read-only view over the same session `finishChallenge`
+    /// scores. The chat mapping tests assert through this.
+    public func currentEffortSignals(at date: Date? = nil) -> EffortSignals {
+        recorder.signals(at: date)
+    }
+
     /// Finishes the challenge: scores the recorded session through the
     /// session-decision boundary (`EffortSessionRecorder.evaluateAndLog`,
     /// which persists the grant/deny Decision) and, only on a granted
