@@ -61,6 +61,15 @@ struct ChatEngineUpdate: Equatable {
     /// the engine treats that submission as a revision of an earlier
     /// answer. The view renders the echo with this label verbatim.
     var submittedTurnIsRevision: Bool = false
+    /// Session generation tag on ASYNC replies (issue #93 fix): the
+    /// engine generation captured when the reply was requested. The
+    /// view model drops an async update whose tag no longer matches
+    /// the engine's live generation (a restart superseded it while
+    /// the reply was in flight or queued for the main actor), so a
+    /// stale reply can never append to, or overwrite turns of, the
+    /// cleared new session. Nil on sync updates, which are applied in
+    /// the same call stack and need no staleness check.
+    var sessionGeneration: Int? = nil
 }
 
 /// The tutor-engine boundary the chat renders. Implementations own
@@ -101,13 +110,20 @@ protocol ChatTutorEngine: AnyObject {
     /// submissions) until the block lifts. Default is false.
     var isInputBlocked: Bool { get }
     /// Async follow-up sink (issue #93): an engine whose reply needs
-    /// background work (on-device model inference) withholds part of
-    /// its sync update and delivers the remainder here later. The view
-    /// model installs this in `init` and applies each update verbatim
-    /// on the main actor, exactly like a sync update. Invoked from a
-    /// background queue; implementations must hop to the main actor.
-    /// Default is nil (the engine answers fully synchronously).
+    /// background work (on-device model inference) answers
+    /// synchronously and delivers model-phrased replacements here
+    /// later. The view model installs this in `init` and applies each
+    /// update verbatim on the main actor, exactly like a sync update.
+    /// Invoked from a background queue; implementations must hop to
+    /// the main actor. Default is nil (the engine answers fully
+    /// synchronously).
     var onAsyncUpdate: ((ChatEngineUpdate) -> Void)? { get set }
+    /// Live session generation (issue #93 fix): bumped by every
+    /// `startSession`, so an async reply tagged with an older
+    /// generation is stale and the view model drops it. Must be safe
+    /// to read from any thread. Default is 0 (fully-sync engines tag
+    /// nothing and emit nothing async).
+    var currentSessionGeneration: Int { get }
 }
 
 extension ChatTutorEngine {
@@ -123,6 +139,7 @@ extension ChatTutorEngine {
         // working with no stored callback.
         set { _ = newValue }
     }
+    var currentSessionGeneration: Int { 0 }
 }
 
 // MARK: - Untrusted child input
@@ -215,11 +232,22 @@ final class ChatConversationViewModel: ObservableObject {
         speech.hintListenSink = forwarder
         cancellable = speech.$isVoiceUnavailable.sink { [weak self] in self?.isVoiceUnavailable = $0 }
         // Issue #93: engines with background work (model inference)
-        // deliver withheld reply turns here; each is applied verbatim
+        // deliver phrased replacements here; each is applied verbatim
         // on the main actor, exactly like a sync update. Fully-sync
-        // engines drop this assignment via the protocol default.
+        // engines drop this assignment via the protocol default. The
+        // generation check runs at apply time on the main actor: a
+        // reply delivered just before a restart (whose engine-side
+        // guard already passed) still queues behind the restart's
+        // synchronous generation bump, so it is dropped here instead
+        // of appending stale turns to, or overwriting turns of, the
+        // cleared new session. Untagged updates (nil) apply as before.
         engine.onAsyncUpdate = { [weak self] update in
-            Task { @MainActor [weak self] in self?.apply(update) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let tag = update.sessionGeneration,
+                   tag != self.engine.currentSessionGeneration { return }
+                self.apply(update)
+            }
         }
     }
 

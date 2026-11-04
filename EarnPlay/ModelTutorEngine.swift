@@ -103,45 +103,77 @@ private final class LockedBox<Value> {
 /// phrasing turns from `ModelRuntime.generate()`; a missing/unlinked
 /// runtime, a cold runtime, a generation failure, a timeout, or a
 /// rejected response serves the inner engine's deterministic turns
-/// verbatim instead. The sync methods never block on inference: while
-/// the model path is active they return the inner update with its turns
-/// withheld and deliver the turns later through `onAsyncUpdate`, in
-/// request order. Progress, composer, and the echo's revision label
-/// always arrive synchronously, so the session-complete boundary and
-/// every scoring input behave exactly as the inner engine's.
+/// verbatim instead. The sync methods never block on inference and
+/// always answer verbatim: every deterministic turn (including the
+/// next question) renders immediately, so input is never accepted for
+/// a question not yet shown, and the model path delivers rephrased
+/// encouragement/probe replacements later through `onAsyncUpdate`, in
+/// request order, applied in place by turn id. Progress, composer, and
+/// the echo's revision label always arrive synchronously, so the
+/// session-complete boundary and every scoring input behave exactly as
+/// the inner engine's.
 ///
 /// Solver authority: questions, hints, answer verdicts, progress, and
 /// composers always come from the inner deterministic engine; the model
 /// only rephrases encouragement/probe turns, preserving their ids and
 /// kinds. Model prompts carry no question, answer, or verdict (see
-/// `promptFor(kind:)`), so model text can structurally neither confirm,
-/// deny, nor leak the solver's verdict. Nothing here is ever stub or
-/// fake inference: model text comes only from the generator, and any
-/// failure surfaces the deterministic fallback, never invented text.
+/// `promptFor(kind:)`), and generated text carrying an unverified
+/// correctness claim or answer-bearing content is rejected outright
+/// (see `containsUnverifiedCorrectnessClaim`), so model text can
+/// structurally neither confirm, deny, nor leak the solver's verdict.
+/// Nothing here is ever stub or fake inference: model text comes only
+/// from the generator, and any failure surfaces the deterministic
+/// fallback, never invented text.
 /// A restart (`startSession`) supersedes in-flight replies: follow-ups
-/// captured under an older epoch are dropped rather than appending
-/// stale turns to the cleared thread (see `generation`).
+/// captured under an older generation are dropped rather than appending
+/// stale turns to the cleared thread (see `generation`), and every
+/// async update carries its generation tag so the view model drops a
+/// reply that was delivered just before the restart (see
+/// `ChatEngineUpdate.sessionGeneration`).
 final class ModelTutorEngine: ChatTutorEngine {
-    /// Bounded wait per withheld reply (warm runtime only): generation
+    /// Bounded wait per model-path reply (warm runtime only): generation
     /// past this deadline falls back to the deterministic turns.
     static let defaultTimeout: TimeInterval = 30
     /// Max tokens per tutor turn: short phrasing turns, like the spike.
     static let modelMaxTokens: Int32 = 48
 
+    /// Production model-file resolution (finding 5): the default
+    /// lookup when its file exists, else the persisted registry's
+    /// active bundle model file — a retained snapshot stays usable
+    /// for inference even when the default/current file is gone, the
+    /// same fallback the readiness gate accepts. Cheap (existence +
+    /// 4-byte magic only, no hashing) and main-thread safe. No digest
+    /// is bound here (that would hash on the main thread); the
+    /// readiness gate already validated off-main, load still checks
+    /// GGUF magic, and a file that vanishes after resolution fails
+    /// load so the tutor falls back deterministically. The registry
+    /// snapshot is not retained (no registry instance is held): the
+    /// load copies bytes to an immutable artifact promptly, and a
+    /// mid-load disappearance surfaces fallback, never an error.
+    static func resolveProductionModelURL(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                          fileManager: FileManager = .default,
+                                          registryStoreURL: URL? = nil) -> URL? {
+        if let url = ModelRuntime.defaultModelURL(environment: environment, fileManager: fileManager),
+           fileManager.fileExists(atPath: url.path) {
+            return url
+        }
+        return VersionRegistry.activeBundleModelFileURL(storeURL: registryStoreURL, fileManager: fileManager)
+    }
+
     /// Production availability probe: the llama framework was linked at
-    /// build time AND a model file resolves. File-existence only (no
+    /// build time AND a model file resolves (default lookup or
+    /// retained registry artifact). Existence checks only (no
     /// hashing), so it is safe on the main thread. When false the
     /// engine is pure deterministic fallback.
     static func isModelAvailable(fileManager: FileManager = .default) -> Bool {
         guard ModelRuntime.isRuntimeLinked else { return false }
-        guard let url = ModelRuntime.defaultModelURL() else { return false }
-        return fileManager.fileExists(atPath: url.path)
+        return resolveProductionModelURL(fileManager: fileManager) != nil
     }
 
     /// Production factory: live model path when available, else the
     /// inner engine's deterministic behavior verbatim.
     convenience init(inner: ChatTutorEngine) {
-        if Self.isModelAvailable(), let url = ModelRuntime.defaultModelURL() {
+        if Self.isModelAvailable(), let url = Self.resolveProductionModelURL() {
             self.init(inner: inner, generator: .live(runtime: ModelRuntime(modelPath: url)))
         } else {
             self.init(inner: inner, generator: nil)
@@ -149,35 +181,45 @@ final class ModelTutorEngine: ChatTutorEngine {
     }
 
     /// Test seam: explicit generator (nil = model absent) and timeout.
+    /// Construction starts no model work: warm-up is deferred until
+    /// the retained engine's first use (see `ensureWarmUpStarted`), so
+    /// engines constructed and discarded by a parent view refresh
+    /// never start unused model loads.
     init(inner: ChatTutorEngine, generator: ModelTextGenerator?, timeout: TimeInterval = ModelTutorEngine.defaultTimeout) {
         self.inner = inner
         self.generator = generator
         self.timeout = timeout
-        if let generator {
-            // Background warm-up (model load) at construction: the sync
-            // path stays verbatim deterministic until the runtime
-            // reports warm, so a cold start never delays a reply.
-            workQueue.async { try? generator.warmUp() }
-        }
     }
 
     private let inner: any ChatTutorEngine
     private let generator: ModelTextGenerator?
     private let timeout: TimeInterval
-    /// Reply epoch: `startSession` clears the thread, so it bumps this
-    /// and pipeline jobs captured under an older epoch are dropped
-    /// instead of appending stale turns to the new session. Guarded by
-    /// `stateLock` (written on the calling thread, read on the pipeline).
+    /// Reply generation: `startSession` clears the thread, so it bumps
+    /// this and pipeline jobs captured under an older generation are
+    /// dropped instead of appending stale turns to the new session.
+    /// Guarded by `stateLock` (written on the calling thread, read on
+    /// the pipeline and by the view model's staleness check).
     private let stateLock = NSLock()
     private var generation = 0
-    /// Serial reply pipeline: withheld replies are generated and
-    /// delivered here in request order, so an async reply can never
-    /// pass an earlier one. Never the main queue: sync methods only
-    /// enqueue and return. Each pipeline wait is bounded by `timeout`,
-    /// so a hung generation delays later replies by at most one
-    /// timeout each, never forever.
+    /// One-shot warm-up gate (finding 6): set under `stateLock` when
+    /// the first use dispatches the background model load.
+    private var didBeginWarmUp = false
+    /// Serial reply pipeline: rephrase jobs run and deliver here in
+    /// request order, so an async reply can never pass an earlier one.
+    /// Never the main queue: sync methods only enqueue and return.
+    /// Each job's total wait is bounded by one `timeout` measured from
+    /// its submission (see `process`), so a hung generation delays
+    /// later replies by at most one timeout each, never forever.
     private let pipeline = DispatchQueue(label: "com.vhoangvu.earnplay.model-tutor", qos: .userInitiated)
     private let workQueue = DispatchQueue.global(qos: .userInitiated)
+    /// Single-flight model-call lease (finding 4): a timed-out worker
+    /// keeps running while holding the runtime lock, so a later call
+    /// must fall back rather than queue obsolete inference behind it.
+    /// Acquired (without waiting) before dispatching a worker,
+    /// released by the worker when its call finishes — including after
+    /// the waiter already timed out — so the model path resumes once
+    /// the stale call actually ends.
+    private let inferenceLease = DispatchSemaphore(value: 1)
 
     /// True when the next reply takes the model path (test/diagnostic aid).
     var isModelPathActive: Bool { generator?.isWarm == true }
@@ -211,13 +253,36 @@ final class ModelTutorEngine: ChatTutorEngine {
     func recordComposerActivity() { inner.recordComposerActivity() }
     var currentHintListenSink: (any HintListenEventSink)? { inner.currentHintListenSink }
     var isInputBlocked: Bool { inner.isInputBlocked }
+    /// Live session generation for the view model's async staleness
+    /// check: bumped by every `startSession` (see `generation`).
+    var currentSessionGeneration: Int { currentGeneration() }
+
+    /// Deferred model warm-up (finding 6): the first use of the
+    /// retained engine dispatches the background model load, once.
+    /// The sync path stays verbatim deterministic until the runtime
+    /// reports warm, so a cold start never delays a reply — and an
+    /// engine that is constructed but never used (a parent view
+    /// refresh discards it in favor of the retained one) starts no
+    /// model load at all.
+    private func ensureWarmUpStarted() {
+        stateLock.lock()
+        guard !didBeginWarmUp else {
+            stateLock.unlock()
+            return
+        }
+        didBeginWarmUp = true
+        stateLock.unlock()
+        if let generator {
+            workQueue.async { try? generator.warmUp() }
+        }
+    }
 
     // MARK: - Reply processing
 
     /// Tutor turns the model may rephrase: encouragement and follow-up
     /// probes carry no verified content, so rewording them cannot teach
     /// wrong math. Questions and hints are solver-verified and are never
-    /// withheld or rewritten; instructions are session framing.
+    /// rephrased; instructions are session framing.
     private static func isModelEligible(_ turn: ChatTurn) -> Bool {
         guard case .tutor(let message) = turn else { return false }
         return message.kind == .encouragement || message.kind == .probe
@@ -256,9 +321,9 @@ final class ModelTutorEngine: ChatTutorEngine {
     }
 
     private func process(_ update: ChatEngineUpdate, generation: Int) -> ChatEngineUpdate {
+        ensureWarmUpStarted()
         // No subscriber, no model, or a cold runtime: the inner
-        // update goes out verbatim and synchronously. In particular a
-        // missing subscriber never withholds turns that nobody delivers.
+        // update goes out verbatim and synchronously.
         guard let generator, generator.isWarm, let deliver = onAsyncUpdate else { return update }
         let eligible = update.turns.indices.filter { Self.isModelEligible(update.turns[$0]) }
         guard !eligible.isEmpty else { return update }
@@ -267,12 +332,17 @@ final class ModelTutorEngine: ChatTutorEngine {
             return Self.promptFor(kind: message.kind)
         }
         let replyTurns = update.turns
+        // Finding 7: the reply's deadline starts at SUBMISSION, before
+        // the serial pipeline queues it — queue wait counts against the
+        // timeout, so rapid submissions behind a stalled generation
+        // fall back within one timeout of their own submission instead
+        // of each waiting out a fresh timeout after dequeueing.
+        let deadline = Date().addingTimeInterval(timeout)
         pipeline.async { [weak self] in
             guard let self else { return }
             // A restart superseded this reply before it ran: drop it
             // without spending inference on a cleared thread.
             guard self.currentGeneration() == generation else { return }
-            let deadline = Date().addingTimeInterval(self.timeout)
             var turns = replyTurns
             for (position, index) in eligible.enumerated() {
                 guard deadline.timeIntervalSinceNow > 0 else { break }
@@ -287,31 +357,68 @@ final class ModelTutorEngine: ChatTutorEngine {
             // A restart landed mid-generation: the thread was cleared,
             // so this reply is stale and must not append to the new one.
             guard self.currentGeneration() == generation else { return }
-            deliver(ChatEngineUpdate(turns: turns))
+            // Eligible turns only (rephrased or deterministic fallback),
+            // tagged with the requesting generation: the sync update
+            // already rendered every turn, so the view model applies
+            // these as in-place replacements by turn id and drops them
+            // if a restart landed between delivery and application.
+            deliver(ChatEngineUpdate(turns: eligible.map { turns[$0] }, sessionGeneration: generation))
         }
-        // Turns withheld for the async model reply; progress, composer,
-        // and the echo's revision label stay synchronous, so the
-        // session-complete boundary behaves exactly as the inner engine's.
-        return ChatEngineUpdate(turns: [], progress: update.progress, composer: update.composer,
-                                submittedTurnIsRevision: update.submittedTurnIsRevision)
+        // Finding 2: the sync update is the inner update VERBATIM —
+        // every deterministic turn, including the next question after
+        // a correct answer, renders before inference completes, so
+        // Send/Hint always act on the shown question. The model path
+        // only upgrades eligible phrasing in place via the async
+        // replacements above; progress, composer, and the echo's
+        // revision label behave exactly as the inner engine's.
+        return update
     }
 
     /// One bounded model call on a worker queue: the worker result on
-    /// success, nil on failure, timeout, or rejected text (the caller
-    /// then keeps the deterministic turn). A call past its timeout keeps
-    /// running detached — it still warms the runtime — but its text is
-    /// discarded; the group accounts its late leave harmlessly.
+    /// success, nil when another call is still in flight (finding 4),
+    /// on failure, timeout, or rejected text (the caller then keeps
+    /// the deterministic turn). A call past its timeout keeps running
+    /// detached — it still holds the lease and warms the runtime — but
+    /// its text is discarded; the group accounts its late leave
+    /// harmlessly and its lease release reopens the model path.
     private func generateTurn(generator: ModelTextGenerator, prompt: String, timeout: TimeInterval) -> String? {
+        // Finding 4: single-flight — a timed-out worker still holds
+        // the runtime lock, so a new call must fall back NOW rather
+        // than queue obsolete inference behind it and run past its own
+        // deadline. Never waits for the lease: waiting here would
+        // serialize behind the stale call this avoids.
+        guard inferenceLease.wait(timeout: .now()) == .success else { return nil }
+        let lease = inferenceLease
         let box = LockedBox<String?>(nil)
         let group = DispatchGroup()
         group.enter()
         workQueue.async {
-            defer { group.leave() }
+            defer {
+                group.leave()
+                lease.signal()
+            }
             box.value = try? generator.generateText(prompt)
         }
         guard group.wait(timeout: .now() + timeout) == .success else { return nil }
         guard let raw = box.value else { return nil }
         let clean = ChildTextSanitizer.plainText(raw)
-        return clean.isEmpty ? nil : clean
+        guard !clean.isEmpty, !Self.containsUnverifiedCorrectnessClaim(clean) else { return nil }
+        return clean
+    }
+
+    /// Fail-closed screen for generated phrasing (finding 3): true when
+    /// the text asserts answer correctness (or carries answer-bearing
+    /// content) that was never verified against the deterministic
+    /// solver path. The model is never told the question, answer, or
+    /// verdict, so ANY correctness claim in its output is unverified
+    /// by construction — including a true-sounding one — and the turn
+    /// falls back to the deterministic wording instead of passing
+    /// through on character filtering. Generic effort praise ("Nice
+    /// trying") is not a correctness claim and passes; explicit
+    /// verdict words and digits do not.
+    static func containsUnverifiedCorrectnessClaim(_ text: String) -> Bool {
+        if text.rangeOfCharacter(from: .decimalDigits) != nil { return true }
+        return text.range(of: #"\b(correct|correctly|incorrect|incorrectly|right|wrong|true|false|answers?)\b"#,
+                          options: [.regularExpression, .caseInsensitive]) != nil
     }
 }

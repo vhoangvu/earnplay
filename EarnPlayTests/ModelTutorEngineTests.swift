@@ -44,6 +44,12 @@ private final class FakeModel {
         return warm
     }
 
+    var warmUpCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return warmUpCalls
+    }
+
     private func recordWarmUp() {
         lock.lock()
         defer { lock.unlock() }
@@ -65,6 +71,28 @@ private final class FakeModel {
         }
         return text
     }
+}
+
+/// Generation-tracking scripted engine for the view-model staleness
+/// test (finding 1): every `startSession` bumps the generation and
+/// reports session-complete (so the view model offers restart), and
+/// `emit` delivers a scripted async update on demand.
+private final class GenerationEngine: ChatTutorEngine {
+    private(set) var generation = 0
+    var currentSessionGeneration: Int { generation }
+    var onAsyncUpdate: ((ChatEngineUpdate) -> Void)?
+
+    func startSession() -> ChatEngineUpdate {
+        generation += 1
+        return ChatEngineUpdate(
+            turns: [.tutor(TutorMessage(id: "q\(generation)", text: "Question \(generation)",
+                                                  kind: .question))],
+            composer: .sessionComplete)
+    }
+
+    func submitAnswer(_ plainText: String) -> ChatEngineUpdate { ChatEngineUpdate() }
+    func requestHint() -> ChatEngineUpdate { ChatEngineUpdate() }
+    func emit(_ update: ChatEngineUpdate) { onAsyncUpdate?(update) }
 }
 
 /// Thread-safe collector for async engine updates (delivered on a
@@ -151,10 +179,11 @@ final class ModelTutorEngineTests: XCTestCase {
             delivered.fulfill()
         }
 
-        // Sync: turns withheld, everything else synchronous.
+        // Sync: the inner update verbatim — every deterministic turn
+        // renders immediately (finding 2), everything else synchronous.
         let expected = demo.submitAnswer(q1Wrong)
         let sync = engine.submitAnswer(q1Wrong)
-        XCTAssertEqual(sync.turns, [])
+        XCTAssertEqual(sync.turns, expected.turns)
         XCTAssertEqual(sync.progress, expected.progress)
         XCTAssertEqual(sync.composer, expected.composer)
         XCTAssertEqual(sync.submittedTurnIsRevision, expected.submittedTurnIsRevision)
@@ -189,7 +218,7 @@ final class ModelTutorEngineTests: XCTestCase {
 
         let expected = demo.submitAnswer(q1Wrong)
         let sync = engine.submitAnswer(q1Wrong)
-        XCTAssertEqual(sync.turns, [])
+        XCTAssertEqual(sync.turns, expected.turns)
 
         await fulfillment(of: [delivered], timeout: 5)
         // A failed generation serves the deterministic turns verbatim —
@@ -219,7 +248,7 @@ final class ModelTutorEngineTests: XCTestCase {
         let start = Date()
         let sync = engine.submitAnswer(q1Wrong)
         let syncElapsed = Date().timeIntervalSince(start)
-        XCTAssertEqual(sync.turns, [])
+        XCTAssertEqual(sync.turns, expected.turns)
         XCTAssertLessThan(syncElapsed, 5, "sync call blocked on inference")
 
         await fulfillment(of: [delivered], timeout: 10)
@@ -230,9 +259,10 @@ final class ModelTutorEngineTests: XCTestCase {
     // MARK: - Solver authority: verdicts, questions, hints untouched
 
     func testSolverStaysAuthoritativeOverModelText() async throws {
-        // Even a model response that sounds like a verdict changes
-        // nothing but phrasing-turn text: progress, composer, revision
-        // flags, questions, and hints stay deterministic.
+        // A model response that sounds like a verdict is REJECTED
+        // (finding 3: unverified correctness claims fall back to the
+        // deterministic wording); progress, composer, revision flags,
+        // questions, and hints stay deterministic regardless.
         let fake = FakeModel(responses: ["Ninety-nine is exactly right!", "What step did you try?"])
         let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 5)
         let demo = DemoTutorEngine()
@@ -263,16 +293,21 @@ final class ModelTutorEngineTests: XCTestCase {
 
         await fulfillment(of: [delivered], timeout: 5)
         XCTAssertEqual(collector.updates.count, 3)
+        // The verdict-sounding encouragement is rejected: the async
+        // turn keeps the deterministic wording (finding 3). The clean
+        // probe rephrase passes through.
+        let expectedWrongMessage = try XCTUnwrap(expectedWrong.turns[0].tutorMessage)
         XCTAssertEqual(collector.updates[0].turns.map(\.displayedText),
-                       ["Ninety-nine is exactly right!", "What step did you try?"])
+                       [expectedWrongMessage.text, "What step did you try?"])
         XCTAssertEqual(collector.updates[1].turns.map(\.displayedText), ["Model line."])
-        // The correct reply's next question arrives verbatim: the model
-        // never writes question content.
+        // The correct reply's next question arrived synchronously
+        // (finding 2); the async update carries only the rephrased
+        // encouragement — the model never writes question content.
+        XCTAssertEqual(syncCorrect.turns, expectedCorrect.turns)
         let correctFollowUp = collector.updates[2]
         let expectedMessage = try XCTUnwrap(expectedCorrect.turns[0].tutorMessage)
         XCTAssertEqual(correctFollowUp.turns, [
             .tutor(TutorMessage(id: expectedMessage.id, text: "Model line.", kind: .encouragement)),
-            expectedCorrect.turns[1],
         ])
     }
 
@@ -325,7 +360,7 @@ final class ModelTutorEngineTests: XCTestCase {
         let finalSync = engine.submitAnswer("99")
         let finalDemo = demo.submitAnswer("99")
         XCTAssertEqual(finalSync.composer, .sessionComplete)
-        XCTAssertEqual(finalSync.turns, [])
+        XCTAssertEqual(finalSync.turns, finalDemo.turns)
         XCTAssertEqual(finalDemo.composer, .sessionComplete)
 
         // Restart immediately, while completion replies are in flight.
@@ -428,11 +463,15 @@ final class ModelTutorEngineTests: XCTestCase {
 
         viewModel.draft = q1Wrong
         viewModel.submitDraft()
-        // The child echo renders synchronously; the model reply arrives async.
-        XCTAssertEqual(viewModel.messages.count, 2)
+        // The child echo AND the deterministic reply render
+        // synchronously (finding 2); the model rephrases arrive async
+        // as in-place replacements.
+        XCTAssertEqual(viewModel.messages.count, 4)
 
         let deadline = Date().addingTimeInterval(5)
-        while viewModel.messages.count < 4, Date() < deadline {
+        while viewModel.messages.count < 4
+                || viewModel.messages[2].displayedText != "Model encouragement!",
+              Date() < deadline {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(viewModel.messages.map(\.displayedText), [
@@ -442,5 +481,292 @@ final class ModelTutorEngineTests: XCTestCase {
             "Model probe?",
         ])
         XCTAssertEqual(viewModel.speakerMessageIDs.count, 3)
+    }
+
+    // MARK: - Fix round 1 finding 1: view-model staleness guard
+
+    func testViewModelDropsStaleAsyncReplyAfterRestart() async throws {
+        let engine = GenerationEngine()
+        let viewModel = ChatConversationViewModel(
+            engine: engine, speech: ReadAloudService(band: GradeBand(grade: "4")))
+        viewModel.startIfNeeded()
+        XCTAssertEqual(engine.currentSessionGeneration, 1)
+        viewModel.restartSession()
+        XCTAssertEqual(engine.currentSessionGeneration, 2)
+        XCTAssertEqual(viewModel.messages.map(\.displayedText), ["Question 2"])
+
+        // Stale: emitted after the restart but tagged with the
+        // pre-restart generation (the engine-side guard passed just
+        // before the restart bumped it). Must never append to, or
+        // overwrite turns of, the cleared new session.
+        engine.emit(ChatEngineUpdate(
+            turns: [.tutor(TutorMessage(id: "stale", text: "Stale turn", kind: .encouragement))],
+            sessionGeneration: 1))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(viewModel.messages.map(\.displayedText), ["Question 2"])
+
+        // Current-generation and untagged updates still apply.
+        engine.emit(ChatEngineUpdate(
+            turns: [.tutor(TutorMessage(id: "fresh", text: "Fresh turn", kind: .encouragement))],
+            sessionGeneration: 2))
+        engine.emit(ChatEngineUpdate(
+            turns: [.tutor(TutorMessage(id: "plain", text: "Plain turn", kind: .encouragement))]))
+        let deadline = Date().addingTimeInterval(2)
+        while viewModel.messages.count < 3, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(viewModel.messages.map(\.displayedText),
+                       ["Question 2", "Fresh turn", "Plain turn"])
+    }
+
+    // MARK: - Fix round 1 finding 2: next question renders synchronously
+
+    func testSyncShowsNextQuestionBeforeInferenceCompletes() async {
+        let fake = FakeModel(responses: ["Keep up the good work!"], delay: 2.0)
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 5)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let delivered = expectation(description: "rephrase delivered")
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            delivered.fulfill()
+        }
+
+        let expected = demo.submitAnswer(q1Correct)
+        let sync = engine.submitAnswer(q1Correct)
+        // The next question renders synchronously — before the
+        // still-running inference completes — and the composer matches
+        // that shown question, so Send/Hint never act on an unseen one.
+        XCTAssertEqual(sync.turns, expected.turns)
+        XCTAssertEqual(sync.turns.count, 2)
+        XCTAssertEqual(sync.turns[1].tutorMessage?.kind, .question)
+        XCTAssertEqual(sync.composer, expected.composer)
+
+        await fulfillment(of: [delivered], timeout: 8)
+        // The async update carries only the encouragement replacement
+        // (same id, model text) — no question turn travels async.
+        XCTAssertEqual(collector.updates.count, 1)
+        XCTAssertEqual(collector.updates[0].turns.count, 1)
+        XCTAssertEqual(collector.updates[0].turns[0].tutorMessage?.kind, .encouragement)
+        XCTAssertEqual(collector.updates[0].turns[0].displayedText, "Keep up the good work!")
+        XCTAssertEqual(collector.updates[0].turns[0].id, expected.turns[0].id)
+    }
+
+    // MARK: - Fix round 1 finding 3: unverified correctness claims rejected
+
+    func testCorrectnessClaimScreenRejectsVerdictWords() {
+        let rejected = [
+            "Ninety-nine is exactly right!",
+            "That is correct.",
+            "Correct!",
+            "Your answer is wrong, try again.",
+            "True! You solved it.",
+            "False.",
+            "The answer is 56.",
+            "You got 56!",
+            "5 more to go.",
+            "WRONG",
+        ]
+        for text in rejected {
+            XCTAssertTrue(ModelTutorEngine.containsUnverifiedCorrectnessClaim(text), text)
+        }
+        let accepted = [
+            "You are thinking hard!",
+            "What step did you try?",
+            "Keep going, you can do it!",
+            "Nice effort, try again.",
+            "Take your time and look again.",
+            "You are bright and capable.",
+            "Correctness grows with practice.",
+            "Model line.",
+        ]
+        for text in accepted {
+            XCTAssertFalse(ModelTutorEngine.containsUnverifiedCorrectnessClaim(text), text)
+        }
+    }
+
+    func testGeneratedCorrectnessClaimsFallBackToDeterministic() async {
+        let fake = FakeModel(responses: ["That is exactly right", "Your answer 5 is wrong"])
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 5)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let delivered = expectation(description: "fallback delivered")
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            delivered.fulfill()
+        }
+
+        let expected = demo.submitAnswer(q1Wrong)
+        let sync = engine.submitAnswer(q1Wrong)
+        XCTAssertEqual(sync.turns, expected.turns)
+
+        await fulfillment(of: [delivered], timeout: 5)
+        // Both generated turns carry unverified correctness claims, so
+        // the async update keeps the deterministic wording verbatim.
+        XCTAssertEqual(collector.updates.map(\.turns), [expected.turns])
+    }
+
+    // MARK: - Fix round 1 finding 4: no obsolete inference behind timeouts
+
+    func testTimedOutInferenceDoesNotQueueObsoleteCalls() async {
+        // The stale worker sleeps far longer than the test runs. The
+        // second reply is submitted AFTER the first timed out, with a
+        // fresh deadline — it must fall back WITHOUT invoking the
+        // generator behind the still-running stale call.
+        let fake = FakeModel(responses: ["Too slow.", "Also slow."], delay: 60)
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 1.0)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let first = expectation(description: "first fallback delivered")
+        let second = expectation(description: "second fallback delivered")
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            if collector.updates.count == 1 {
+                first.fulfill()
+            } else {
+                second.fulfill()
+            }
+        }
+
+        let expectedFirst = demo.submitAnswer(q1Correct)
+        _ = engine.submitAnswer(q1Correct)
+        await fulfillment(of: [first], timeout: 10)
+        XCTAssertEqual(collector.updates[0].turns.map(\.displayedText),
+                       [expectedFirst.turns[0].displayedText])
+        XCTAssertEqual(fake.recordedPrompts.count, 1)
+
+        let expectedSecond = demo.submitAnswer("54")
+        let syncSecond = engine.submitAnswer("54")
+        XCTAssertEqual(syncSecond.turns, expectedSecond.turns)
+        await fulfillment(of: [second], timeout: 10)
+        XCTAssertEqual(collector.updates[1].turns.map(\.displayedText),
+                       [expectedSecond.turns[0].displayedText])
+        XCTAssertEqual(fake.recordedPrompts.count, 1,
+                       "obsolete inference queued behind the timed-out call")
+    }
+
+    // MARK: - Fix round 1 finding 5: registry artifact resolution
+
+    private func tempModelFile() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("RetainedModel.gguf")
+        try Data("GGUF-fixture".utf8).write(to: url)
+        return url
+    }
+
+    private func tempRegistryStore(activeBundleID: String, modelFilePath: String?) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = dir.appendingPathComponent("version-registry.json")
+        var bundle: [String: Any] = ["bundleID": activeBundleID,
+                                     "modelVersion": "v", "promptVersion": "p"]
+        if let modelFilePath { bundle["modelFilePath"] = modelFilePath }
+        let state: [String: Any] = ["bundles": [bundle], "activeBundleID": activeBundleID]
+        try JSONSerialization.data(withJSONObject: state).write(to: store)
+        return store
+    }
+
+    func testResolverPrefersDefaultModelFile() throws {
+        let model = try tempModelFile()
+        let resolved = ModelTutorEngine.resolveProductionModelURL(
+            environment: ["EARNPLAY_MODEL_PATH": model.path],
+            registryStoreURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString))
+        XCTAssertEqual(resolved?.path, model.path)
+    }
+
+    func testResolverFallsBackToRegistryArtifact() throws {
+        let snapshot = try tempModelFile()
+        let store = try tempRegistryStore(activeBundleID: "previous-known-good",
+                                           modelFilePath: snapshot.path)
+        let resolved = ModelTutorEngine.resolveProductionModelURL(
+            environment: ["EARNPLAY_MODEL_PATH": "/nonexistent-missing/EarnPlayModel.gguf"],
+            registryStoreURL: store)
+        XCTAssertEqual(resolved?.path, snapshot.path)
+    }
+
+    func testResolverReturnsNilWhenNothingResolves() throws {
+        let resolved = ModelTutorEngine.resolveProductionModelURL(
+            environment: ["EARNPLAY_MODEL_PATH": "/nonexistent-missing/EarnPlayModel.gguf"],
+            registryStoreURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString))
+        XCTAssertNil(resolved)
+    }
+
+    // MARK: - Fix round 1 finding 6: warm-up deferred until first use
+
+    func testWarmUpDeferredUntilFirstUse() async throws {
+        let fake = FakeModel()
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 5)
+        // Construction (plus a settle window for any eager dispatch)
+        // starts no model load: a discarded engine costs nothing.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(fake.warmUpCallCount, 0)
+        // First use dispatches exactly one background warm-up.
+        engine.onAsyncUpdate = { _ in }
+        _ = engine.startSession()
+        let deadline = Date().addingTimeInterval(2)
+        while fake.warmUpCallCount == 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(fake.warmUpCallCount, 1)
+        // Later uses never re-dispatch.
+        _ = engine.submitAnswer(q1Wrong)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(fake.warmUpCallCount, 1)
+    }
+
+    // MARK: - Fix round 1 finding 7: deadline measured from submission
+
+    func testQueuedReplyHonorsSubmissionDeadline() async {
+        // 3d < timeout < 4d (d = 0.2s per call): the first two replies
+        // fit their submission deadlines and serve model text; the
+        // third dequeues with too little submission budget left and
+        // falls back — without the submission-based deadline it would
+        // serve model text on a fresh post-dequeue budget. The lease is
+        // free throughout (every attempted call finishes), isolating
+        // the deadline fix from the finding-4 lease.
+        let fake = FakeModel(responses: ["Model line.", "Model line.", "Model line.", "Model line."],
+                             delay: 0.2)
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 0.7)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let delivered = expectation(description: "all replies delivered")
+        delivered.expectedFulfillmentCount = 3
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            delivered.fulfill()
+        }
+
+        let first = demo.submitAnswer(q1Wrong)
+        let second = demo.submitAnswer("I added seven eight times")
+        let third = demo.submitAnswer("55")
+        _ = engine.submitAnswer(q1Wrong)
+        _ = engine.submitAnswer("I added seven eight times")
+        _ = engine.submitAnswer("55")
+
+        await fulfillment(of: [delivered], timeout: 10)
+        XCTAssertEqual(collector.updates.count, 3)
+        XCTAssertEqual(collector.updates[0].turns.map(\.displayedText), ["Model line.", "Model line."])
+        XCTAssertEqual(collector.updates[0].turns.map(\.id), first.turns.map(\.id))
+        XCTAssertEqual(collector.updates[1].turns.map(\.displayedText), ["Model line."])
+        XCTAssertEqual(collector.updates[1].turns.map(\.id), second.turns.map(\.id))
+        // Third reply: its submission budget expired in queue, so it
+        // falls back to the deterministic wording (no fresh budget).
+        XCTAssertEqual(collector.updates[2].turns, third.turns)
+        XCTAssertEqual(fake.recordedPrompts.count, 4)
     }
 }
