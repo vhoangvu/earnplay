@@ -59,7 +59,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             if Self.uiChatPreviewEnabled {
-                ChatConversationView(engine: DemoTutorEngine(), theme: themes.theme)
+                ChatConversationView(engine: ModelTutorEngine(inner: DemoTutorEngine()), theme: themes.theme)
             } else {
                 // Fix round 1 (finding 1): the unpaired child's local code
                 // on a reachable production surface BEFORE any invitation —
@@ -87,7 +87,7 @@ struct ContentView: View {
                         // (same instance the service drains, never a second
                         // writer over the same directory) and delivered via
                         // notifySessionEnqueued after each durable enqueue.
-                        ChatConversationView(engine: DemoTutorEngine(
+                        ChatConversationView(engine: ModelTutorEngine(inner: DemoTutorEngine(
                             recording: .productionDefault(
                                 queue: syncController.sessionQueue,
                                 // Round 2 item 4: read the persisted version
@@ -108,7 +108,7 @@ struct ContentView: View {
                                 // queue on lifecycle triggers below.
                                 onEnqueueFailed: { [syncController] log in
                                     syncController.handleFailedEnqueue(log)
-                                })), theme: themes.theme)
+                                }))), theme: themes.theme)
                     } else {
                         SetupFlowView(viewModel: setup, themes: themes)
                     }

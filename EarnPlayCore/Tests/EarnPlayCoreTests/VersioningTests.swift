@@ -987,3 +987,80 @@ extension VersioningTests {
                        "snapshot must retire after the session releases it")
     }
 }
+
+extension VersioningTests {
+    // Fix round 2 F1 (issue #93): an unbound runtime (no digest, no
+    // version — the chat tutor's `ModelRuntime(modelPath:)`) checks
+    // the immutable cache BEFORE writing any temporary copy. With
+    // the cache directory read-only, a cache hit still resolves (the
+    // old path failed creating its ~770 MiB tmp).
+    func testUnboundRuntimeChecksImmutableCacheBeforeCopying() throws {
+        let model = try tempGGUF(named: "UnboundCacheFirst.gguf")
+        try Data("GGUF-unbound-cache-first".utf8).write(to: model)
+        let first = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+        let dir = first.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let second = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(try Data(contentsOf: second), Data("GGUF-unbound-cache-first".utf8))
+    }
+
+    // Fix round 2 F1: a version-only binding also resolves its cache
+    // hit with pure reads — no tmp copy before the lookup.
+    func testVersionBoundRuntimeChecksImmutableCacheBeforeCopying() throws {
+        let model = try tempGGUF(named: "VersionCacheFirst.gguf")
+        try Data("GGUF-version-cache-first".utf8).write(to: model)
+        let version = try ModelRuntime.verifiedModelVersion(forModelAt: model)
+        let first = try ModelRuntime(modelPath: model, expectedModelVersion: version)
+            .verifiedImmutableCopyURL()
+        let dir = first.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let second = try ModelRuntime(modelPath: model, expectedModelVersion: version)
+            .verifiedImmutableCopyURL()
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(try Data(contentsOf: second), Data("GGUF-version-cache-first".utf8))
+    }
+
+    // Fix round 2 F1: a genuine miss still copies and publishes (the
+    // early lookup must not become an early return of nothing).
+    func testUnboundRuntimePublishesOnCacheMiss() throws {
+        let model = try tempGGUF(named: "UnboundCacheMiss.gguf")
+        try Data("GGUF-unbound-cache-miss-\(UUID().uuidString)".utf8).write(to: model)
+        let copy = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+        XCTAssertNotEqual(copy.path, model.path)
+        XCTAssertEqual(try Data(contentsOf: copy), try Data(contentsOf: model))
+        XCTAssertEqual(try ModelRuntime.contentSHA256(forFileAt: copy),
+                       try ModelRuntime.contentSHA256(forFileAt: model))
+    }
+
+    // Fix round 2 F1: a version mismatch fails on the binding BEFORE
+    // any copy — under a read-only cache dir the old code failed
+    // with `.modelLoadFailed` (tmp creation) instead.
+    func testVersionBoundRuntimeRejectsMismatchBeforeCopying() throws {
+        let model = try tempGGUF(named: "VersionMismatchNoCopy.gguf")
+        try Data("GGUF-version-mismatch-nocopy".utf8).write(to: model)
+        let dir = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+            .deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        XCTAssertThrowsError(try ModelRuntime(modelPath: model, expectedModelVersion: "bogus-version")
+            .verifiedImmutableCopyURL()) { error in
+            XCTAssertEqual(error as? ModelRuntimeError, .modelContentMismatch(path: model.path))
+        }
+    }
+
+    // Fix round 2 F1: the unbound early lookup verifies its hit — a
+    // corrupt entry is removed and rebuilt from the source.
+    func testUnboundRuntimeRebuildsCorruptCacheEntry() throws {
+        let model = try tempGGUF(named: "UnboundCorruptEntry.gguf")
+        try Data("GGUF-unbound-corrupt-A".utf8).write(to: model)
+        let first = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: first.path)
+        try Data("GGUF-unbound-corrupt!!!".utf8).write(to: first)
+        let rebuilt = try ModelRuntime(modelPath: model).verifiedImmutableCopyURL()
+        XCTAssertEqual(rebuilt, first)
+        XCTAssertEqual(try Data(contentsOf: rebuilt), Data("GGUF-unbound-corrupt-A".utf8))
+    }
+}
