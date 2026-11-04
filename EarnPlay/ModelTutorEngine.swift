@@ -406,19 +406,92 @@ final class ModelTutorEngine: ChatTutorEngine {
         return clean
     }
 
-    /// Fail-closed screen for generated phrasing (finding 3): true when
-    /// the text asserts answer correctness (or carries answer-bearing
-    /// content) that was never verified against the deterministic
-    /// solver path. The model is never told the question, answer, or
-    /// verdict, so ANY correctness claim in its output is unverified
-    /// by construction — including a true-sounding one — and the turn
-    /// falls back to the deterministic wording instead of passing
-    /// through on character filtering. Generic effort praise ("Nice
-    /// trying") is not a correctness claim and passes; explicit
-    /// verdict words and digits do not.
+    /// Fail-closed screen for generated phrasing (finding 3, round 2
+    /// finding 2): true when the text asserts answer correctness,
+    /// carries answer-bearing content, or otherwise states math or
+    /// success the model cannot verify. The model is never told the
+    /// question, answer, or verdict, so ANY correctness or success
+    /// claim in its output is unverified by construction — including
+    /// a true-sounding one — and the turn falls back to the
+    /// deterministic wording instead of passing through on character
+    /// filtering. Digits, number words (hyphenated compounds like
+    /// "fifty-four" match on each part), arithmetic/result words
+    /// ("add", "sum", "twice", "calculate"), verdict words, and
+    /// success/praise phrasing ("nailed it", "crushed it", "great
+    /// job", "well done", scores, stars) are all rejected:
+    /// generated text must never be the source of a correctness or
+    /// success claim — the deterministic path already supplies
+    /// encouragement. Generic effort, process, and ability praise
+    /// ("Nice trying", "Keep up the good work", "You are bright and
+    /// capable") passes, as do bare ordinals ("first", "second"),
+    /// which state no math. A denylist cannot name every paraphrase,
+    /// so this is one layer among several: prompts also forbid
+    /// verdicts (see `promptFor`), and anything suspicious falls
+    /// back rather than through.
     static func containsUnverifiedCorrectnessClaim(_ text: String) -> Bool {
         if text.rangeOfCharacter(from: .decimalDigits) != nil { return true }
-        return text.range(of: #"\b(correct|correctly|incorrect|incorrectly|right|wrong|true|false|answers?)\b"#,
+        return text.range(of: Self.deniedClaimPattern,
                           options: [.regularExpression, .caseInsensitive]) != nil
     }
+
+    /// Word-boundary alternation over `deniedClaimTerms`, built once.
+    private static let deniedClaimPattern: String =
+        #"\b("# + deniedClaimTerms.joined(separator: "|") + #")\b"#
+
+    /// Denied terms for the screen above. Deliberately NOT denied:
+    /// effort/process/ability praise (nice, good, work, effort,
+    /// bright, capable, hard, best, go), bare ordinals (first,
+    /// second), and probe verbs (show, step, solve, point) — those
+    /// pass through, everything suspicious falls back.
+    private static let deniedClaimTerms: [String] = [
+        // Verdict words (finding 3): explicit correctness claims.
+        "correct", "correctly", "incorrect", "incorrectly",
+        "right", "wrong", "true", "false", "answer", "answers",
+        // Spelled-out numbers (round 2 finding 2): any one of these
+        // can carry an unverified math claim ("Seven times eight
+        // equals fifty-four").
+        "zero", "one", "two", "three", "four", "five", "six",
+        "seven", "eight", "nine", "ten", "eleven", "twelve",
+        "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+        "eighteen", "nineteen", "twenty", "thirty", "forty",
+        "fifty", "sixty", "seventy", "eighty", "ninety",
+        "hundred", "hundreds", "thousand", "thousands",
+        "million", "millions", "billion", "billions",
+        "dozen", "dozens", "half", "halves", "halfway",
+        "quarter", "quarters",
+        // Arithmetic and result words: "plus", "equals", and "total"
+        // turn even number-free text into math content.
+        "plus", "minus", "times", "multiplied", "multiply",
+        "divided", "divide", "equals", "equal", "total",
+        "product", "quotient", "remainder", "subtract",
+        "subtracted", "subtraction", "multiplication", "division",
+        "add", "adds", "added", "adding", "addition",
+        "sum", "sums", "summed", "difference", "differences",
+        "calculate", "calculates", "calculated", "calculating",
+        "calculation", "twice", "thrice", "double", "doubles",
+        "doubled", "triple", "triples", "tripled",
+        // Success/praise verdicts (round 2 finding 2): completion
+        // and evaluation claims ("You nailed it!", "Great job!").
+        "nail", "nails", "nailed", "ace", "aced", "solved",
+        "crush", "crushes", "crushed", "crushing",
+        "kill", "kills", "killed", "killing",
+        "slay", "slays", "slayed", "slaying",
+        "done", "mastered", "perfect", "perfectly", "perfection",
+        "excellent", "excellence", "great", "greatly", "greatest",
+        "awesome", "amazing", "fantastic", "wonderful",
+        "brilliant", "outstanding", "superb", "stellar",
+        "incredible", "fabulous", "splendid", "terrific",
+        "marvelous", "marvellous", "phenomenal", "remarkable",
+        "impressive", "proud", "job", "jobs", "winner",
+        "champion", "superstar", "congratulations", "congrats",
+        "bravo", "hooray", "hurray", "hurrah", "yay", "woohoo",
+        "win", "wins", "winning", "won", "lose", "loses",
+        "losing", "lost", "pass", "passing", "passed", "fail",
+        "failing", "failed", "score", "scores", "scored",
+        "scoring", "grade", "grades", "star", "stars", "success",
+        "succeed", "succeeds", "succeeded", "successful",
+        "successfully", "complete", "completely", "completed",
+        "finish", "finished", "exactly", "precisely", "absolutely",
+        "well done", "way to go", "did well", "done well", "do well",
+    ]
 }

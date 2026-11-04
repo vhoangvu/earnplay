@@ -612,6 +612,95 @@ final class ModelTutorEngineTests: XCTestCase {
         XCTAssertEqual(collector.updates.map(\.turns), [expected.turns])
     }
 
+    // MARK: - Fix round 2 finding 2: spelled-out math and praise verdicts
+
+    func testCorrectnessClaimScreenRejectsNumberWordsAndPraiseVerdicts() {
+        let rejected = [
+            // The finding's own examples.
+            "Seven times eight equals fifty-four",
+            "You nailed it!",
+            // Spelled-out math claims (no digits, no round-1 verdict word).
+            "Eight plus five equals thirteen",
+            "One plus one is two.",
+            "Half of ten is five.",
+            "A dozen eggs make twelve.",
+            "The total is twenty.",
+            "Add them together to check.",
+            "The sum must match.",
+            "Double it and see.",
+            "Twice as much next time.",
+            "Calculate it step by step.",
+            // Praise/success verdicts without a round-1 verdict word.
+            "You crushed it!",
+            "You killed it!",
+            "Slayed!",
+            "Great job!",
+            "Good job, you did it!",
+            "Well done!",
+            "Way to go!",
+            "Perfect!",
+            "Excellent work!",
+            "Amazing!",
+            "You are fantastic!",
+            "You solved it!",
+            "You aced it!",
+            "Bravo!",
+            "Congratulations!",
+            "Exactly!",
+            "Precisely!",
+            "You did well!",
+            "You earned a star!",
+            "Your score is high.",
+            "You passed the test!",
+            "You finished all the questions!",
+        ]
+        for text in rejected {
+            XCTAssertTrue(ModelTutorEngine.containsUnverifiedCorrectnessClaim(text), text)
+        }
+        // Effort, process, and ability praise still passes: the
+        // deterministic path owns encouragement wording, and falling
+        // back on THESE would cost phrasing for no safety gain.
+        let accepted = [
+            "Keep trying your best!",
+            "Give it another go!",
+            "Think step by step.",
+            "Keep practising, you are working hard!",
+            "Show me how you started.",
+            "What did you try first?",
+            "You can solve this step.",
+            "Point to the part you tried.",
+            "Do you want to try again?",
+        ]
+        for text in accepted {
+            XCTAssertFalse(ModelTutorEngine.containsUnverifiedCorrectnessClaim(text), text)
+        }
+    }
+
+    func testGeneratedPraiseVerdictsFallBackToDeterministic() async {
+        let fake = FakeModel(responses: ["You nailed it!", "Seven times eight equals fifty-four"])
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 5)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let delivered = expectation(description: "fallback delivered")
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            delivered.fulfill()
+        }
+
+        let expected = demo.submitAnswer(q1Wrong)
+        let sync = engine.submitAnswer(q1Wrong)
+        XCTAssertEqual(sync.turns, expected.turns)
+
+        await fulfillment(of: [delivered], timeout: 5)
+        // Both generated turns carry unverified success/math claims
+        // with no digits or round-1 verdict words, so the async
+        // update keeps the deterministic wording verbatim.
+        XCTAssertEqual(collector.updates.map(\.turns), [expected.turns])
+    }
+
     // MARK: - Fix round 1 finding 4: no obsolete inference behind timeouts
 
     func testTimedOutInferenceDoesNotQueueObsoleteCalls() async {
