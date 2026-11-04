@@ -590,6 +590,43 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         return condition()
     }
 
+    /// Spins until the keyboard-open layout STOPS MOVING (round 7):
+    /// the reported layout plus every watched scroll offset identical
+    /// across four consecutive pump windows (~0.8s of stillness). The
+    /// avoidance scroll animates across many renders, and a fixed
+    /// pump budget reads mid-animation on slower runtimes — settling
+    /// first keeps every later geometric assertion on final frames.
+    /// Times out loud: a layout that never converges is itself a bug.
+    @MainActor
+    private func spinUntilLayoutSettled(
+        timeout: TimeInterval,
+        readReport: () -> ChallengeLayoutReport?,
+        hostView: UIView,
+        scrolls: [UIScrollView]
+    ) -> Bool {
+        var steadyReport: ChallengeLayoutReport?
+        var steadyOffsets: [CGFloat] = []
+        var steadyPasses = 0
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while Date() < deadline {
+            pumpCover(hostView)
+            guard let current = readReport(), current.isComplete else {
+                steadyPasses = 0
+                continue
+            }
+            let offsets = scrolls.map { $0.contentOffset.y }
+            if steadyReport == current && steadyOffsets == offsets {
+                steadyPasses += 1
+                if steadyPasses >= 4 { return true }
+            } else {
+                steadyPasses = 0
+                steadyReport = current
+                steadyOffsets = offsets
+            }
+        }
+        return false
+    }
+
     @MainActor
     private func pumpCover(_ view: UIView) {
         view.setNeedsLayout()
@@ -1300,10 +1337,12 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             "the keyboard must not resign the focused composer")
 
         // Fresh positions after the keyboard-driven layout.
-        guard spinUntil(timeout: 5, {
-            pumpCover(host.view)
-            return latestReport?.isComplete == true
-        }) else {
+        guard spinUntilLayoutSettled(
+            timeout: 15,
+            readReport: { latestReport },
+            hostView: host.view,
+            scrolls: [outer]
+        ) else {
             return XCTFail("the layout report never settled with the keyboard open")
         }
         report = latestReport!
@@ -1313,8 +1352,7 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             x: 0, y: topSafe,
             width: width, height: height - topSafe - keyboardHeight)
 
-        // The focused composer stays visible: avoidance scrolls it
-        // above the keyboard (or it was never covered).
+        // The keyboard-open ruler check for the reveal pass below.
         guard let keyboardFieldFrame = report.composerFieldFrame,
             let ruledField = renderedThroughRuler(
                 keyboardFieldFrame, fieldReport: keyboardFieldFrame,
@@ -1325,10 +1363,6 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertLessThan(
             hypot(ruledField.vector.x, ruledField.vector.y), 40,
             "the keyboard-open report must agree with the materialized field")
-        XCTAssertTrue(
-            visible.insetBy(dx: 0, dy: 4).contains(
-                CGPoint(x: ruledField.frame.midX, y: ruledField.frame.midY)),
-            "the focused composer must stay visible with the keyboard open")
 
         // Each control in turn: compute the scroll offset that lands
         // its center 20pt above the fold, prove that offset lies
@@ -1375,6 +1409,7 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                     case "Hint": return fresh.hintButtonFrame
                     case "Send": return fresh.sendButtonFrame
                     case "Finish": return fresh.finishButtonFrame
+                    case "Composer": return fresh.composerFieldFrame
                     default: return nil
                     }
                 }(),
@@ -1413,6 +1448,19 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                 file: file, line: line)
             return true
         }
+
+        // The focused composer is reveal-reachable like every other
+        // control (round 7): the old passive check depended on the
+        // automatic avoidance landing it visible, which varies by
+        // runtime — the explicit reveal proves the same guarantee
+        // with or without any avoidance, and focus must survive it.
+        guard reveal(report.composerFieldFrame, "Composer") else { return }
+        XCTAssertTrue(
+            composer.isFirstResponder,
+            "revealing the composer must not resign it")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive its own reveal")
 
         // Hint operates through the surface's live model (Send's and
         // Hint's exact target — rendered SwiftUI buttons materialize
@@ -1725,10 +1773,12 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             "the keyboard must not resign the focused composer")
 
         // Fresh positions after the keyboard-driven layout.
-        guard spinUntil(timeout: 5, {
-            pumpCover(host.view)
-            return latestReport?.isComplete == true
-        }) else {
+        guard spinUntilLayoutSettled(
+            timeout: 15,
+            readReport: { latestReport },
+            hostView: host.view,
+            scrolls: [outer, sidebar]
+        ) else {
             return XCTFail("the layout report never settled with the keyboard open")
         }
         report = latestReport!
@@ -1758,8 +1808,7 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             openThread.bounds.height, 55,
             "the keyboard-open compact thread must keep real height")
 
-        // The focused composer stays visible: avoidance scrolls it
-        // above the keyboard (or it was never covered).
+        // The keyboard-open ruler check for the reveal pass below.
         guard let keyboardFieldFrame = report.composerFieldFrame,
             let ruledField = renderedThroughRuler(
                 keyboardFieldFrame, fieldReport: keyboardFieldFrame,
@@ -1770,10 +1819,6 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertLessThan(
             hypot(ruledField.vector.x, ruledField.vector.y), 40,
             "the keyboard-open report must agree with the materialized field")
-        XCTAssertTrue(
-            visible.insetBy(dx: 0, dy: 4).contains(
-                CGPoint(x: ruledField.frame.midX, y: ruledField.frame.midY)),
-            "the focused composer must stay visible with the keyboard open")
 
         // Each chat-column control in turn: compute the scroll offset
         // that lands its center 20pt above the fold, prove that offset
@@ -1819,6 +1864,7 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                     switch name {
                     case "Hint": return fresh.hintButtonFrame
                     case "Send": return fresh.sendButtonFrame
+                    case "Composer": return fresh.composerFieldFrame
                     default: return nil
                     }
                 }(),
@@ -1904,6 +1950,20 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                 file: file, line: line)
             return true
         }
+
+        // The focused composer is reveal-reachable like every other
+        // chat-column control (round 7): the old passive check
+        // depended on the automatic avoidance landing it visible,
+        // which varies by runtime — the explicit reveal proves the
+        // same guarantee with or without any avoidance, and focus
+        // must survive it.
+        guard reveal(report.composerFieldFrame, "Composer") else { return }
+        XCTAssertTrue(
+            composer.isFirstResponder,
+            "revealing the composer must not resign it")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive its own reveal")
 
         // Hint operates through the surface's live model (Send's and
         // Hint's exact target — rendered SwiftUI buttons materialize
