@@ -400,12 +400,24 @@ struct ChatConversationView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Round-4 probes (issue #91): transparent backgrounds
+            // reporting through `ChallengeLayoutReportKey`. They never
+            // affect layout or behavior; only the installed shield
+            // challenge observes them (to size its portrait chat and to
+            // let tests prove the controls reachable). The main practice
+            // chat observes nothing, so they compute and discard there.
             header
+                .background(ChallengeLayoutProbe {
+                    ChallengeLayoutReport(chatHeaderHeight: $0.size.height)
+                })
             if viewModel.isVoiceUnavailable {
                 voiceUnavailableNotice
             }
             thread
             composerBar
+                .background(ChallengeLayoutProbe {
+                    ChallengeLayoutReport(chatComposerHeight: $0.size.height)
+                })
         }
         .background(theme.tokens.background.color)
         .accessibilityIdentifier("chatConversationView")
@@ -456,6 +468,9 @@ struct ChatConversationView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(theme.tokens.tutorBackground.color)
             .accessibilityIdentifier("chatVoiceUnavailableNotice")
+            .background(ChallengeLayoutProbe {
+                ChallengeLayoutReport(chatNoticeHeight: $0.size.height)
+            })
     }
 
     private var thread: some View {
@@ -569,6 +584,10 @@ struct ChatConversationView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: .infinity)
                     .accessibilityIdentifier("chatComposerField")
+                    .background(ChallengeLayoutProbe {
+                        ChallengeLayoutReport(
+                            composerFieldFrame: $0.frame(in: .global))
+                    })
                     .onSubmit { viewModel.submitDraft() }
 
                 HStack(spacing: 8) {
@@ -592,6 +611,10 @@ struct ChatConversationView: View {
                     // Rendered pill residual (~1.67pt) accepted per #79.
                     .frame(minHeight: 44)
                     .accessibilityIdentifier("chatHintButton")
+                    .background(ChallengeLayoutProbe {
+                        ChallengeLayoutReport(
+                            hintButtonFrame: $0.frame(in: .global))
+                    })
 
                     Spacer()
 
@@ -604,6 +627,10 @@ struct ChatConversationView: View {
                         .foregroundStyle(theme.childTextOnChildBackground.color)
                         .frame(minHeight: 44)
                         .accessibilityIdentifier("chatSendButton")
+                        .background(ChallengeLayoutProbe {
+                            ChallengeLayoutReport(
+                                sendButtonFrame: $0.frame(in: .global))
+                        })
                 }
             }
         }

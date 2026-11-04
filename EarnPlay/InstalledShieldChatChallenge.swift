@@ -138,6 +138,75 @@ final class InstalledShieldChatEngine: ChatTutorEngine, HintListenEventSink {
     }
 }
 
+// MARK: - Challenge layout measurement (PR #92 fix round 4)
+
+/// One layout measurement pass over the portrait challenge body.
+///
+/// Heights size the chat (see `innerChatHeight`); frames let tests
+/// prove the controls reachable. Frames are in the `.global` space:
+/// consumers translate them with one UIKit anchor (the materialized
+/// composer field), which also cross-checks the hook's truthfulness.
+/// Every field has exactly one probe; absent views (e.g. Hint/Send
+/// after session completion) report nil — never a stale frame.
+struct ChallengeLayoutReport: Equatable {
+    var shieldHeaderHeight: CGFloat? = nil
+    var finishFooterHeight: CGFloat? = nil
+    var chatHeaderHeight: CGFloat? = nil
+    var chatComposerHeight: CGFloat? = nil
+    /// Voice-unavailable notice height; nil when the notice is absent
+    /// (the usual case), so it never gates `isComplete`.
+    var chatNoticeHeight: CGFloat? = nil
+    var composerFieldFrame: CGRect? = nil
+    var hintButtonFrame: CGRect? = nil
+    var sendButtonFrame: CGRect? = nil
+    var finishButtonFrame: CGRect? = nil
+
+    /// True once every probe in an active session has reported.
+    var isComplete: Bool {
+        shieldHeaderHeight != nil && finishFooterHeight != nil
+            && chatHeaderHeight != nil && chatComposerHeight != nil
+            && composerFieldFrame != nil && hintButtonFrame != nil
+            && sendButtonFrame != nil && finishButtonFrame != nil
+    }
+
+    fileprivate mutating func merge(_ other: ChallengeLayoutReport) {
+        shieldHeaderHeight = other.shieldHeaderHeight ?? shieldHeaderHeight
+        finishFooterHeight = other.finishFooterHeight ?? finishFooterHeight
+        chatHeaderHeight = other.chatHeaderHeight ?? chatHeaderHeight
+        chatComposerHeight = other.chatComposerHeight ?? chatComposerHeight
+        chatNoticeHeight = other.chatNoticeHeight ?? chatNoticeHeight
+        composerFieldFrame = other.composerFieldFrame ?? composerFieldFrame
+        hintButtonFrame = other.hintButtonFrame ?? hintButtonFrame
+        sendButtonFrame = other.sendButtonFrame ?? sendButtonFrame
+        finishButtonFrame = other.finishButtonFrame ?? finishButtonFrame
+    }
+}
+
+struct ChallengeLayoutReportKey: PreferenceKey {
+    static var defaultValue = ChallengeLayoutReport()
+    static func reduce(
+        value: inout ChallengeLayoutReport,
+        nextValue: () -> ChallengeLayoutReport
+    ) {
+        value.merge(nextValue())
+    }
+}
+
+/// A layout-neutral measurement background: transparent, never affects
+/// layout, only reports through `ChallengeLayoutReportKey`. Shared by
+/// this file's probes and `ChatConversationView`'s (same module).
+struct ChallengeLayoutProbe: View {
+    var report: (GeometryProxy) -> ChallengeLayoutReport
+
+    var body: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(
+                key: ChallengeLayoutReportKey.self,
+                value: report(proxy))
+        }
+    }
+}
+
 // MARK: - Chat challenge surface (issue #91)
 
 /// Installed-shield challenge surface (issue #91): the chat tutor with the
@@ -154,6 +223,12 @@ struct InstalledShieldChatChallengeView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     var theme: DesignSystem.Theme = DesignSystem.defaultTheme
     private let onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)?
+    /// Latest measurement pass (round 4): sizes the portrait chat and,
+    /// through `onControlFrames`, lets tests prove the controls
+    /// reachable. Updated only on change, so layout converges instead
+    /// of feeding back.
+    @State private var layoutReport = ChallengeLayoutReport()
+    private let onControlFrames: ((ChallengeLayoutReport) -> Void)?
 
     /// Minimum container width for the compact two-column layout (PR
     /// #92 fix round 3, finding 1): the sidebar reserves 280pt, and
@@ -166,6 +241,12 @@ struct InstalledShieldChatChallengeView: View {
 
     /// Sidebar width in the compact layout (round 2, unchanged).
     private static let compactSidebarWidth: CGFloat = 280
+
+    /// Thread floor in the portrait layout (round 4): the chat never
+    /// shrinks below its fixed chrome (measured) plus this, so at
+    /// least one message row survives and the outer column — not the
+    /// chat's pinned composer — yields when the safe area shrinks.
+    private static let minThreadHeight: CGFloat = 60
 
     /// Layout decision table (round 3, finding 1): the compact sidebar
     /// layout applies only when the vertical size class is compact
@@ -194,15 +275,21 @@ struct InstalledShieldChatChallengeView: View {
     ///   production. Mount-time only, so it always names the identity
     ///   the surface actually uses (view `init` also runs for
     ///   identities whose `@StateObject` is then discarded).
+    /// - Parameter onControlFrames: test hook receiving each new
+    ///   `ChallengeLayoutReport`; nil in production. The measurement
+    ///   itself is production-always (it sizes the portrait chat);
+    ///   only the observation is test-gated.
     init(
         flow: SimulatedShieldFlow,
         theme: DesignSystem.Theme = DesignSystem.defaultTheme,
         makeEngine: ((SimulatedShieldFlow) -> any ChatTutorEngine)? = nil,
-        onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)? = nil
+        onChatModelMount: ((ChatConversationViewModel, SimulatedShieldFlow) -> Void)? = nil,
+        onControlFrames: ((ChallengeLayoutReport) -> Void)? = nil
     ) {
         self.flow = flow
         self.theme = theme
         self.onChatModelMount = onChatModelMount
+        self.onControlFrames = onControlFrames
         let challengeEngine = makeEngine?(flow) ?? InstalledShieldChatEngine(
             inner: DemoTutorEngine(), flow: flow
         )
@@ -213,21 +300,32 @@ struct InstalledShieldChatChallengeView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            adaptiveBody(width: proxy.size.width)
+            adaptiveBody(width: proxy.size.width, height: proxy.size.height)
         }
         .background(theme.tokens.background.color)
         .interactiveDismissDisabled(true)
         .onAppear {
             onChatModelMount?(chatViewModel, flow)
         }
+        .onPreferenceChange(ChallengeLayoutReportKey.self) { report in
+            // Deduped: heights are width-determined (stable across
+            // keyboard and scroll changes), so layout converges after
+            // the first pass instead of feeding back.
+            if report != layoutReport {
+                layoutReport = report
+                onControlFrames?(report)
+            }
+        }
     }
 
     /// Both layouts share one structure (round 3, finding 1): the
-    /// reader feeds ONLY the width — the keyboard never changes the
-    /// container width, and the height input is gone (the size class
-    /// carries the short/regular distinction) — so opening the
-    /// software keyboard can never flip the layout.
-    private func adaptiveBody(width: CGFloat) -> some View {
+    /// layout DECISION reads only the size class and the width — the
+    /// keyboard changes neither, so it can never flip the layout.
+    /// Round 4 feeds the height ONLY to the chat's explicit frame
+    /// (sizing, never a branch): keyboard open/close changes no view
+    /// type or position, so the focused composer subtree — still the
+    /// inner column's middle slot in both layouts — always survives.
+    private func adaptiveBody(width: CGFloat, height: CGFloat) -> some View {
         let compact = Self.useCompactLayout(
             verticalSizeClass: verticalSizeClass, width: width)
         return HStack(spacing: 0) {
@@ -253,31 +351,75 @@ struct InstalledShieldChatChallengeView: View {
                 .frame(width: Self.compactSidebarWidth)
             }
 
-            // The chat keeps ONE structural position in both layouts —
-            // the inner column's middle slot — so a layout flip
-            // (rotation, multitasking resize) never replaces the
-            // focused composer subtree and never dismisses the
-            // keyboard. Only the header and footer move, and they hold
-            // no focus. The regular (portrait / tall) layout is
-            // otherwise unchanged from issue #91: the fixed challenge
-            // header, the chat, and the finish footer stacked
-            // vertically, with only the message thread scrolling.
-            VStack(spacing: 0) {
-                if !compact {
-                    challengeHeader
-                        .padding()
-                }
+            // Round 4: the inner column always scrolls, in BOTH layouts,
+            // so rotation never changes the chat's ancestors either.
+            // The chat keeps ONE structural position — the inner
+            // column's middle slot — so a keyboard open/close (no
+            // branch change at all) or a layout flip (rotation,
+            // multitasking resize) never replaces the focused composer
+            // subtree and never dismisses the keyboard. Only the header
+            // and footer move, and they hold no focus.
+            //
+            // At full height the portrait content fits exactly — the
+            // chat's explicit height IS the old flexible height
+            // (available minus the measured chrome) — so the thread
+            // still scrolls internally, the composer stays pinned, and
+            // the scroll view never engages: identical to round 3. At
+            // keyboard-reduced heights the column (not the chat) yields:
+            // the chat keeps its measured fixed chrome plus the thread
+            // floor, the keyboard avoidance keeps the focused composer
+            // visible, and Hint/Send and Finish stay reachable by
+            // scrolling. The compact chat keeps the full height exactly
+            // as in round 2.
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    if !compact {
+                        challengeHeader
+                            .padding()
+                            .background(ChallengeLayoutProbe {
+                                ChallengeLayoutReport(
+                                    shieldHeaderHeight: $0.size.height)
+                            })
+                    }
 
-                ChatConversationView(viewModel: chatViewModel, theme: theme)
+                    ChatConversationView(viewModel: chatViewModel, theme: theme)
+                        .frame(height: innerChatHeight(
+                            available: height, compact: compact))
 
-                if !compact {
-                    finishFooter
-                        .padding()
+                    if !compact {
+                        finishFooter
+                            .padding()
+                            .background(ChallengeLayoutProbe {
+                                ChallengeLayoutReport(
+                                    finishFooterHeight: $0.size.height)
+                            })
+                    }
                 }
+                .frame(maxWidth: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Explicit chat height (round 4): the available height minus the
+    /// measured shield chrome — exactly what the old flexible layout
+    /// gave the chat — floored at the chat's measured fixed chrome
+    /// plus the thread floor, so a shrunken safe area scrolls the
+    /// outer column instead of crushing the pinned composer. Compact
+    /// keeps the full height (round 2, unchanged). Unmeasured heights
+    /// read 0 on the first pass; the preference pass corrects them
+    /// before anything settles.
+    private func innerChatHeight(available: CGFloat, compact: Bool) -> CGFloat {
+        if compact {
+            return available
+        }
+        let chrome = (layoutReport.shieldHeaderHeight ?? 0)
+            + (layoutReport.finishFooterHeight ?? 0)
+        let fixed = (layoutReport.chatHeaderHeight ?? 0)
+            + (layoutReport.chatComposerHeight ?? 0)
+            + (layoutReport.chatNoticeHeight ?? 0)
+        return max(fixed + Self.minThreadHeight, available - chrome)
     }
 
     private var challengeHeader: some View {
@@ -309,6 +451,9 @@ struct InstalledShieldChatChallengeView: View {
                 flow.finishChallenge()
             }
             .accessibilityIdentifier("finishChallengeButton")
+            .background(ChallengeLayoutProbe {
+                ChallengeLayoutReport(finishButtonFrame: $0.frame(in: .global))
+            })
 
             if let score = flow.lastScore {
                 Text(score.narration)
