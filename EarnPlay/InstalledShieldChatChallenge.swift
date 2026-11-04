@@ -160,6 +160,9 @@ struct ChallengeLayoutReport: Equatable {
     var hintButtonFrame: CGRect? = nil
     var sendButtonFrame: CGRect? = nil
     var finishButtonFrame: CGRect? = nil
+    /// Simulated-badge frame (round 5, finding 1): proves the pinned
+    /// badge stays visible while the controls are reveal-scrolled.
+    var badgeFrame: CGRect? = nil
 
     /// True once every probe in an active session has reported.
     var isComplete: Bool {
@@ -167,6 +170,7 @@ struct ChallengeLayoutReport: Equatable {
             && chatHeaderHeight != nil && chatComposerHeight != nil
             && composerFieldFrame != nil && hintButtonFrame != nil
             && sendButtonFrame != nil && finishButtonFrame != nil
+            && badgeFrame != nil
     }
 
     fileprivate mutating func merge(_ other: ChallengeLayoutReport) {
@@ -179,6 +183,7 @@ struct ChallengeLayoutReport: Equatable {
         hintButtonFrame = other.hintButtonFrame ?? hintButtonFrame
         sendButtonFrame = other.sendButtonFrame ?? sendButtonFrame
         finishButtonFrame = other.finishButtonFrame ?? finishButtonFrame
+        badgeFrame = other.badgeFrame ?? badgeFrame
     }
 }
 
@@ -343,82 +348,101 @@ struct InstalledShieldChatChallengeView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         challengeHeader
+                            .background(ChallengeLayoutProbe {
+                                ChallengeLayoutReport(
+                                    shieldHeaderHeight: $0.size.height)
+                            })
 
                         finishFooter
+                            .background(ChallengeLayoutProbe {
+                                ChallengeLayoutReport(
+                                    finishFooterHeight: $0.size.height)
+                            })
                     }
                     .padding(12)
                 }
                 .frame(width: Self.compactSidebarWidth)
             }
 
-            // Round 4: the inner column always scrolls, in BOTH layouts,
-            // so rotation never changes the chat's ancestors either.
-            // The chat keeps ONE structural position — the inner
-            // column's middle slot — so a keyboard open/close (no
-            // branch change at all) or a layout flip (rotation,
-            // multitasking resize) never replaces the focused composer
-            // subtree and never dismisses the keyboard. Only the header
-            // and footer move, and they hold no focus.
-            //
-            // At full height the portrait content fits exactly — the
-            // chat's explicit height IS the old flexible height
-            // (available minus the measured chrome) — so the thread
-            // still scrolls internally, the composer stays pinned, and
-            // the scroll view never engages: identical to round 3. At
-            // keyboard-reduced heights the column (not the chat) yields:
-            // the chat keeps its measured fixed chrome plus the thread
-            // floor, the keyboard avoidance keeps the focused composer
-            // visible, and Hint/Send and Finish stay reachable by
-            // scrolling. The compact chat keeps the full height exactly
-            // as in round 2.
-            ScrollView(.vertical) {
-                VStack(spacing: 0) {
-                    if !compact {
-                        challengeHeader
-                            .padding()
-                            .background(ChallengeLayoutProbe {
-                                ChallengeLayoutReport(
-                                    shieldHeaderHeight: $0.size.height)
-                            })
+            // Round 5, finding 1: the portrait header — the simulated
+            // badge block — is pinned ABOVE the scrolling column, never
+            // inside it, so scrolling to the controls with the keyboard
+            // open can never hide the simulated-enforcement indication.
+            // The sizing math is unchanged: the column viewport is the
+            // available height minus the pinned header, and the chat
+            // keeps available-minus-chrome, so closed content still fits
+            // exactly and keyboard-reduced heights still scroll the
+            // column (not the chat). The compact sidebar keeps its
+            // scrolling header deliberately: at landscape
+            // keyboard-reduced heights the sidebar viewport can fall
+            // below header-plus-footer, where a pinned sidebar header
+            // would strand Finish — the scrolling sidebar keeps it
+            // reachable. Keyboard open/close still changes no branch in
+            // either layout, so the focused composer subtree still
+            // always survives (the resolved round-4 finding).
+            if compact {
+                ScrollView(.vertical) {
+                    VStack(spacing: 0) {
+                        ChatConversationView(viewModel: chatViewModel, theme: theme)
+                            .frame(height: innerChatHeight(
+                                available: height, compact: compact))
                     }
-
-                    ChatConversationView(viewModel: chatViewModel, theme: theme)
-                        .frame(height: innerChatHeight(
-                            available: height, compact: compact))
-
-                    if !compact {
-                        finishFooter
-                            .padding()
-                            .background(ChallengeLayoutProbe {
-                                ChallengeLayoutReport(
-                                    finishFooterHeight: $0.size.height)
-                            })
-                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VStack(spacing: 0) {
+                    challengeHeader
+                        .padding()
+                        .background(ChallengeLayoutProbe {
+                            ChallengeLayoutReport(
+                                shieldHeaderHeight: $0.size.height)
+                        })
+
+                    ScrollView(.vertical) {
+                        VStack(spacing: 0) {
+                            ChatConversationView(viewModel: chatViewModel, theme: theme)
+                                .frame(height: innerChatHeight(
+                                    available: height, compact: compact))
+
+                            finishFooter
+                                .padding()
+                                .background(ChallengeLayoutProbe {
+                                    ChallengeLayoutReport(
+                                        finishFooterHeight: $0.size.height)
+                                })
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Explicit chat height (round 4): the available height minus the
-    /// measured shield chrome — exactly what the old flexible layout
-    /// gave the chat — floored at the chat's measured fixed chrome
-    /// plus the thread floor, so a shrunken safe area scrolls the
-    /// outer column instead of crushing the pinned composer. Compact
-    /// keeps the full height (round 2, unchanged). Unmeasured heights
-    /// read 0 on the first pass; the preference pass corrects them
-    /// before anything settles.
+    /// Explicit chat height (round 4, portrait): the available height
+    /// minus the measured shield chrome — exactly what the old
+    /// flexible layout gave the chat — floored at the chat's measured
+    /// fixed chrome plus the thread floor, so a shrunken safe area
+    /// scrolls the outer column instead of crushing the pinned
+    /// composer. Round 5, finding 2: compact applies the same
+    /// fixed-plus-floor minimum instead of the bare available height,
+    /// so a keyboard-reduced landscape height grows outer scroll
+    /// content instead of crushing the thread and overflowing
+    /// Hint/Send past the scrollable end. Unmeasured heights read 0
+    /// on the first pass; the preference pass corrects them before
+    /// anything settles.
     private func innerChatHeight(available: CGFloat, compact: Bool) -> CGFloat {
-        if compact {
-            return available
-        }
-        let chrome = (layoutReport.shieldHeaderHeight ?? 0)
-            + (layoutReport.finishFooterHeight ?? 0)
         let fixed = (layoutReport.chatHeaderHeight ?? 0)
             + (layoutReport.chatComposerHeight ?? 0)
             + (layoutReport.chatNoticeHeight ?? 0)
+        if compact {
+            return max(fixed + Self.minThreadHeight, available)
+        }
+        let chrome = (layoutReport.shieldHeaderHeight ?? 0)
+            + (layoutReport.finishFooterHeight ?? 0)
         return max(fixed + Self.minThreadHeight, available - chrome)
     }
 
@@ -433,6 +457,9 @@ struct InstalledShieldChatChallengeView: View {
                 .background(theme.tokens.track.color)
                 .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius))
                 .accessibilityIdentifier("simulatedShieldBadge")
+                .background(ChallengeLayoutProbe {
+                    ChallengeLayoutReport(badgeFrame: $0.frame(in: .global))
+                })
 
             Text("Locked app (simulated): \(flow.app.id)")
                 .font(.subheadline)

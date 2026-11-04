@@ -151,13 +151,27 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         for view: Content,
         width: CGFloat = 390,
         height: CGFloat = 1500,
-        verticalSizeClass: UserInterfaceSizeClass = .regular
+        verticalSizeClass: UserInterfaceSizeClass = .regular,
+        // Round 5: the headless window keeps the portrait scene's
+        // top safe area even at landscape geometry, while a real
+        // landscape phone reports ~0 there. Cancelling it makes the
+        // landscape render faithful (available 390, not 336) — at a
+        // false 336 the finding-2 floor correctly binds and the
+        // composer sits partly below the fold, which is exactly what
+        // the floor is for, not what this closed-state test checks.
+        cancelTopSafeArea: Bool = false
     ) -> String {
         let host = UIHostingController(
             rootView: view.environment(\.verticalSizeClass, verticalSizeClass))
         let win = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: height))
         win.rootViewController = host
         win.makeKeyAndVisible()
+        if cancelTopSafeArea {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            host.additionalSafeAreaInsets = UIEdgeInsets(
+                top: -host.view.safeAreaInsets.top, left: 0, bottom: 0, right: 0)
+        }
         return ocrText(of: host.view)
     }
 
@@ -833,7 +847,8 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
             flow: flow, theme: DesignSystem.defaultTheme)
 
         let rendered = renderedText(
-            for: view, width: 844, height: 390, verticalSizeClass: .compact)
+            for: view, width: 844, height: 390, verticalSizeClass: .compact,
+            cancelTopSafeArea: true)
         XCTAssertTrue(
             rendered.contains("SIMULATED SHIELD"),
             "badge must stay visible at short heights; rendered:\n\(rendered)")
@@ -1221,6 +1236,14 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
         XCTAssertTrue(
             ruled.frame.insetBy(dx: -1, dy: -1).contains(uiFieldFrame),
             "the reported field frame must contain the materialized field")
+        // Round 5, finding 1 calibration: at the closed resting
+        // offset the shift is pure chrome-plus-space (no scroll
+        // staleness), so this tight bound proves raw reported frames
+        // read in host coordinates — the reveal steps below compare
+        // the raw pinned-badge frame against the visible rect.
+        XCTAssertLessThan(
+            hypot(ruled.vector.x, ruled.vector.y), 15,
+            "raw reported frames must read in host coordinates")
 
         // Portrait-closed equivalence (round 3): the content fits its
         // viewport exactly — the outer column never engages — and the
@@ -1367,6 +1390,23 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
                     CGPoint(x: reRuled.frame.midX, y: reRuled.frame.midY)),
                 "the \(name) control must be visible after its reveal scroll",
                 file: file, line: line)
+            // Round 5, finding 1: the pinned badge stays visible after
+            // every reveal scroll — reaching the controls must never
+            // hide the simulated-enforcement indication. The badge sits
+            // OUTSIDE the scrolled column, so its frame needs no ruler
+            // translation (the shift is the column's scroll); the raw
+            // frame reads in host coordinates (calibrated above), and
+            // the 8pt bound holds tens of points of margin.
+            guard let badgeFrame = fresh.badgeFrame else {
+                XCTFail("the badge lost its frame after revealing \(name)",
+                        file: file, line: line)
+                return false
+            }
+            XCTAssertTrue(
+                visible.insetBy(dx: 0, dy: 8).contains(
+                    CGPoint(x: badgeFrame.midX, y: badgeFrame.midY)),
+                "the simulated badge must stay visible after revealing \(name)",
+                file: file, line: line)
             XCTAssertTrue(
                 mountedComposerField(in: host.view) === composer,
                 "the composer subtree must survive revealing \(name)",
@@ -1481,5 +1521,455 @@ final class InstalledShieldChatChallengeTests: XCTestCase {
     @MainActor
     func testSmallPhoneKeyboardKeepsControlsReachableAndOperable() {
         verifyKeyboardReachability(width: 375, height: 667, keyboardHeight: 300)
+    }
+
+    // MARK: - Landscape keyboard reachability (PR #92 fix round 5, finding 2)
+
+    /// The compact sidebar scroll: the top-level column that is neither
+    /// the chat column nor nested in it (the thread nests in the chat
+    /// column; the composer field is a text view, excluded first).
+    @MainActor
+    private func compactSidebarScroll(in root: UIView, excluding chatColumn: UIScrollView) -> UIScrollView? {
+        var found: UIScrollView?
+        func walk(_ v: UIView) {
+            if found != nil { return }
+            if v is UITextView {
+                // The composer field, not a column.
+            } else if let scroll = v as? UIScrollView, scroll !== chatColumn,
+                !scroll.isDescendant(of: chatColumn)
+            {
+                found = scroll
+                return
+            }
+            v.subviews.forEach(walk)
+        }
+        walk(root)
+        return found
+    }
+
+    /// The message thread: the chat column's nested scroll.
+    @MainActor
+    private func threadScroll(in chatColumn: UIScrollView) -> UIScrollView? {
+        var found: UIScrollView?
+        func walk(_ v: UIView) {
+            if found != nil { return }
+            if let scroll = v as? UIScrollView, !(v is UITextView), scroll !== chatColumn {
+                found = scroll
+                return
+            }
+            v.subviews.forEach(walk)
+        }
+        chatColumn.subviews.forEach(walk)
+        return found
+    }
+
+    /// Landscape keyboard reachability with the PRODUCTION engine (whose
+    /// number-pad composer is the tallest fixed chrome): the compact
+    /// challenge mounted at landscape geometry, the real composer
+    /// focused, a keyboard-height safe-area inset plus keyboard
+    /// notifications — the observable effects of a visible software
+    /// keyboard. The finding-2 minimum must hold open AND closed (the
+    /// outer content keeps fixed chrome plus the thread floor; the
+    /// thread keeps real height instead of crushing to zero), and
+    /// Hint/Send (chat column) and Finish (sidebar) must each be
+    /// reveal-reachable and then OPERATED through the surface's live
+    /// instances. Rendering or OCR alone proves none of this, so this
+    /// test asserts no text.
+    @MainActor
+    private func verifyCompactKeyboardReachability(
+        width: CGFloat, height: CGFloat, keyboardHeight: CGFloat
+    ) {
+        let (flow, _) = makeFlow()
+        var liveModel: ChatConversationViewModel?
+        var latestReport: ChallengeLayoutReport?
+        let view = InstalledShieldChatChallengeView(
+            flow: flow,
+            theme: DesignSystem.defaultTheme,
+            onChatModelMount: { model, _ in liveModel = model },
+            onControlFrames: { latestReport = $0 })
+            .environment(\.verticalSizeClass, .compact)
+        let host = UIHostingController(rootView: view)
+        let win = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: height))
+        win.rootViewController = host
+        win.makeKeyAndVisible()
+        UIView.setAnimationsEnabled(false)
+        defer { UIView.setAnimationsEnabled(true) }
+
+        guard spinUntil(timeout: 5, {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            return mountedComposerField(in: host.view) != nil
+        }) else {
+            return XCTFail("the mounted compact challenge never rendered its composer")
+        }
+        guard spinUntil(timeout: 5, {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            return latestReport?.isComplete == true
+        }) else {
+            return XCTFail("the compact challenge never produced a complete layout report")
+        }
+        guard let model = liveModel else {
+            return XCTFail("the mounted challenge never reported its live model")
+        }
+        guard spinUntil(timeout: 5, { model.messages.count >= 1 }) else {
+            return XCTFail("the mounted chat never started its session")
+        }
+        guard let composer = mountedComposerField(in: host.view) else {
+            return XCTFail("the mounted challenge lost its composer")
+        }
+        guard let outer = outerColumnScroll(in: host.view) else {
+            return XCTFail("the compact challenge has no chat column")
+        }
+        guard let sidebar = compactSidebarScroll(in: host.view, excluding: outer) else {
+            return XCTFail("the compact challenge has no sidebar column")
+        }
+        // Force a FRESH frame report: the first complete report can
+        // predate the relayout it triggers (compact pass 1 sizes the
+        // chat from unmeasured zero heights, and the growth is
+        // absorbed by the thread sibling — the repositioned readers
+        // keep their size, so they don't always re-fire until a
+        // scroll forces a re-read). The nudge scrolls the chat
+        // column; the loop below then holds until a complete report
+        // agrees with the materialized field — agreement IS
+        // freshness against settled UI, and a genuine space/hook
+        // error can never satisfy it, so the loop times out loud
+        // instead of calibrating against a wrong report.
+        outer.setContentOffset(
+            CGPoint(x: 0, y: outer.contentOffset.y + 10), animated: false)
+        guard spinUntil(timeout: 5, {
+            pumpCover(host.view)
+            guard let current = latestReport, current.isComplete,
+                let field = current.composerFieldFrame,
+                let ui = mountedComposerField(in: host.view)
+            else { return false }
+            let uiFrame = ui.convert(ui.bounds, to: host.view)
+            return hypot(
+                uiFrame.minX - field.minX,
+                uiFrame.minY - field.minY) < 15
+        }) else {
+            return XCTFail("no layout report agreed with the materialized field")
+        }
+        guard var report = latestReport, report.isComplete else {
+            return XCTFail("the layout report never completed")
+        }
+
+        // The hook's truthfulness check, as in portrait.
+        guard let fieldFrame = report.composerFieldFrame else {
+            return XCTFail("the report lacks the composer field frame")
+        }
+        guard let ruled = renderedThroughRuler(
+            fieldFrame, fieldReport: fieldFrame, hostView: host.view)
+        else {
+            return XCTFail("the composer field vanished mid-test")
+        }
+        XCTAssertLessThan(
+            hypot(ruled.vector.x, ruled.vector.y), 40,
+            "the layout hook must agree with the materialized field")
+        let uiFieldFrame = composer.convert(composer.bounds, to: host.view)
+        XCTAssertTrue(
+            ruled.frame.insetBy(dx: -1, dy: -1).contains(uiFieldFrame),
+            "the reported field frame must contain the materialized field")
+        // Raw-frame calibration: at the resting offset the shift is
+        // pure chrome-plus-space, so raw sidebar frames read in host
+        // coordinates — the Finish reveal below compares the raw
+        // Finish frame (the field ruler's shift is the CHAT column's
+        // scroll, invalid across columns) against the visible rect.
+        XCTAssertLessThan(
+            hypot(ruled.vector.x, ruled.vector.y), 15,
+            "raw reported frames must read in host coordinates")
+
+        // Closed compact floor: the chat keeps its fixed chrome plus
+        // the thread minimum even before the keyboard opens, so at
+        // least one message row survives short landscape heights.
+        let closedFixed = (report.chatHeaderHeight ?? 0)
+            + (report.chatComposerHeight ?? 0)
+            + (report.chatNoticeHeight ?? 0)
+        XCTAssertGreaterThanOrEqual(
+            outer.contentSize.height, closedFixed + 60 - 1,
+            "the closed compact chat must keep fixed chrome plus the thread floor")
+        guard let closedThread = threadScroll(in: outer) else {
+            return XCTFail("the message thread must exist")
+        }
+        XCTAssertGreaterThan(
+            closedThread.bounds.height, 55,
+            "the closed compact thread must keep real height")
+
+        // Open the landscape keyboard: focus the real composer and
+        // type through it.
+        XCTAssertTrue(composer.becomeFirstResponder(), "focusing the composer must work")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { composer.isFirstResponder }),
+            "the composer must hold focus")
+        composer.selectAll(nil)
+        composer.insertText("56")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { model.draft == "56" }),
+            "the focused composer must stay bound to the live model")
+
+        // The keyboard's observable effects: a reduced safe area plus
+        // the notifications UIKit avoidance listens to.
+        host.additionalSafeAreaInsets = UIEdgeInsets(
+            top: 0, left: 0, bottom: keyboardHeight, right: 0)
+        pumpCover(host.view)
+        postKeyboard(shown: true, keyboardHeight: keyboardHeight, window: win)
+        pumpCover(host.view)
+
+        // No refocus dance: the keyboard changes no SwiftUI structure,
+        // so the same field must STILL be first responder.
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive the keyboard opening")
+        XCTAssertTrue(
+            composer.isFirstResponder,
+            "the keyboard must not resign the focused composer")
+
+        // Fresh positions after the keyboard-driven layout.
+        guard spinUntil(timeout: 5, {
+            pumpCover(host.view)
+            return latestReport?.isComplete == true
+        }) else {
+            return XCTFail("the layout report never settled with the keyboard open")
+        }
+        report = latestReport!
+
+        let topSafe = host.view.safeAreaInsets.top
+        let visible = CGRect(
+            x: 0, y: topSafe,
+            width: width, height: height - topSafe - keyboardHeight)
+
+        // Finding 2, open: the keyboard-reduced height grows outer
+        // scroll content instead of crushing the chat — the content
+        // keeps fixed chrome plus the floor, and the thread keeps
+        // real height. Without the compact minimum the content
+        // collapses to the reduced height and the thread crushes to
+        // zero, overflowing Hint/Send past the scrollable end.
+        let openFixed = (report.chatHeaderHeight ?? 0)
+            + (report.chatComposerHeight ?? 0)
+            + (report.chatNoticeHeight ?? 0)
+        print("R5-COMPACT openFixed=\(openFixed) content=\(outer.contentSize.height) inset=\(outer.adjustedContentInset)")
+        XCTAssertGreaterThanOrEqual(
+            outer.contentSize.height, openFixed + 60 - 1,
+            "the keyboard-open compact chat must keep fixed chrome plus the thread floor")
+        guard let openThread = threadScroll(in: outer) else {
+            return XCTFail("the message thread must exist with the keyboard open")
+        }
+        XCTAssertGreaterThan(
+            openThread.bounds.height, 55,
+            "the keyboard-open compact thread must keep real height")
+
+        // The focused composer stays visible: avoidance scrolls it
+        // above the keyboard (or it was never covered).
+        guard let keyboardFieldFrame = report.composerFieldFrame,
+            let ruledField = renderedThroughRuler(
+                keyboardFieldFrame, fieldReport: keyboardFieldFrame,
+                hostView: host.view)
+        else {
+            return XCTFail("the composer field has no keyboard-open frame")
+        }
+        XCTAssertLessThan(
+            hypot(ruledField.vector.x, ruledField.vector.y), 40,
+            "the keyboard-open report must agree with the materialized field")
+        XCTAssertTrue(
+            visible.insetBy(dx: 0, dy: 4).contains(
+                CGPoint(x: ruledField.frame.midX, y: ruledField.frame.midY)),
+            "the focused composer must stay visible with the keyboard open")
+
+        // Each chat-column control in turn: compute the scroll offset
+        // that lands its center 20pt above the fold, prove that offset
+        // lies inside the column's live range, apply it through the
+        // presented surface's own scroll view, and prove the center
+        // visible there — the portrait reveal, unchanged.
+        func reveal(
+            _ hookFrame: CGRect?, _ name: String,
+            file: StaticString = #filePath, line: UInt = #line
+        ) -> Bool {
+            guard let hookFrame,
+                let ruled = renderedThroughRuler(
+                    hookFrame, fieldReport: keyboardFieldFrame,
+                    hostView: host.view)
+            else {
+                XCTFail("the \(name) control has no keyboard-open frame",
+                        file: file, line: line)
+                return false
+            }
+            let minOffset = -outer.adjustedContentInset.top
+            let maxOffset = outer.contentSize.height - outer.bounds.height
+                + outer.adjustedContentInset.bottom
+            let unclamped = outer.contentOffset.y
+                + (ruled.frame.midY - visible.maxY) + 20
+            XCTAssertLessThanOrEqual(
+                unclamped, maxOffset + 0.5,
+                "the \(name) control must be reachable by scrolling",
+                file: file, line: line)
+            XCTAssertGreaterThanOrEqual(
+                unclamped, minOffset - 0.5,
+                "the \(name) control must be reachable by scrolling",
+                file: file, line: line)
+            let target = min(max(unclamped, minOffset), maxOffset)
+            outer.setContentOffset(CGPoint(x: 0, y: target), animated: false)
+            pumpCover(host.view)
+            XCTAssertEqual(
+                outer.contentOffset.y, target, accuracy: 0.5,
+                "the column must apply the reveal scroll for \(name)",
+                file: file, line: line)
+            guard let fresh = latestReport,
+                let freshField = fresh.composerFieldFrame,
+                let freshHook: CGRect = {
+                    switch name {
+                    case "Hint": return fresh.hintButtonFrame
+                    case "Send": return fresh.sendButtonFrame
+                    default: return nil
+                    }
+                }(),
+                let reRuled = renderedThroughRuler(
+                    freshHook, fieldReport: freshField, hostView: host.view)
+            else {
+                XCTFail("the \(name) control lost its frame after scrolling",
+                        file: file, line: line)
+                return false
+            }
+            XCTAssertTrue(
+                visible.insetBy(dx: 0, dy: 4).contains(
+                    CGPoint(x: reRuled.frame.midX, y: reRuled.frame.midY)),
+                "the \(name) control must be visible after its reveal scroll",
+                file: file, line: line)
+            XCTAssertTrue(
+                mountedComposerField(in: host.view) === composer,
+                "the composer subtree must survive revealing \(name)",
+                file: file, line: line)
+            return true
+        }
+
+        // Finish lives in the compact SIDEBAR — a different scroll
+        // view than the composer's — so the field ruler (the chat
+        // column's scroll shift) cannot translate its frame. Sidebar
+        // frames are chat-scroll-independent, so the raw reported
+        // frame is exact in host coordinates (calibrated above); the
+        // reveal target derives from it, and visibility after the
+        // applied scroll follows by rigid translation — plus the
+        // measured offset proves the sidebar obeyed the scroll.
+        func revealSidebarFinish(
+            file: StaticString = #filePath, line: UInt = #line
+        ) -> Bool {
+            guard let raw = latestReport?.finishButtonFrame else {
+                XCTFail("the Finish control has no keyboard-open frame",
+                        file: file, line: line)
+                return false
+            }
+            let preOffset = sidebar.contentOffset.y
+            let minOffset = -sidebar.adjustedContentInset.top
+            let maxOffset = sidebar.contentSize.height - sidebar.bounds.height
+                + sidebar.adjustedContentInset.bottom
+            let unclamped = preOffset + (raw.midY - visible.maxY) + 20
+            XCTAssertLessThanOrEqual(
+                unclamped, maxOffset + 0.5,
+                "the Finish control must be reachable by scrolling",
+                file: file, line: line)
+            XCTAssertGreaterThanOrEqual(
+                unclamped, minOffset - 0.5,
+                "the Finish control must be reachable by scrolling",
+                file: file, line: line)
+            let target = min(max(unclamped, minOffset), maxOffset)
+            sidebar.setContentOffset(CGPoint(x: 0, y: target), animated: false)
+            pumpCover(host.view)
+            XCTAssertEqual(
+                sidebar.contentOffset.y, target, accuracy: 0.5,
+                "the sidebar must apply the reveal scroll for Finish",
+                file: file, line: line)
+            let landed = CGPoint(x: raw.midX, y: raw.midY - (target - preOffset))
+            XCTAssertTrue(
+                visible.insetBy(dx: 0, dy: 4).contains(landed),
+                "the Finish control must be visible after its reveal scroll",
+                file: file, line: line)
+            XCTAssertTrue(
+                mountedComposerField(in: host.view) === composer,
+                "the composer subtree must survive revealing Finish",
+                file: file, line: line)
+            return true
+        }
+
+        // Hint operates through the surface's live model (Send's and
+        // Hint's exact target — rendered SwiftUI buttons materialize
+        // no tappable views in this host, per the round-2 probe).
+        guard reveal(report.hintButtonFrame, "Hint") else { return }
+        model.requestHint()
+        XCTAssertEqual(
+            flow.currentEffortSignals().hintInteractions, 1,
+            "Hint must deliver through the keyboard-open surface")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive the Hint tap")
+
+        // Send operates: re-type through the REAL field at its
+        // revealed offset, then submit through the live model.
+        guard reveal(report.sendButtonFrame, "Send") else { return }
+        composer.selectAll(nil)
+        composer.insertText("56")
+        XCTAssertTrue(
+            spinUntil(timeout: 3, { model.draft == "56" }),
+            "the composer binding must survive scrolling with the keyboard open")
+        model.submitDraft()
+        XCTAssertEqual(
+            flow.currentEffortSignals().genuineAttempts, 1,
+            "Send must submit through the keyboard-open surface")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive the Send tap")
+
+        // Finish operates through the live flow — the Finish button's
+        // exact target. Last: the decision labels grow the sidebar
+        // footer.
+        guard revealSidebarFinish() else { return }
+        let score = flow.finishChallenge()
+        XCTAssertEqual(score?.decision, .denied)
+        XCTAssertTrue(score?.floorMet ?? false)
+        XCTAssertEqual(
+            flow.challengeDecisionText,
+            SimulatedShieldFlow.unlockDeniedText)
+        XCTAssertNotNil(flow.lastDecision)
+        XCTAssertTrue(
+            flow.isShieldPresented,
+            "the denial must keep the challenge presented for a retry")
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive the Finish tap")
+
+        // Keyboard closed: the composer subtree survives and the chat
+        // keeps its floor with no scrolling tricks — the decision
+        // labels grew only the sidebar footer, never the chat column.
+        postKeyboard(shown: false, keyboardHeight: keyboardHeight, window: win)
+        host.additionalSafeAreaInsets = .zero
+        pumpCover(host.view)
+        outer.setContentOffset(
+            CGPoint(x: 0, y: -outer.adjustedContentInset.top), animated: false)
+        sidebar.setContentOffset(
+            CGPoint(x: 0, y: -sidebar.adjustedContentInset.top), animated: false)
+        pumpCover(host.view)
+        XCTAssertTrue(
+            mountedComposerField(in: host.view) === composer,
+            "the composer subtree must survive the keyboard closing")
+        guard spinUntil(timeout: 5, {
+            pumpCover(host.view)
+            return latestReport?.isComplete == true
+        }) else {
+            return XCTFail("the layout report never settled after the keyboard closed")
+        }
+        guard let closedAgainThread = threadScroll(in: outer) else {
+            return XCTFail("the message thread must exist after the keyboard closed")
+        }
+        XCTAssertGreaterThan(
+            closedAgainThread.bounds.height, 55,
+            "the keyboard-closed compact thread must keep real height")
+    }
+
+    /// Landscape phone with the software keyboard open (844x390
+    /// compact, mid-range landscape keyboard): the chat keeps fixed
+    /// chrome plus the thread floor instead of collapsing to the
+    /// keyboard-reduced height, and Hint/Send/Finish stay reachable
+    /// and operable.
+    @MainActor
+    func testCompactKeyboardKeepsControlsReachableAndOperable() {
+        verifyCompactKeyboardReachability(width: 844, height: 390, keyboardHeight: 200)
     }
 }
