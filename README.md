@@ -73,7 +73,7 @@ scaffold pre-dates the event.
 
 ## How it was built
 
-![How EarnPlay gets built — from brainstorm to merge](docs/build-loop-diagram.png)
+![How EarnPlay gets built — from brainstorm to merge](Docs/build-loop-diagram.png)
 
 The loop in one picture: Vu and Muse AI brainstormed in the docs repo,
 ran a pilot, and turned the task list into GitHub issues. Muse AI is the
@@ -83,7 +83,7 @@ Code runs on Vu's Mac mini over a Tailscale tunnel, up to three tasks in
 parallel, through Copilot review and CI; Muse AI grades CI and the
 Copilot verdict firsthand, and nothing merges without a green CI and a
 clean Copilot verdict. Public, paid, or irreversible steps always stop
-for Vu's call. (The diagram lives in this repo at `docs/build-loop-diagram.png`;
+for Vu's call. (The diagram lives in this repo at `Docs/build-loop-diagram.png`;
 it is also the closing segment of the demo video.)
 
 ## Meta models — where they run, honestly
@@ -238,7 +238,7 @@ xcodegen generate
 
 Simulator staging, measured cold/warm latencies, the go/no-go on model
 size, and the exact CI gap are recorded in
-`docs/ModelRuntimeSpike.md`. Without setup, the package still builds
+`Docs/ModelRuntimeSpike.md`. Without setup, the package still builds
 (runtime reports unavailable) and the offline integration test skips
 rather than passing vacuously.
 
@@ -260,4 +260,4 @@ swift run --package-path EarnPlayCore eval-harness
 Prints a per-criterion pass/fail scorecard, writes
 `EarnPlayCore/EvalHarness/eval-report-latest.json` next to the committed
 baseline, and exits nonzero on any criterion failure or regression.
-Details: `docs/EvalHarness.md`.
+Details: `Docs/EvalHarness.md`.
