@@ -1063,4 +1063,28 @@ extension VersioningTests {
         XCTAssertEqual(rebuilt, first)
         XCTAssertEqual(try Data(contentsOf: rebuilt), Data("GGUF-unbound-corrupt-A".utf8))
     }
+
+    // Fix round 3 F1 (issue #93): a digest-bound warm hit is a pure
+    // name check — the source is never hashed (replaced source bytes
+    // under the same valid magic still hit) and no temp copy is
+    // created (the lookup succeeds with the cache dir read-only,
+    // where any tmp creation would fail). The tutor factory relies
+    // on this by binding the registry/download digest.
+    func testBoundDigestHitSkipsSourceHashAndTempCopy() throws {
+        let model = try tempGGUF(named: "BoundHitNoHash.gguf")
+        try Data("GGUF-bound-hit-original".utf8).write(to: model)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: model)
+        let first = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+            .verifiedImmutableCopyURL()
+        // Replace the source with different, longer bytes under valid
+        // magic: a hash-first lookup would derive a new name and miss.
+        try Data("GGUF-bound-hit-REPLACED-longer".utf8).write(to: model)
+        let dir = first.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let second = try ModelRuntime(modelPath: model, expectedContentDigest: digest)
+            .verifiedImmutableCopyURL()
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(try Data(contentsOf: second), Data("GGUF-bound-hit-original".utf8))
+    }
 }

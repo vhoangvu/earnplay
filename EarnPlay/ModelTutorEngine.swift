@@ -31,10 +31,11 @@ final class ModelTextGenerator {
 
     var isWarm: Bool { checkWarm() }
 
-    /// Production generator over one `ModelRuntime` (unbound: the model
-    /// file was already sha256-verified by the first-launch download,
-    /// and the runtime still rejects non-GGUF files at load). Reports
-    /// warm after the first successful load or generation.
+    /// Production generator over one `ModelRuntime` (digest-bound
+    /// when a record knows it — see `makeProductionRuntime` — so a
+    /// warm immutable cache hits by name; the runtime still rejects
+    /// non-GGUF files at load). Reports warm after the first
+    /// successful load or generation.
     static func live(runtime: ModelRuntime, maxTokens: Int32 = ModelTutorEngine.modelMaxTokens) -> ModelTextGenerator {
         let state = WarmState()
         return ModelTextGenerator(
@@ -138,26 +139,58 @@ final class ModelTutorEngine: ChatTutorEngine {
     static let modelMaxTokens: Int32 = 48
 
     /// Production model-file resolution (finding 5): the default
-    /// lookup when its file exists, else the persisted registry's
-    /// active bundle model file — a retained snapshot stays usable
-    /// for inference even when the default/current file is gone, the
-    /// same fallback the readiness gate accepts. Cheap (existence +
-    /// 4-byte magic only, no hashing) and main-thread safe. No digest
-    /// is bound here (that would hash on the main thread); the
-    /// readiness gate already validated off-main, load still checks
-    /// GGUF magic, and a file that vanishes after resolution fails
-    /// load so the tutor falls back deterministically. The registry
-    /// snapshot is not retained (no registry instance is held): the
-    /// load copies bytes to an immutable artifact promptly, and a
-    /// mid-load disappearance surfaces fallback, never an error.
+    /// lookup when its file exists and passes the GGUF magic check,
+    /// else the persisted registry's active bundle model file — a
+    /// retained snapshot stays usable for inference even when the
+    /// default/current file is gone or corrupt (fix round 3 finding
+    /// 2: a corrupt default must not win over the validated
+    /// snapshot), the same fallback the readiness gate accepts.
+    /// Cheap (existence + 4-byte magic only, no hashing) and
+    /// main-thread safe. No digest is bound here (that would hash on
+    /// the main thread); the readiness gate already validated
+    /// off-main, load still checks GGUF magic, and a file that
+    /// vanishes after resolution fails load so the tutor falls back
+    /// deterministically. The registry snapshot is not retained (no
+    /// registry instance is held): the load copies bytes to an
+    /// immutable artifact promptly, and a mid-load disappearance
+    /// surfaces fallback, never an error.
     static func resolveProductionModelURL(environment: [String: String] = ProcessInfo.processInfo.environment,
                                           fileManager: FileManager = .default,
                                           registryStoreURL: URL? = nil) -> URL? {
         if let url = ModelRuntime.defaultModelURL(environment: environment, fileManager: fileManager),
-           fileManager.fileExists(atPath: url.path) {
+           fileManager.fileExists(atPath: url.path),
+           ModelRuntime.isGGUFFile(at: url) {
             return url
         }
         return VersionRegistry.activeBundleModelFileURL(storeURL: registryStoreURL, fileManager: fileManager)
+    }
+
+    /// Production runtime construction (fix round 3 finding 1):
+    /// binds the expected content digest when a record already knows
+    /// it, so a warm immutable cache hits by name with no
+    /// full-source hash and no temp copy on a hit. The digest comes
+    /// from the pinned download record at the first-launch
+    /// destination (that file was installed sha256-verified), else
+    /// from the active bundle record when the resolved file IS its
+    /// validated snapshot. Any other file (env/Documents/cache paths
+    /// no record describes, or a file that merely shares bytes with
+    /// the snapshot) stays unbound: the runtime keeps its hash-first
+    /// fallback, and a bound digest is still enforced before any
+    /// early return, exactly as on the copy path. Cheap (path
+    /// compares + one small registry decode, no hashing) and
+    /// main-thread safe.
+    static func makeProductionRuntime(for url: URL, fileManager: FileManager = .default,
+                                      registryStoreURL: URL? = nil) -> ModelRuntime {
+        let digest: String?
+        if url.standardizedFileURL.path == ModelDownloader.defaultDestinationURL(fileManager: fileManager).standardizedFileURL.path {
+            digest = ModelDownloadConfiguration.production.expectedSHA256
+        } else if let snapshot = VersionRegistry.activeBundleModelFileURL(storeURL: registryStoreURL, fileManager: fileManager),
+                  snapshot.standardizedFileURL.path == url.standardizedFileURL.path {
+            digest = VersionRegistry.activeBundleModelContentDigest(storeURL: registryStoreURL, fileManager: fileManager)
+        } else {
+            digest = nil
+        }
+        return ModelRuntime(modelPath: url, expectedContentDigest: digest)
     }
 
     /// Production availability probe: the llama framework was linked at
@@ -174,7 +207,7 @@ final class ModelTutorEngine: ChatTutorEngine {
     /// inner engine's deterministic behavior verbatim.
     convenience init(inner: ChatTutorEngine) {
         if Self.isModelAvailable(), let url = Self.resolveProductionModelURL() {
-            self.init(inner: inner, generator: .live(runtime: ModelRuntime(modelPath: url)))
+            self.init(inner: inner, generator: .live(runtime: Self.makeProductionRuntime(for: url)))
         } else {
             self.init(inner: inner, generator: nil)
         }
@@ -393,9 +426,15 @@ final class ModelTutorEngine: ChatTutorEngine {
         let group = DispatchGroup()
         group.enter()
         workQueue.async {
+            // Fix round 3 finding 3: release the lease BEFORE leaving
+            // the group — the waiter (or a later call hitting the
+            // `wait(.now())` guard) must never observe completion
+            // with the lease still held, which would spuriously force
+            // fallback. Single-flight semantics and the never-wait
+            // guard are unchanged.
             defer {
-                group.leave()
                 lease.signal()
+                group.leave()
             }
             box.value = try? generator.generateText(prompt)
         }

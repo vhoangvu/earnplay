@@ -10,14 +10,18 @@ private final class FakeModel {
     private var remaining: [String]
     private var scriptError: Error?
     private var delay: TimeInterval
+    private var delays: [TimeInterval]
     private var warm: Bool
     private var prompts: [String] = []
     private var warmUpCalls = 0
+    private var completed = 0
 
-    init(responses: [String] = [], error: Error? = nil, delay: TimeInterval = 0, warm: Bool = true) {
+    init(responses: [String] = [], error: Error? = nil, delay: TimeInterval = 0,
+         delays: [TimeInterval] = [], warm: Bool = true) {
         self.remaining = responses
         self.scriptError = error
         self.delay = delay
+        self.delays = delays
         self.warm = warm
     }
 
@@ -50,6 +54,16 @@ private final class FakeModel {
         return warmUpCalls
     }
 
+    /// Calls whose `generateText` body finished (fix round 3 finding
+    /// 3): incremented when the worker body returns, just before the
+    /// engine releases the lease — the observation point for "the
+    /// stale call actually ended".
+    var completedCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return completed
+    }
+
     private func recordWarmUp() {
         lock.lock()
         defer { lock.unlock() }
@@ -59,10 +73,16 @@ private final class FakeModel {
     private func generate(prompt: String) throws -> String {
         lock.lock()
         prompts.append(prompt)
-        let wait = delay
+        let index = prompts.count - 1
+        let wait = index < delays.count ? delays[index] : delay
         let error = scriptError
         let text = remaining.isEmpty ? "Model line." : remaining.removeFirst()
         lock.unlock()
+        defer {
+            lock.lock()
+            completed += 1
+            lock.unlock()
+        }
         if wait > 0 {
             Thread.sleep(forTimeInterval: wait)
         }
@@ -753,13 +773,24 @@ final class ModelTutorEngineTests: XCTestCase {
         return url
     }
 
-    private func tempRegistryStore(activeBundleID: String, modelFilePath: String?) throws -> URL {
+    /// Existing file with bad GGUF magic (fix round 3 finding 2).
+    private func tempCorruptModelFile() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("CorruptModel.gguf")
+        try Data("NOT-A-MODEL".utf8).write(to: url)
+        return url
+    }
+
+    private func tempRegistryStore(activeBundleID: String, modelFilePath: String?,
+                                   modelContentDigest: String? = nil) throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let store = dir.appendingPathComponent("version-registry.json")
         var bundle: [String: Any] = ["bundleID": activeBundleID,
                                      "modelVersion": "v", "promptVersion": "p"]
         if let modelFilePath { bundle["modelFilePath"] = modelFilePath }
+        if let modelContentDigest { bundle["modelContentDigest"] = modelContentDigest }
         let state: [String: Any] = ["bundles": [bundle], "activeBundleID": activeBundleID]
         try JSONSerialization.data(withJSONObject: state).write(to: store)
         return store
@@ -790,6 +821,69 @@ final class ModelTutorEngineTests: XCTestCase {
             registryStoreURL: FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString))
         XCTAssertNil(resolved)
+    }
+
+    // MARK: - Fix round 3 finding 2: corrupt default yields to snapshot
+
+    func testResolverSkipsCorruptDefaultForRegistrySnapshot() throws {
+        // The default file exists but fails GGUF magic: it must not
+        // win over the validated retained snapshot.
+        let corrupt = try tempCorruptModelFile()
+        let snapshot = try tempModelFile()
+        let store = try tempRegistryStore(activeBundleID: "previous-known-good",
+                                           modelFilePath: snapshot.path)
+        let resolved = ModelTutorEngine.resolveProductionModelURL(
+            environment: ["EARNPLAY_MODEL_PATH": corrupt.path],
+            registryStoreURL: store)
+        XCTAssertEqual(resolved?.path, snapshot.path)
+    }
+
+    // MARK: - Fix round 3 finding 1: factory binds the known digest
+
+    func testProductionRuntimeBindsRegistryDigestForSnapshot() throws {
+        let snapshot = try tempModelFile()
+        let digest = try ModelRuntime.contentSHA256(forFileAt: snapshot)
+        let store = try tempRegistryStore(activeBundleID: "previous-known-good",
+                                           modelFilePath: snapshot.path,
+                                           modelContentDigest: digest)
+        let runtime = ModelTutorEngine.makeProductionRuntime(for: snapshot, registryStoreURL: store)
+        XCTAssertEqual(runtime.expectedContentDigest, digest)
+    }
+
+    func testProductionRuntimeBindsPinnedDigestAtDownloadDestination() throws {
+        // The first-launch destination holds a sha256-verified install:
+        // the pinned download digest applies by path, no store needed.
+        let destination = ModelDownloader.defaultDestinationURL()
+        let runtime = ModelTutorEngine.makeProductionRuntime(
+            for: destination,
+            registryStoreURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString))
+        XCTAssertEqual(runtime.expectedContentDigest,
+                       ModelDownloadConfiguration.production.expectedSHA256)
+    }
+
+    func testProductionRuntimeIgnoresDigestForOtherFiles() throws {
+        // A digest is bound only to the file the record describes —
+        // never to a different path, even with identical bytes.
+        let snapshot = try tempModelFile()
+        let digest = try ModelRuntime.contentSHA256(forFileAt: snapshot)
+        let store = try tempRegistryStore(activeBundleID: "previous-known-good",
+                                           modelFilePath: snapshot.path,
+                                           modelContentDigest: digest)
+        let other = try tempModelFile()
+        XCTAssertEqual(try ModelRuntime.contentSHA256(forFileAt: other), digest)
+        let runtime = ModelTutorEngine.makeProductionRuntime(for: other, registryStoreURL: store)
+        XCTAssertNil(runtime.expectedContentDigest)
+    }
+
+    func testProductionRuntimeLeavesUnknownFilesUnbound() throws {
+        // No record anywhere: the runtime keeps its hash-first fallback.
+        let model = try tempModelFile()
+        let runtime = ModelTutorEngine.makeProductionRuntime(
+            for: model,
+            registryStoreURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString))
+        XCTAssertNil(runtime.expectedContentDigest)
     }
 
     // MARK: - Fix round 1 finding 6: warm-up deferred until first use
@@ -857,5 +951,61 @@ final class ModelTutorEngineTests: XCTestCase {
         // falls back to the deterministic wording (no fresh budget).
         XCTAssertEqual(collector.updates[2].turns, third.turns)
         XCTAssertEqual(fake.recordedPrompts.count, 4)
+    }
+
+    // MARK: - Fix round 3 finding 3: lease released before completion
+
+    func testFollowUpAfterCompletionIsNotSpuriouslyFallenBack() async {
+        // The first generation is slow: its waiter times out and falls
+        // back while the worker still holds the lease. Once that
+        // worker actually completes, the lease is released BEFORE the
+        // group completes — so a follow-up submitted right after
+        // completion observes a free lease and serves model text,
+        // instead of spuriously falling back on a still-held lease.
+        let fake = FakeModel(responses: ["Slow line.", "Fast encouragement!"],
+                             delays: [1.0])
+        let engine = ModelTutorEngine(inner: DemoTutorEngine(), generator: fake.generator, timeout: 0.2)
+        let demo = DemoTutorEngine()
+        _ = engine.startSession()
+        _ = demo.startSession()
+
+        let collector = UpdateCollector()
+        let first = expectation(description: "first fallback delivered")
+        let second = expectation(description: "follow-up model reply delivered")
+        engine.onAsyncUpdate = { update in
+            collector.append(update)
+            if collector.updates.count == 1 {
+                first.fulfill()
+            } else {
+                second.fulfill()
+            }
+        }
+
+        // Q1 correct: one eligible turn (encouragement). It times out
+        // and falls back while its worker keeps running.
+        let expectedFirst = demo.submitAnswer(q1Correct)
+        _ = engine.submitAnswer(q1Correct)
+        await fulfillment(of: [first], timeout: 10)
+        XCTAssertEqual(collector.updates[0].turns.map(\.displayedText),
+                       [expectedFirst.turns[0].displayedText])
+        XCTAssertEqual(fake.recordedPrompts.count, 1)
+
+        // Wait for the stale worker to actually finish, then submit
+        // the follow-up IMMEDIATELY — no settle sleep — so a
+        // still-held lease would spuriously force fallback.
+        let done = Date().addingTimeInterval(10)
+        while fake.completedCallCount == 0, Date() < done {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(fake.completedCallCount, 1)
+
+        // Q2 correct ("54"): its encouragement must serve model text.
+        let expectedSecond = demo.submitAnswer("54")
+        _ = engine.submitAnswer("54")
+        await fulfillment(of: [second], timeout: 10)
+        XCTAssertEqual(collector.updates.count, 2)
+        XCTAssertEqual(collector.updates[1].turns.map(\.displayedText), ["Fast encouragement!"])
+        XCTAssertEqual(collector.updates[1].turns.map(\.id), [expectedSecond.turns[0].id])
+        XCTAssertEqual(fake.recordedPrompts.count, 2)
     }
 }

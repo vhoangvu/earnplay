@@ -370,6 +370,24 @@ public final class VersionRegistry: @unchecked Sendable {
         return fileURL
     }
 
+    /// Active bundle's bound content digest (fix round 3 F1, issue
+    /// #93): the SHA-256 the active bundle's model file carries in
+    /// the persisted record, decoded with no hashing, no writes, and
+    /// no retention — safe on the main thread. The tutor factory
+    /// binds it to its `ModelRuntime` so a warm immutable cache hits
+    /// by name without hashing the ~770 MB source. Nil when the
+    /// store is absent/corrupt, the active bundle is unknown, or it
+    /// binds no digest. Callers must only apply it to the file
+    /// `activeBundleModelFileURL` validates for the same store.
+    public static func activeBundleModelContentDigest(storeURL: URL? = nil,
+                                                      fileManager: FileManager = .default) -> String? {
+        let url = storeURL ?? defaultStoreURL(fileManager: fileManager)
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(PersistedRegistryState.self, from: data),
+              let bundle = state.bundles.first(where: { $0.bundleID == state.activeBundleID }) else { return nil }
+        return bundle.modelContentDigest
+    }
+
     public static func production(
         storeURL: URL? = nil,
         modelURL: URL? = ModelRuntime.defaultModelURL()

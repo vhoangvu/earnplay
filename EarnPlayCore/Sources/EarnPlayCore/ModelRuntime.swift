@@ -196,7 +196,11 @@ public final class ModelRuntime: @unchecked Sendable {
         try Self.verifiedModelVersion(forModelAt: modelPath)
     }
 
-    static func isGGUFFile(at url: URL) -> Bool {
+    /// GGUF magic check (fix round 3 F2, issue #93): a 4-byte header
+    /// read, never a hash — safe on the main thread. Public so the
+    /// chat-tutor factory (app target) can refuse a corrupt default
+    /// model file before falling back to the retained snapshot.
+    public static func isGGUFFile(at url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }

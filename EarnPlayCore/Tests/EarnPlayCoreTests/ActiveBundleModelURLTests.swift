@@ -18,9 +18,11 @@ final class ActiveBundleModelURLTests: XCTestCase {
         return url
     }
 
-    private func bundle(id: String, modelFilePath: String? = nil) -> [String: Any] {
+    private func bundle(id: String, modelFilePath: String? = nil,
+                      modelContentDigest: String? = nil) -> [String: Any] {
         var value: [String: Any] = ["bundleID": id, "modelVersion": "m", "promptVersion": "p"]
         if let modelFilePath { value["modelFilePath"] = modelFilePath }
+        if let modelContentDigest { value["modelContentDigest"] = modelContentDigest }
         return value
     }
 
@@ -123,5 +125,32 @@ final class ActiveBundleModelURLTests: XCTestCase {
             bundles: [bundle(id: "current"),
                       bundle(id: "previous-known-good", modelFilePath: model.path)])
         XCTAssertNil(VersionRegistry.activeBundleModelFileURL(storeURL: store))
+    }
+
+    // Fix round 3 F1 (issue #93): the tutor factory's digest source —
+    // the ACTIVE bundle's bound digest, decoded with no hashing.
+    func testActiveBundleDigestReturnsPersistedDigest() throws {
+        let dir = try tempDir()
+        let model = try ggufFile(in: dir)
+        let digest = try ModelRuntime.contentSHA256(forFileAt: model)
+        let store = try writeStore(in: dir, activeBundleID: "previous-known-good",
+                                   bundles: [bundle(id: "previous-known-good",
+                                                    modelFilePath: model.path,
+                                                    modelContentDigest: digest)])
+        XCTAssertEqual(VersionRegistry.activeBundleModelContentDigest(storeURL: store), digest)
+    }
+
+    func testActiveBundleDigestNilWithoutDigestOrStore() throws {
+        let dir = try tempDir()
+        let model = try ggufFile(in: dir)
+        let noDigest = try writeStore(in: dir, activeBundleID: "previous-known-good",
+                                      bundles: [bundle(id: "previous-known-good",
+                                                       modelFilePath: model.path)])
+        XCTAssertNil(VersionRegistry.activeBundleModelContentDigest(storeURL: noDigest))
+        let missing = try tempDir().appendingPathComponent("version-registry.json")
+        XCTAssertNil(VersionRegistry.activeBundleModelContentDigest(storeURL: missing))
+        let corrupt = (try tempDir()).appendingPathComponent("version-registry.json")
+        try Data("not-json{".utf8).write(to: corrupt)
+        XCTAssertNil(VersionRegistry.activeBundleModelContentDigest(storeURL: corrupt))
     }
 }
