@@ -320,6 +320,74 @@ public final class VersionRegistry: @unchecked Sendable {
         return base.appendingPathComponent("EarnPlay/version-registry.json")
     }
 
+    /// Active bundle's model file URL without validation (issue #93 fix).
+    ///
+    /// Cheap resolution for the tutor factory: decodes the persisted
+    /// registry and returns the ACTIVE bundle's model file when it
+    /// exists on disk — no hashing, no writes, no snapshot retention —
+    /// so it is safe on the main thread. A retained snapshot therefore
+    /// stays usable for inference even when the default/current model
+    /// file is gone, matching the fallback the readiness gate accepts.
+    /// Nil when the store is absent/corrupt, the active bundle binds
+    /// the default model (nil path — the caller already checked it),
+    /// or the file is missing, a directory, or not a GGUF. Stored
+    /// paths resolve like the reload path (F8 relative paths, plus the
+    /// restored-container basename migration for absolute paths).
+    ///
+    /// Full validation still happens elsewhere and is unchanged: the
+    /// readiness gate resolves `inferenceArtifacts()` off the main
+    /// thread, and `ModelRuntime` load rejects non-GGUF files. A file
+    /// that vanishes after resolution fails load and the tutor falls
+    /// back to its deterministic engine — never an error to the child.
+    public static func activeBundleModelFileURL(storeURL: URL? = nil,
+                                                fileManager: FileManager = .default) -> URL? {
+        let url = storeURL ?? defaultStoreURL(fileManager: fileManager)
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(PersistedRegistryState.self, from: data),
+              let bundle = state.bundles.first(where: { $0.bundleID == state.activeBundleID }),
+              let stored = bundle.modelFilePath, !stored.isEmpty else { return nil }
+        let dir = url.deletingLastPathComponent()
+        if stored.hasPrefix("/") {
+            var isDir: ObjCBool = false
+            if fileManager.fileExists(atPath: stored, isDirectory: &isDir) {
+                return validatedModelFile(at: stored, fileManager: fileManager)
+            }
+            let migrated = dir.appendingPathComponent(URL(fileURLWithPath: stored).lastPathComponent).path
+            guard fileManager.fileExists(atPath: migrated) else { return nil }
+            return validatedModelFile(at: migrated, fileManager: fileManager)
+        }
+        return validatedModelFile(at: dir.appendingPathComponent(stored).path, fileManager: fileManager)
+    }
+
+    /// Existence + GGUF-magic check for the cheap resolver above (a
+    /// 4-byte header read, never a hash). Nil when the path is not a
+    /// readable model file.
+    private static func validatedModelFile(at path: String, fileManager: FileManager) -> URL? {
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { return nil }
+        let fileURL = URL(fileURLWithPath: path)
+        guard ModelRuntime.isGGUFFile(at: fileURL) else { return nil }
+        return fileURL
+    }
+
+    /// Active bundle's bound content digest (fix round 3 F1, issue
+    /// #93): the SHA-256 the active bundle's model file carries in
+    /// the persisted record, decoded with no hashing, no writes, and
+    /// no retention — safe on the main thread. The tutor factory
+    /// binds it to its `ModelRuntime` so a warm immutable cache hits
+    /// by name without hashing the ~770 MB source. Nil when the
+    /// store is absent/corrupt, the active bundle is unknown, or it
+    /// binds no digest. Callers must only apply it to the file
+    /// `activeBundleModelFileURL` validates for the same store.
+    public static func activeBundleModelContentDigest(storeURL: URL? = nil,
+                                                      fileManager: FileManager = .default) -> String? {
+        let url = storeURL ?? defaultStoreURL(fileManager: fileManager)
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(PersistedRegistryState.self, from: data),
+              let bundle = state.bundles.first(where: { $0.bundleID == state.activeBundleID }) else { return nil }
+        return bundle.modelContentDigest
+    }
+
     public static func production(
         storeURL: URL? = nil,
         modelURL: URL? = ModelRuntime.defaultModelURL()

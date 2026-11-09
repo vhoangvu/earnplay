@@ -196,7 +196,11 @@ public final class ModelRuntime: @unchecked Sendable {
         try Self.verifiedModelVersion(forModelAt: modelPath)
     }
 
-    static func isGGUFFile(at url: URL) -> Bool {
+    /// GGUF magic check (fix round 3 F2, issue #93): a 4-byte header
+    /// read, never a hash — safe on the main thread. Public so the
+    /// chat-tutor factory (app target) can refuse a corrupt default
+    /// model file before falling back to the retained snapshot.
+    public static func isGGUFFile(at url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
@@ -345,6 +349,34 @@ public final class ModelRuntime: @unchecked Sendable {
         return final
     }
 
+    /// Verified cache lookup shared by every path below: the entry
+    /// for `digest` when present and hash-verified, nil when missing
+    /// — a corrupt entry is removed so the caller rebuilds it.
+    /// Pure reads plus at most one stale-entry removal, never a copy.
+    private static func verifiedCacheEntry(in dir: URL, digest: String) -> URL? {
+        let cached = dir.appendingPathComponent("\(digest).gguf")
+        guard FileManager.default.fileExists(atPath: cached.path) else { return nil }
+        guard (try? Self.contentSHA256(forFileAt: cached)) == digest else {
+            try? FileManager.default.removeItem(at: cached)
+            return nil
+        }
+        return cached
+    }
+
+    /// Enforces a version-only binding (no digest bound) against one
+    /// (filename, size, digest) identity, under the same
+    /// reported/stored comparison the copy path uses. Throws
+    /// `.modelContentMismatch` on mismatch; removing any temporary
+    /// copy is the caller's job.
+    private func verifyVersionBinding(_ expected: String, digest: String, byteCount: Int64) throws {
+        let verified = "\(modelPath.lastPathComponent) (\(byteCount) bytes, GGUF, sha256:\(digest)) / \(Self.runtimeIdentifier)"
+        guard verified == expected
+                || Self.reportedModelVersion(storedModelVersion: verified) == expected
+                || verified == Self.reportedModelVersion(storedModelVersion: expected) else {
+            throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+        }
+    }
+
     func verifiedImmutableCopyURL() throws -> URL {
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw ModelRuntimeError.modelNotFound(path: modelPath.path)
@@ -359,13 +391,26 @@ public final class ModelRuntime: @unchecked Sendable {
         // Round 6 F2: when a digest is already bound, check and
         // verify the existing cache entry before creating any
         // temporary copy — a cache hit needs no extra 770 MiB.
-        if let expectedContentDigest {
-            let cached = dir.appendingPathComponent("\(expectedContentDigest).gguf")
-            if FileManager.default.fileExists(atPath: cached.path) {
-                if (try? Self.contentSHA256(forFileAt: cached)) == expectedContentDigest {
-                    return cached
-                }
-                try? FileManager.default.removeItem(at: cached)
+        if let expectedContentDigest, let hit = Self.verifiedCacheEntry(in: dir, digest: expectedContentDigest) {
+            return hit
+        }
+        // Round 2 F1 (issue #93): without a bound digest there is no
+        // known cache name — hash the source FIRST, then check for
+        // that entry before writing any temporary copy. A cache hit
+        // returns with pure reads (no extra 770 MiB tmp, no failure
+        // when the disk is too full for one); only a miss falls
+        // through to the copy below. A version-only binding is still
+        // enforced before any early return, exactly as on the copy
+        // path, so the early lookup cannot smuggle in bytes the
+        // binding would refuse.
+        if expectedContentDigest == nil {
+            let sourceDigest = try Self.contentSHA256(forFileAt: modelPath)
+            if let expectedModelVersion {
+                let size = (try? FileManager.default.attributesOfItem(atPath: modelPath.path)[.size] as? NSNumber)?.int64Value ?? 0
+                try verifyVersionBinding(expectedModelVersion, digest: sourceDigest, byteCount: size)
+            }
+            if let hit = Self.verifiedCacheEntry(in: dir, digest: sourceDigest) {
+                return hit
             }
         }
         guard let source = try? FileHandle(forReadingFrom: modelPath) else {
@@ -399,22 +444,18 @@ public final class ModelRuntime: @unchecked Sendable {
         }
         if expectedContentDigest == nil, let expectedModelVersion {
             let size = (try? FileManager.default.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value ?? 0
-            let verified = "\(modelPath.lastPathComponent) (\(size) bytes, GGUF, sha256:\(digest)) / \(Self.runtimeIdentifier)"
-            guard verified == expectedModelVersion
-                    || Self.reportedModelVersion(storedModelVersion: verified) == expectedModelVersion
-                    || verified == Self.reportedModelVersion(storedModelVersion: expectedModelVersion) else {
+            do {
+                try verifyVersionBinding(expectedModelVersion, digest: digest, byteCount: size)
+            } catch {
                 try? FileManager.default.removeItem(at: tmp)
-                throw ModelRuntimeError.modelContentMismatch(path: modelPath.path)
+                throw error
             }
+        }
+        if let hit = Self.verifiedCacheEntry(in: dir, digest: digest) {
+            try? FileManager.default.removeItem(at: tmp)
+            return hit
         }
         let final = dir.appendingPathComponent("\(digest).gguf")
-        if FileManager.default.fileExists(atPath: final.path) {
-            if (try? Self.contentSHA256(forFileAt: final)) == digest {
-                try? FileManager.default.removeItem(at: tmp)
-                return final
-            }
-            try? FileManager.default.removeItem(at: final)
-        }
         return try publishImmutableCopy(tmp: tmp, to: final, digest: digest)
     }
 
